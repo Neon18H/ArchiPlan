@@ -180,7 +180,7 @@ export function validate(nodes: AppNode[], edges: AppEdge[]): Issue[] {
         title: `${name(n)}: credenciales de BD`,
         detail: 'Guarda las credenciales en Secrets Manager con rotación, nunca en variables de entorno ni en el código.',
         nodeIds: [n.id],
-        fix: secretsNode ? { label: 'Conectar a Secrets Manager', connect: [{ source: n.id, target: secretsNode.id }] } : { label: 'Agregar Secrets Manager', add: [{ serviceId: 'secrets', near: n.id, parent: null }], connect: [{ source: n.id, target: 'new:0' }] },
+        fix: secretsNode ? { label: 'Conectar a Secrets Manager', connect: [{ source: n.id, target: secretsNode.id }] } : { label: 'Agregar Secrets Manager', add: [{ serviceId: 'secrets', near: n.id }], connect: [{ source: n.id, target: 'new:0' }] },
       });
     if (n.data.serviceId === 'lambda' && outgoing(n.id).some((e) => ['rds', 'aurora'].includes((map.get(e.target) as ServiceNode)?.data?.serviceId)))
       push({ severity: 'info', title: `${name(n)} → BD relacional`, detail: 'Lambda puede agotar las conexiones de la BD. Usa RDS Proxy o Aurora Data API.', nodeIds: [n.id] });
@@ -196,7 +196,7 @@ export function validate(nodes: AppNode[], edges: AppEdge[]): Issue[] {
       detail: 'No hay CloudWatch: no tendrás logs, métricas ni alarmas.',
       nodeIds: computes.map((c) => c.id),
       id: 'no-observability',
-      fix: { label: 'Agregar CloudWatch', add: [{ serviceId: 'cloudwatch', near: computes[0].id, parent: null }], connect: computes.map((c) => ({ source: c.id, target: 'new:0' })) },
+      fix: { label: 'Agregar CloudWatch', add: [{ serviceId: 'cloudwatch', near: computes[0].id }], connect: computes.map((c) => ({ source: c.id, target: 'new:0' })) },
     });
   } else if (cw) {
     const missing = computes.filter((c) => !outgoing(c.id).some((e) => svc(map.get(e.target) as ServiceNode)?.role === 'observability'));
@@ -208,7 +208,7 @@ export function validate(nodes: AppNode[], edges: AppEdge[]): Issue[] {
   const actors = services.filter((n) => svc(n).role === 'actor');
   if (actors.length && entries.length && !hasRole('identity')) {
     const api = entries.find((n) => svc(n).role === 'api') ?? entries[0];
-    push({ severity: 'info', title: 'Sin proveedor de identidad', detail: 'Hay usuarios pero no se ve cómo se autentican. Considera Cognito u otro IdP (OIDC).', nodeIds: [api.id], id: 'no-identity', fix: { label: 'Agregar Cognito', add: [{ serviceId: 'cognito', near: api.id, parent: null }], connect: [{ source: api.id, target: 'new:0', protocol: 'authorizer (JWT)' }] } });
+    push({ severity: 'info', title: 'Sin proveedor de identidad', detail: 'Hay usuarios pero no se ve cómo se autentican. Considera Cognito u otro IdP (OIDC).', nodeIds: [api.id], id: 'no-identity', fix: { label: 'Agregar Cognito', add: [{ serviceId: 'cognito', near: api.id }], connect: [{ source: api.id, target: 'new:0', protocol: 'authorizer (JWT)' }] } });
   }
 
   // ── 11. Piezas sueltas y actores
