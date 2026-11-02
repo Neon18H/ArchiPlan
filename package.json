@@ -1,0 +1,30 @@
+{
+  "name": "archiplan",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Diseñador local de arquitecturas de soluciones con reglas, capas C4, plantillas y exportación",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p . && vite build",
+    "start": "node server/index.mjs",
+    "serve": "npm run build && node server/index.mjs",
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "@xyflow/react": "^12.12.1",
+    "html-to-image": "^1.11.13",
+    "jspdf": "^4.2.1",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "zustand": "^5.0.16"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.2.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
+  }
+}

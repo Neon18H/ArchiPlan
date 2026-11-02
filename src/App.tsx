@@ -1,0 +1,267 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ReactFlowProvider } from '@xyflow/react';
+import { getService, LAYERS } from './catalog/catalog';
+import { Canvas } from './components/Canvas';
+import { CanvasContext } from './components/context';
+import { ExportModal, ProjectsModal, TemplatesModal, WizardModal } from './components/Modals';
+import { Palette } from './components/Palette';
+import { Sidebar } from './components/Sidebar';
+import { download } from './export/image';
+import { isService } from './lib/graph';
+import { saveProjectFile, serverAvailable, slugify } from './lib/api';
+import { buildGuide } from './rules/guide';
+import { validate } from './rules/validate';
+import { useStore } from './store';
+import type { Layer, Severity } from './types';
+
+type ModalKind = 'templates' | 'wizard' | 'projects' | 'export' | null;
+
+function Menu({ label, children }: { label: React.ReactNode; children: (close: () => void) => React.ReactNode }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const h = (e: MouseEvent) => !ref.current?.contains(e.target as Node) && setOpen(false);
+    window.addEventListener('mousedown', h);
+    return () => window.removeEventListener('mousedown', h);
+  }, [open]);
+  return (
+    <div className="menu" ref={ref}>
+      <button className={`tb-btn ${open ? 'on' : ''}`} onClick={() => setOpen(!open)}>
+        {label} <span className="caret">▾</span>
+      </button>
+      {open && <div className="menu-pop">{children(() => setOpen(false))}</div>}
+    </div>
+  );
+}
+
+function Toolbar({ openModal, onSave, issuesCount }: { openModal: (m: ModalKind) => void; onSave: () => void; issuesCount: Record<Severity, number> }) {
+  const meta = useStore((s) => s.meta);
+  const dirty = useStore((s) => s.dirty);
+  const view = useStore((s) => s.view);
+  const layers = useStore((s) => s.layers);
+  const past = useStore((s) => s.past.length);
+  const future = useStore((s) => s.future.length);
+  const { setMeta, undo, redo, setView, toggleLayer, clearLayers, autoLayout, newEmpty } = useStore.getState();
+
+  return (
+    <header className="toolbar">
+      <div className="brand">
+        <svg viewBox="0 0 32 32" width="22" height="22" aria-hidden>
+          <rect width="32" height="32" rx="7" fill="#e8590c" />
+          <path d="M8 22h16M10 22V12h4v10M18 22V8h4v14" stroke="#fff" strokeWidth="2.4" fill="none" />
+        </svg>
+        <span>ArchiPlan</span>
+      </div>
+      <input className="proj-name" value={meta.name} onChange={(e) => setMeta({ name: e.target.value })} aria-label="Nombre del proyecto" />
+      {dirty && <span className="dirty" title="Cambios sin guardar en disco">●</span>}
+
+      <div className="tb-group">
+        <Menu label="Nuevo">
+          {(close) => (
+            <>
+              <button onClick={() => (close(), openModal('wizard'))}>
+                <b>Asistente guiado</b>
+                <span>Responde preguntas y genera la arquitectura</span>
+              </button>
+              <button onClick={() => (close(), openModal('templates'))}>
+                <b>Desde plantilla</b>
+                <span>3 capas, serverless, microservicios, eventos…</span>
+              </button>
+              <button
+                onClick={() => {
+                  close();
+                  const st = useStore.getState();
+                  if (st.nodes.length && st.dirty && !window.confirm('¿Descartar el diagrama actual? (Ctrl+Z para deshacer)')) return;
+                  newEmpty();
+                }}
+              >
+                <b>Lienzo vacío</b>
+                <span>Empezar desde cero</span>
+              </button>
+            </>
+          )}
+        </Menu>
+        <button className="tb-btn" onClick={() => openModal('projects')}>
+          Abrir
+        </button>
+        <button className="tb-btn" onClick={onSave} title="Ctrl+S">
+          Guardar
+        </button>
+        <button className="tb-btn accent" onClick={() => openModal('export')}>
+          Exportar
+        </button>
+      </div>
+
+      <div className="tb-group">
+        <button className="tb-icon" onClick={undo} disabled={!past} title="Deshacer (Ctrl+Z)">
+          ↶
+        </button>
+        <button className="tb-icon" onClick={redo} disabled={!future} title="Rehacer (Ctrl+Y)">
+          ↷
+        </button>
+        <button className="tb-btn" onClick={autoLayout} disabled={view !== 'c2'} title="Reordena las piezas por zona y capa">
+          Auto‑organizar
+        </button>
+      </div>
+
+      <div className="tb-group">
+        <div className="seg" role="tablist" aria-label="Nivel C4">
+          <button className={view === 'c1' ? 'on' : ''} onClick={() => setView('c1')} title="C4 nivel 1: actores, sistema y externos">
+            C1 Contexto
+          </button>
+          <button className={view === 'c2' ? 'on' : ''} onClick={() => setView('c2')} title="C4 nivel 2: contenedores / servicios">
+            C2 Contenedores
+          </button>
+        </div>
+        <Menu label={layers.length ? `Capas (${layers.length})` : 'Capas'}>
+          {() => (
+            <div className="layers-pop">
+              <div className="muted small" style={{ padding: '4px 8px 8px' }}>
+                Resalta solo las capas elegidas
+              </div>
+              {(Object.keys(LAYERS) as Layer[]).map((l) => (
+                <label key={l} className="layer-row">
+                  <input type="checkbox" checked={layers.includes(l)} onChange={() => toggleLayer(l)} />
+                  {LAYERS[l].label}
+                </label>
+              ))}
+              {layers.length > 0 && (
+                <button className="btn small block" onClick={clearLayers}>
+                  Mostrar todas
+                </button>
+              )}
+            </div>
+          )}
+        </Menu>
+      </div>
+
+      <span className="spacer" />
+      <button className="health" onClick={() => window.dispatchEvent(new CustomEvent('archiplan:tab', { detail: 'issues' }))} title="Ver validación">
+        <span className={`hdot ${issuesCount.error ? 'err' : issuesCount.warn ? 'warn' : 'ok'}`} />
+        {issuesCount.error ? `${issuesCount.error} errores` : issuesCount.warn ? `${issuesCount.warn} avisos` : 'Sin errores'}
+      </button>
+    </header>
+  );
+}
+
+function Toasts() {
+  const toasts = useStore((s) => s.toasts);
+  const dismiss = useStore((s) => s.dismissToast);
+  return (
+    <div className="toasts">
+      {toasts.map((t) => (
+        <div key={t.id} className={`toast ${t.kind}`} onClick={() => dismiss(t.id)}>
+          {t.text}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export default function App() {
+  const nodes = useStore((s) => s.nodes);
+  const edges = useStore((s) => s.edges);
+  const decisions = useStore((s) => s.decisions);
+  const layers = useStore((s) => s.layers);
+  const view = useStore((s) => s.view);
+  const [modal, setModal] = useState<ModalKind>(null);
+
+  // Validación en vivo (solo depende de la estructura, no de la selección)
+  const structKey = useMemo(
+    () => JSON.stringify([nodes.map((n) => [n.id, n.parentId, n.data]), edges.map((e) => [e.id, e.source, e.target, e.data])]),
+    [nodes, edges],
+  );
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const issues = useMemo(() => validate(nodes, edges), [structKey]);
+  const guide = useMemo(() => buildGuide(nodes, edges, decisions, issues), [structKey, decisions, issues]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const ctx = useMemo(() => {
+    const rank = { error: 3, warn: 2, info: 1 } as const;
+    const nodeIssues = new Map<string, Severity>();
+    const edgeIssues = new Map<string, Severity>();
+    for (const i of issues) {
+      if (i.edgeIds?.length) {
+        for (const e of i.edgeIds) if (!edgeIssues.has(e) || rank[i.severity] > rank[edgeIssues.get(e)!]) edgeIssues.set(e, i.severity);
+        continue;
+      }
+      if (i.severity === 'info' && i.nodeIds.length > 1) continue;
+      for (const n of i.nodeIds) if (!nodeIssues.has(n) || rank[i.severity] > rank[nodeIssues.get(n)!]) nodeIssues.set(n, i.severity);
+    }
+    const dimmed = new Set<string>();
+    if (layers.length) for (const n of nodes) if (isService(n) && !layers.includes(getService(n.data.serviceId).layer)) dimmed.add(n.id);
+    return { nodeIssues, edgeIssues, dimmed, readOnly: view !== 'c2' };
+  }, [issues, layers, nodes, view]);
+
+  const counts = { error: issues.filter((i) => i.severity === 'error').length, warn: issues.filter((i) => i.severity === 'warn').length, info: issues.filter((i) => i.severity === 'info').length };
+
+  const save = useCallback(async () => {
+    const st = useStore.getState();
+    const p = st.toProject();
+    const id = st.projectId ?? slugify(p.meta.name);
+    if (await serverAvailable()) {
+      try {
+        await saveProjectFile(id, p);
+        st.setProjectId(id);
+        st.markSaved();
+        st.toast('ok', `Guardado en projects/${id}.archi.json`);
+        return;
+      } catch (e) {
+        st.toast('error', String((e as Error).message));
+        return;
+      }
+    }
+    download(`${id}.archi.json`, JSON.stringify(p, null, 2), 'application/json');
+    st.markSaved();
+    st.toast('info', 'Servidor local no disponible: se descargó el archivo del proyecto.');
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const mod = e.ctrlKey || e.metaKey;
+      const typing = /^(INPUT|TEXTAREA|SELECT)$/.test((e.target as HTMLElement)?.tagName);
+      if (mod && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        save();
+      } else if (mod && !typing && e.key.toLowerCase() === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        useStore.getState().undo();
+      } else if (mod && !typing && (e.key.toLowerCase() === 'y' || (e.key.toLowerCase() === 'z' && e.shiftKey))) {
+        e.preventDefault();
+        useStore.getState().redo();
+      }
+    };
+    const onOpen = (e: Event) => setModal((e as CustomEvent).detail as ModalKind);
+    const beforeUnload = (e: BeforeUnloadEvent) => {
+      if (useStore.getState().dirty) e.preventDefault();
+    };
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('archiplan:open', onOpen);
+    window.addEventListener('beforeunload', beforeUnload);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('archiplan:open', onOpen);
+      window.removeEventListener('beforeunload', beforeUnload);
+    };
+  }, [save]);
+
+  return (
+    <ReactFlowProvider>
+      <CanvasContext.Provider value={ctx}>
+        <div className="app">
+          <Toolbar openModal={setModal} onSave={save} issuesCount={counts} />
+          <div className="main">
+            <Palette />
+            <Canvas />
+            <Sidebar issues={issues} guide={guide} />
+          </div>
+          {modal === 'templates' && <TemplatesModal onClose={() => setModal(null)} />}
+          {modal === 'wizard' && <WizardModal onClose={() => setModal(null)} />}
+          {modal === 'projects' && <ProjectsModal onClose={() => setModal(null)} />}
+          {modal === 'export' && <ExportModal onClose={() => setModal(null)} />}
+          <Toasts />
+        </div>
+      </CanvasContext.Provider>
+    </ReactFlowProvider>
+  );
+}
