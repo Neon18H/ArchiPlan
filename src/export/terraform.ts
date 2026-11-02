@@ -445,7 +445,7 @@ resource "aws_wafv2_web_acl" "${name}" {
   default_action {
     allow {}
   }
-  rule {
+${p.managedRules !== false ? `  rule {
     name     = "AWSManagedRulesCommonRuleSet"
     priority = 1
     override_action {
@@ -463,7 +463,43 @@ resource "aws_wafv2_web_acl" "${name}" {
       sampled_requests_enabled   = true
     }
   }
-  rule {
+` : ''}${p.sqliRules !== false ? `  rule {
+    name     = "AWSManagedRulesSQLiRuleSet"
+    priority = 3
+    override_action {
+      none {}
+    }
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesSQLiRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "sqli"
+      sampled_requests_enabled   = true
+    }
+  }
+` : ''}${p.botControl ? `  rule {
+    name     = "AWSManagedRulesBotControlRuleSet"
+    priority = 4
+    override_action {
+      none {}
+    }
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesBotControlRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "bots"
+      sampled_requests_enabled   = true
+    }
+  }
+` : ''}  rule {
     name     = "rate-limit"
     priority = 2
     action {
@@ -730,7 +766,29 @@ resource "aws_ecs_service" "${name}" {
     container_port   = 8080
   }` : ''}
 }
-`);
+${p['sim.autoscaling'] !== false ? `
+resource "aws_appautoscaling_target" "${name}" {
+  service_namespace  = "ecs"
+  resource_id        = "service/\${aws_ecs_cluster.main.name}/\${aws_ecs_service.${name}.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  min_capacity       = ${Number(p.desired) || 2}
+  max_capacity       = ${(Number(p.desired) || 2) * 4}
+}
+
+resource "aws_appautoscaling_policy" "${name}_cpu" {
+  name               = "${name.replace(/_/g, '-')}-cpu"
+  policy_type        = "TargetTrackingScaling"
+  service_namespace  = aws_appautoscaling_target.${name}.service_namespace
+  resource_id        = aws_appautoscaling_target.${name}.resource_id
+  scalable_dimension = aws_appautoscaling_target.${name}.scalable_dimension
+  target_tracking_scaling_policy_configuration {
+    target_value = 60
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+    }
+  }
+}
+` : ''}`);
         break;
       }
       case 'eks':

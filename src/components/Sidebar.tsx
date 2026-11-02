@@ -7,6 +7,8 @@ import type { GuideStep } from '../rules/guide';
 import { useStore } from '../store';
 import type { AppEdge, AppNode, ConnData, Decision, Issue, PropDef, PropValue, ServiceNode, ZoneNode } from '../types';
 import { ServiceIcon } from './ServiceIcon';
+import { fmtRps, profileFor } from '../sim/profiles';
+import { useSim } from '../sim/store';
 
 type Tab = 'props' | 'issues' | 'guide' | 'adr';
 
@@ -171,6 +173,7 @@ function ServiceInspector({ node, issues }: { node: ServiceNode; issues: Issue[]
           ))}
         </div>
       ) : null}
+      <SimSection node={node} />
       <Field label="Notas / responsabilidad">
         <textarea rows={3} placeholder="¿Qué hace esta pieza? ¿Quién es dueño?" value={node.data.notes ?? ''} onChange={(e) => updateNode(node.id, { notes: e.target.value })} />
       </Field>
@@ -192,6 +195,57 @@ function ServiceInspector({ node, issues }: { node: ServiceNode; issues: Issue[]
       <button className="btn danger block" onClick={() => deleteIds([node.id])}>
         Eliminar pieza
       </button>
+    </div>
+  );
+}
+
+function SimSection({ node }: { node: ServiceNode }) {
+  const { updateNode } = useStore.getState();
+  const simOpen = useSim((s) => s.open);
+  const frame = useSim((s) => (s.open && s.result ? s.result.frames[s.idx] : null));
+  const p = profileFor(node);
+  if (p.passive || ['user', 'admin'].includes(node.data.serviceId)) return null;
+  const f = frame?.nodes[node.id];
+  const capTotal = Number.isFinite(p.perInstance) ? p.perInstance * (p.scale === 'instant' ? 1 : p.instances) : Infinity;
+  const ov = node.data.props['sim.capacity'];
+  const setProp = (k: string, v: string | number | boolean) => updateNode(node.id, { props: { [k]: v } });
+  return (
+    <div className="insp-section sim-section">
+      <div className="insp-section-title">Simulación</div>
+      <div className="sim-cap">
+        <div>
+          <b>{fmtRps(capTotal)}</b> req/s de capacidad inicial
+          {p.instances > 1 && p.scale !== 'instant' ? ` (${fmtRps(p.perInstance)} × ${p.instances})` : ''}
+          {p.maxInstances > p.instances ? ` · escala hasta ×${p.maxInstances}` : ''}
+        </div>
+        <div className="muted small">{p.basis}</div>
+        {p.quota && <div className="muted small">Cuota: {p.quota}</div>}
+      </div>
+      {simOpen && f && (
+        <div className={`sim-now-node st-${f.status}`}>
+          Ahora: <b>{fmtRps(f.offered)} req/s</b>
+          {Number.isFinite(f.cap) && f.cap > 0 ? ` de ${fmtRps(f.cap)} (${Math.round(f.util * 100)}%)` : f.status === 'down' ? ' — caído' : ''}
+        </div>
+      )}
+      <Field label="Capacidad por instancia (req/s)" help="Déjalo vacío para usar la estimación. Pon aquí el resultado de tus pruebas de carga.">
+        <input type="number" min={0} placeholder={Number.isFinite(p.perInstance) ? String(Math.round(p.perInstance)) : '∞'} value={ov === undefined || ov === '' ? '' : Number(ov)} onChange={(e) => setProp('sim.capacity', e.target.value === '' ? '' : Number(e.target.value))} />
+      </Field>
+      {node.data.serviceId === 'lambda' && (
+        <div className="row gap">
+          <Field label="Duración media (ms)">
+            <input type="number" min={1} value={Number(node.data.props['sim.durationMs'] ?? 120)} onChange={(e) => setProp('sim.durationMs', Number(e.target.value))} />
+          </Field>
+          <Field label="Concurrencia máx.">
+            <input type="number" min={1} value={Number(node.data.props['sim.concurrency'] ?? 1000)} onChange={(e) => setProp('sim.concurrency', Number(e.target.value))} />
+          </Field>
+        </div>
+      )}
+      {node.data.serviceId === 'ecs' && (
+        <label className="toggle">
+          <input type="checkbox" checked={node.data.props['sim.autoscaling'] === undefined ? true : !!node.data.props['sim.autoscaling']} onChange={(e) => setProp('sim.autoscaling', e.target.checked)} />
+          <span>Service Auto Scaling</span>
+        </label>
+      )}
     </div>
   );
 }
