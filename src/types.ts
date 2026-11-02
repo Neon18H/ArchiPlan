@@ -138,6 +138,17 @@ export interface ProjectMeta {
   updatedAt: string;
 }
 
+export type ThreatStatusOverride = 'aceptada' | 'no-aplica' | 'mitigada';
+
+/** Estado que el arquitecto registra para una amenaza (se guarda en el proyecto). */
+export interface ThreatState {
+  status?: ThreatStatusOverride;
+  note?: string;
+  owner?: string;
+  /** Controles manuales marcados como implementados. */
+  controls?: Record<string, boolean>;
+}
+
 export interface Project {
   format: 'archiplan';
   version: 1;
@@ -145,6 +156,7 @@ export interface Project {
   nodes: AppNode[];
   edges: AppEdge[];
   decisions: Decision[];
+  threats?: Record<string, ThreatState>;
 }
 
 export type Severity = 'error' | 'warn' | 'info';

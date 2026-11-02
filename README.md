@@ -34,6 +34,7 @@ Los proyectos se guardan como archivos `*.archi.json` en la carpeta `projects/`.
 | **Plantillas** | Web en 3 capas, API serverless, microservicios en ECS, orientada a eventos, sitio estático y pipeline de datos. |
 | **Decisiones (ADR)** | Registro de decisiones con contexto, decisión y consecuencias. |
 | **Simulación** | Carga, picos, caída de instancias o AZ, falla de dependencias, DDoS L7 y L3/L4, y ataques web contra el WAF (ver abajo). |
+| **Modelo de amenazas (STRIDE)** | Genera las amenazas por pieza, por flujo que cruza un límite de confianza y de la cuenta. Calcula el riesgo, detecta controles en el diagrama y aplica mitigaciones con un clic; se conecta con la simulación (ver abajo). |
 | **Exportar** | PNG, SVG, PDF (A3), documento de arquitectura en HTML (imprimible a PDF) o Markdown, Mermaid, Terraform y JSON. |
 
 ## Simulación
@@ -56,6 +57,19 @@ Mientras corre, el lienzo muestra el tráfico de cada flecha y la carga y el est
 
 Las capacidades son **estimaciones** de orden de magnitud: cuotas por defecto de AWS (API Gateway 10k req/s, concurrencia de Lambda 1.000, Cognito 120 req/s…) y cargas típicas por tamaño de instancia. Sirven para comparar diseños y encontrar puntos únicos de falla, **no reemplazan una prueba de carga real**. Cada pieza permite poner su capacidad medida en *Propiedades → Simulación*. Los supuestos están en `src/sim/profiles.ts` y el modelo en `src/sim/engine.ts`.
 
+## Modelo de amenazas (STRIDE)
+
+La pestaña **Amenazas** genera un modelo STRIDE a partir del diagrama, y se actualiza cada vez que lo cambias:
+
+- **Zonas y límites de confianza.** Cada pieza queda en una zona según dónde está dibujada: Internet, Borde AWS, Servicios AWS, subnet pública, privada o de datos, o un grupo propio. Las flechas que pasan a una zona de mayor confianza se marcan en el lienzo como límites (⛨).
+- **Amenazas por elemento.** STRIDE por elemento: actores, sistemas externos, puntos de entrada, APIs, cómputo, datos, mensajería, identidad y LLM (prompt injection), más amenazas de la cuenta (auditoría, detección) y de cada flujo que cruza un límite.
+- **Riesgo.** Probabilidad × impacto (1‑3 cada uno). El impacto de los datos sale de su **clasificación** (Público, Interno, Confidencial o Restringido), que se define en las propiedades de cada pieza de datos.
+- **Controles.** Unos se **detectan en el diagrama** (WAF y sus reglas, cifrado, Multi‑AZ, Secrets Manager, authorizer, CloudTrail, GuardDuty…) y traen arreglo ⚡ con un clic. Otros son **manuales** y se marcan al implementarlos: consultas parametrizadas, BOLA, firma de webhooks, rol de mínimo privilegio, etc.
+- **Estado.** Se calcula solo (abierta, parcial o mitigada). También puedes marcar el riesgo como aceptado o "no aplica", con responsable y justificación. Todo se guarda en el proyecto.
+- **Referencias.** OWASP Top 10 2021, OWASP API Security 2023, OWASP LLM Top 10 2025, CWE y MITRE ATT&CK.
+- **Integración con la simulación.** Las amenazas de DoS, inyección, bots o indisponibilidad tienen un botón para correr el escenario correspondiente sobre la pieza afectada.
+- **Exportación.** CSV (para Jira, Excel o GRC) y una sección completa en el documento de arquitectura.
+
 ### Sobre el Terraform
 Es un **esqueleto** para el provider AWS 5.x. Incluye VPC, subnets por AZ, IGW/NAT, rutas y los recursos de cada pieza. Los **security groups** salen de las flechas (origen → destino, con el puerto del protocolo) y el **IAM de mínimo privilegio** sale de lo que cada cómputo consume, además de los triggers (SQS/Kinesis/S3 → Lambda), suscripciones SNS y reglas de EventBridge. Lo que falta por completar está marcado con `TODO`. Revísalo antes de `terraform apply`.
 
@@ -68,6 +82,7 @@ src/rules/         connections.ts (matriz de reglas), validate.ts (hallazgos), g
 src/templates/     Plantillas y lógica del asistente
 src/export/        Mermaid, Terraform, documento, imagen/PDF
 src/sim/           Simulación: perfiles de capacidad, escenarios y motor
+src/threats/       Modelo de amenazas STRIDE: zonas de confianza, reglas y controles
 src/components/    Lienzo, paleta, panel lateral, modales
 ```
 

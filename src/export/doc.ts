@@ -3,6 +3,7 @@ import { byId, isService, isZone, placementOf } from '../lib/graph';
 import { buildGuide } from '../rules/guide';
 import { validate } from '../rules/validate';
 import type { ConnData, Project, ServiceNode } from '../types';
+import { buildThreats, STATUS_LABEL, STRIDE, summarizeThreats, type Stride, type Threat } from '../threats/model';
 
 const PLACE: Record<string, string> = { outside: 'Global / fuera de VPC', region: 'Regional', 'subnet-public': 'Subnet pública', 'subnet-private': 'Subnet privada', 'subnet-data': 'Subnet de datos' };
 const SEV: Record<string, string> = { error: 'Crítico', warn: 'Advertencia', info: 'Sugerencia' };
@@ -19,6 +20,9 @@ interface DocModel {
   risks: { sev: string; title: string; detail: string }[];
   checklist: { title: string; done: boolean; optional?: boolean }[];
   next: string[];
+  threats: Threat[];
+  boundaries: string[];
+  tsum: ReturnType<typeof summarizeThreats>;
 }
 
 function model(p: Project): DocModel {
@@ -27,7 +31,8 @@ function model(p: Project): DocModel {
   const services = nodes.filter(isService);
   const label = (id: string) => (map.get(id)?.data as { label?: string })?.label ?? id;
   const issues = validate(nodes, edges);
-  const guide = buildGuide(nodes, edges, decisions, issues);
+  const tm = buildThreats(nodes, edges, p.threats ?? {});
+  const guide = buildGuide(nodes, edges, decisions, issues, tm.threats);
   const role = (n: ServiceNode) => getService(n.data.serviceId).role;
   const actors = services.filter((n) => role(n) === 'actor');
   const externals = services.filter((n) => role(n) === 'external');
@@ -93,8 +98,12 @@ function model(p: Project): DocModel {
     decisions,
     risks: issues.map((i) => ({ sev: SEV[i.severity], title: i.title, detail: i.detail })),
     checklist: guide.map((g) => ({ title: g.title, done: g.done, optional: g.optional })),
+    threats: tm.threats,
+    boundaries: [...new Set(tm.boundaries.filter((b) => b.inbound).map((b) => b.label))],
+    tsum: summarizeThreats(tm.threats),
     next: [
       ...issues.filter((i) => i.severity === 'error').map((i) => `Resolver: ${i.title}`),
+      ...tm.threats.filter((t) => (t.status === 'abierta' || t.status === 'parcial') && t.risk === 'Crítico').map((t) => `Mitigar amenaza crítica: ${t.title}`),
       ...guide.filter((g) => !g.done && !g.optional).map((g) => `${g.title.replace(/^\d+\.\s*/, '')}: ${g.question}`),
     ],
   };
@@ -132,8 +141,21 @@ export function toMarkdown(p: Project, diagramFile = 'diagrama.png'): string {
   L.push('## 8. Riesgos y hallazgos', '');
   if (m.risks.length) L.push('| Severidad | Hallazgo | Detalle |', '|---|---|---|', ...m.risks.map((r) => `| ${r.sev} | ${mdEsc(r.title)} | ${mdEsc(r.detail)} |`), '');
   else L.push('Sin hallazgos: el diagrama cumple todas las reglas.', '');
-  L.push('## 9. Checklist de diseño', '', ...m.checklist.map((c) => `- [${c.done ? 'x' : ' '}] ${c.title}${c.optional ? ' _(opcional)_' : ''}`), '');
-  L.push('## 10. Próximos pasos', '', ...(m.next.length ? m.next.map((n) => `- ${n}`) : ['- Revisar con el equipo y pasar a implementación.']), '');
+  L.push('## 9. Modelo de amenazas (STRIDE)', '');
+  if (!m.threats.length) L.push('Sin elementos para modelar.', '');
+  else {
+    L.push(`${m.tsum.total} amenazas identificadas: **${m.tsum.open} pendientes** (${m.tsum.critical} críticas, ${m.tsum.high} altas, ${m.tsum.medium} medias, ${m.tsum.low} bajas) y ${m.tsum.handled} mitigadas, aceptadas o no aplicables.`, '');
+    if (m.boundaries.length) L.push('**Límites de confianza:** ' + m.boundaries.join(' · '), '');
+    L.push('| Categoría | Propiedad | Total | Pendientes |', '|---|---|---|---|', ...m.tsum.byStride.map((b) => `| ${b.k} — ${STRIDE[b.k as Stride].es} | ${STRIDE[b.k as Stride].property} | ${b.total} | ${b.open} |`), '');
+    L.push('| STRIDE | Amenaza | Elemento | Riesgo | Estado | Controles pendientes | Ref. |', '|---|---|---|---|---|---|---|');
+    for (const t of m.threats) {
+      const pend = t.controls.filter((c) => c.required && !c.ok).map((c) => c.label).join('; ');
+      L.push(`| ${t.stride.join('')} | ${mdEsc(t.title)} | ${mdEsc(t.element)} | ${t.risk} | ${STATUS_LABEL[t.status]}${t.note ? ` — ${mdEsc(t.note)}` : ''} | ${mdEsc(pend || '—')} | ${mdEsc(t.refs.slice(0, 2).join(', '))} |`);
+    }
+    L.push('');
+  }
+  L.push('## 10. Checklist de diseño', '', ...m.checklist.map((c) => `- [${c.done ? 'x' : ' '}] ${c.title}${c.optional ? ' _(opcional)_' : ''}`), '');
+  L.push('## 11. Próximos pasos', '', ...(m.next.length ? m.next.map((n) => `- ${n}`) : ['- Revisar con el equipo y pasar a implementación.']), '');
   L.push('---', `_Generado con ArchiPlan el ${new Date().toISOString().slice(0, 16).replace('T', ' ')}._`, '');
   return L.join('\n');
 }
@@ -167,6 +189,10 @@ export function toHtmlDoc(p: Project, diagramDataUrl?: string): string {
   .check li { list-style: none; } .check { padding-left: 4px; }
   .toolbar { position: sticky; top: 0; background: #fff; padding: 10px 0; text-align: right; }
   .toolbar button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--ink); background: var(--ink); color: #fff; cursor: pointer; }
+  .stride { display: inline-block; width: 16px; height: 16px; border-radius: 3px; color: #fff; font-size: 10px; font-weight: 800; text-align: center; line-height: 16px; margin-right: 1px; }
+  .muted { color: var(--muted); } .refs { font-family: ui-monospace, Consolas, monospace; font-size: 11px; color: var(--muted); }
+  .risk-Crítico { background: #9b1c1c; color: #fff; } .risk-Alto { background: #ffe3e3; color: #b02525; } .risk-Medio { background: #fff3bf; color: #8a5a00; } .risk-Bajo { background: #ebfbee; color: #0b7a0b; }
+  ul.ctl { margin: 0; padding: 0; list-style: none; font-size: 12px; } ul.ctl li.ok { color: #0b7a0b; } ul.ctl li.no { color: #b02525; } ul.ctl li.opt { color: var(--muted); }
   @media print { .toolbar { display: none; } body { margin: 0; max-width: none; } h2 { break-after: avoid; } table, .adr { break-inside: avoid; } }
 </style></head><body>
 <div class="toolbar"><button onclick="window.print()">Imprimir / Guardar como PDF</button></div>
@@ -191,9 +217,19 @@ ${m.flows.length ? table(['Origen', 'Destino', 'Protocolo', 'Tipo', 'Descripció
 ${m.decisions.length ? m.decisions.map((d, i) => `<div class="adr"><h3>ADR‑${String(i + 1).padStart(3, '0')}: ${h(d.title)} <span class="st">${h(d.status)}</span></h3><p><strong>Contexto.</strong> ${h(d.context || '—')}</p><p><strong>Decisión.</strong> ${h(d.decision || '—')}</p><p><strong>Consecuencias.</strong> ${h(d.consequences || '—')}</p></div>`).join('') : '<p><em>No hay decisiones registradas.</em></p>'}
 <h2>8. Riesgos y hallazgos</h2>
 ${m.risks.length ? `<table><thead><tr><th>Severidad</th><th>Hallazgo</th><th>Detalle</th></tr></thead><tbody>${m.risks.map((r) => `<tr><td><span class="pill ${sevClass[r.sev]}">${h(r.sev)}</span></td><td>${h(r.title)}</td><td>${h(r.detail)}</td></tr>`).join('')}</tbody></table>` : '<p>Sin hallazgos: el diagrama cumple todas las reglas.</p>'}
-<h2>9. Checklist de diseño</h2>
+<h2>9. Modelo de amenazas (STRIDE)</h2>
+${m.threats.length ? `
+<p>${m.tsum.total} amenazas identificadas: <strong>${m.tsum.open} pendientes</strong> (${m.tsum.critical} críticas, ${m.tsum.high} altas, ${m.tsum.medium} medias, ${m.tsum.low} bajas) y ${m.tsum.handled} mitigadas, aceptadas o no aplicables.</p>
+${m.boundaries.length ? `<p><strong>Límites de confianza:</strong> ${m.boundaries.map(h).join(' · ')}</p>` : ''}
+<table><thead><tr><th>Categoría</th><th>Propiedad</th><th>Total</th><th>Pendientes</th></tr></thead><tbody>${m.tsum.byStride.map((b) => `<tr><td><span class="stride" style="background:${STRIDE[b.k as Stride].color}">${b.k}</span> ${h(STRIDE[b.k as Stride].es)}</td><td>${h(STRIDE[b.k as Stride].property)}</td><td>${b.total}</td><td>${b.open}</td></tr>`).join('')}</tbody></table>
+<table><thead><tr><th>STRIDE</th><th>Amenaza</th><th>Riesgo</th><th>Estado</th><th>Controles</th></tr></thead><tbody>${m.threats
+  .map(
+    (t) => `<tr><td>${t.stride.map((k) => `<span class="stride" style="background:${STRIDE[k].color}">${k}</span>`).join('')}</td><td><strong>${h(t.title)}</strong><br><span class="muted">${h(t.element)}${t.boundary ? ` · límite ${h(t.boundary)}` : ''}</span><br><span class="refs">${h(t.refs.join(' · '))}</span></td><td><span class="pill risk-${h(t.risk)}">${h(t.risk)}</span></td><td>${h(STATUS_LABEL[t.status])}${t.owner ? `<br><span class="muted">${h(t.owner)}</span>` : ''}${t.note ? `<br><em>${h(t.note)}</em>` : ''}</td><td><ul class="ctl">${t.controls.map((c) => `<li class="${c.ok ? 'ok' : c.required ? 'no' : 'opt'}">${c.ok ? '✓' : c.required ? '✗' : '○'} ${h(c.label)}</li>`).join('')}</ul></td></tr>`,
+  )
+  .join('')}</tbody></table>` : '<p>Sin elementos para modelar.</p>'}
+<h2>10. Checklist de diseño</h2>
 <ul class="check">${m.checklist.map((c) => `<li>${c.done ? '✅' : '⬜'} ${h(c.title)}${c.optional ? ' <em>(opcional)</em>' : ''}</li>`).join('')}</ul>
-<h2>10. Próximos pasos</h2>
+<h2>11. Próximos pasos</h2>
 <ul>${(m.next.length ? m.next : ['Revisar con el equipo y pasar a implementación.']).map((n) => `<li>${h(n)}</li>`).join('')}</ul>
 <p class="sub" style="margin-top:40px">Generado con ArchiPlan · ${new Date().toISOString().slice(0, 16).replace('T', ' ')}</p>
 </body></html>`;

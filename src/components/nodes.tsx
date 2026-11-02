@@ -36,9 +36,10 @@ function simExtra(f: NodeFrame): { text: string; tone?: 'good' | 'bad' } | null 
 
 export const ServiceNodeView = memo(function ServiceNodeView({ id, data, selected }: NodeProps<ServiceNode>) {
   const def = getService(data.serviceId);
-  const { nodeIssues, dimmed, readOnly, sim } = useCanvasCtx();
+  const { nodeIssues, dimmed, readOnly, sim, stride } = useCanvasCtx();
   const simF = sim?.nodes[id];
-  const issue = sim ? undefined : nodeIssues.get(id);
+  const thr = stride?.nodes.get(id);
+  const issue = sim || stride ? undefined : nodeIssues.get(id);
   const color = CATEGORIES[def.category].color;
   const isActor = def.role === 'actor' || def.role === 'external';
   return (
@@ -70,6 +71,11 @@ export const ServiceNodeView = memo(function ServiceNodeView({ id, data, selecte
       </div>
       {simF && !isActor && ['saturated', 'down', 'degraded', 'hot'].includes(simF.status) && <span className={`sim-pill st-${simF.status}`}>{STATUS_LABEL[simF.status]}</span>}
       {simF && sim?.targetId === id && <span className="sim-target">Objetivo</span>}
+      {thr && thr.open > 0 && (
+        <span className={`thr-badge r-${thr.worst}`} title={`${thr.open} amenaza(s) pendiente(s) · máximo riesgo ${thr.worst}`}>
+          ⛨ {thr.open}
+        </span>
+      )}
       {simF && !isActor && Number.isFinite(simF.cap) && simF.cap > 0 && simF.status !== 'passive' && simF.blocked === undefined && (
         <span className={`sim-ubar st-${simF.status}`}>
           <span style={{ width: `${Math.min(100, simF.util * 100)}%` }} />

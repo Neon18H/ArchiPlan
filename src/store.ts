@@ -4,7 +4,7 @@ import { defaultProps, getService, ZONE_PARENT, ZONES } from './catalog/catalog'
 import { absolutePosition, ancestors, byId, isService, isZone, nodeSize, placementOf, sortNodes, uid, ZONE_DEPTH } from './lib/graph';
 import { buildFromSpec, NODE_H, NODE_W, type Spec } from './lib/layout';
 import { evaluateConnection } from './rules/connections';
-import type { AppEdge, AppNode, ConnData, Decision, Fix, Layer, Placement, Project, ProjectMeta, PropValue, ServiceNode, ZoneKind, ZoneNode } from './types';
+import type { AppEdge, AppNode, ConnData, Decision, Fix, Layer, Placement, Project, ProjectMeta, PropValue, ServiceNode, ThreatState, ZoneKind, ZoneNode } from './types';
 
 export type ViewMode = 'c2' | 'c1';
 
@@ -13,6 +13,7 @@ interface Snapshot {
   edges: AppEdge[];
   decisions: Decision[];
   meta: ProjectMeta;
+  threats: Record<string, ThreatState>;
 }
 
 export interface Toast {
@@ -55,6 +56,8 @@ interface State extends Snapshot {
   addDecision: (d?: Partial<Decision>) => void;
   updateDecision: (id: string, patch: Partial<Decision>) => void;
   deleteDecision: (id: string) => void;
+  setThreatState: (id: string, patch: Partial<ThreatState>) => void;
+  setThreatControl: (id: string, key: string, value: boolean) => void;
 
   loadProject: (p: Project, projectId?: string | null) => void;
   loadSpec: (spec: Spec, meta: Partial<ProjectMeta>, decisions?: Omit<Decision, 'id'>[]) => void;
@@ -92,7 +95,7 @@ function loadAutosave(): Partial<State> | null {
     if (!raw) return null;
     const p = JSON.parse(raw) as Project & { projectId?: string | null };
     if (p.format !== 'archiplan') return null;
-    return { nodes: sortNodes(p.nodes), edges: p.edges, decisions: p.decisions ?? [], meta: { ...emptyMeta(), ...p.meta }, projectId: p.projectId ?? null };
+    return { nodes: sortNodes(p.nodes), edges: p.edges, decisions: p.decisions ?? [], threats: p.threats ?? {}, meta: { ...emptyMeta(), ...p.meta }, projectId: p.projectId ?? null };
   } catch {
     return null;
   }
@@ -212,6 +215,7 @@ export const useStore = create<State>((set, get) => ({
   nodes: init?.nodes ?? [],
   edges: init?.edges ?? [],
   decisions: init?.decisions ?? [],
+  threats: init?.threats ?? {},
   meta: init?.meta ?? emptyMeta(),
   projectId: init?.projectId ?? null,
   dirty: false,
@@ -234,21 +238,21 @@ export const useStore = create<State>((set, get) => ({
       }
       lastKey = coalesceKey ?? '';
       lastT = t;
-      const { nodes, edges, decisions, meta, past } = get();
-      set({ past: [...past.slice(-99), { nodes, edges, decisions, meta }], future: [], dirty: true });
+      const { nodes, edges, decisions, meta, threats, past } = get();
+      set({ past: [...past.slice(-99), { nodes, edges, decisions, meta, threats }], future: [], dirty: true });
     };
   })(),
   undo: () => {
-    const { past, future, nodes, edges, decisions, meta } = get();
+    const { past, future, nodes, edges, decisions, meta, threats } = get();
     const prev = past[past.length - 1];
     if (!prev) return;
-    set({ ...prev, past: past.slice(0, -1), future: [{ nodes, edges, decisions, meta }, ...future].slice(0, 100), dirty: true });
+    set({ ...prev, past: past.slice(0, -1), future: [{ nodes, edges, decisions, meta, threats }, ...future].slice(0, 100), dirty: true });
   },
   redo: () => {
-    const { past, future, nodes, edges, decisions, meta } = get();
+    const { past, future, nodes, edges, decisions, meta, threats } = get();
     const next = future[0];
     if (!next) return;
-    set({ ...next, future: future.slice(1), past: [...past, { nodes, edges, decisions, meta }], dirty: true });
+    set({ ...next, future: future.slice(1), past: [...past, { nodes, edges, decisions, meta, threats }], dirty: true });
   },
 
   onNodesChange: (changes) => {
@@ -497,12 +501,26 @@ export const useStore = create<State>((set, get) => ({
     set({ decisions: get().decisions.filter((d) => d.id !== id) });
   },
 
+  setThreatState: (id, patch) => {
+    get().commit(`threat:${id}`);
+    const cur = get().threats[id] ?? {};
+    const next = { ...cur, ...patch };
+    if (patch.status === undefined && 'status' in patch) delete next.status;
+    set({ threats: { ...get().threats, [id]: next } });
+  },
+  setThreatControl: (id, key, value) => {
+    get().commit();
+    const cur = get().threats[id] ?? {};
+    set({ threats: { ...get().threats, [id]: { ...cur, controls: { ...(cur.controls ?? {}), [key]: value } } } });
+  },
+
   loadProject: (p, projectId = null) => {
     get().commit();
     set({
       nodes: sortNodes(p.nodes.map((n) => ({ ...n, selected: false }))),
       edges: p.edges.map((e) => ({ ...e, type: 'floating', selected: false })),
       decisions: p.decisions ?? [],
+      threats: p.threats ?? {},
       meta: { ...emptyMeta(), ...p.meta },
       projectId,
       dirty: false,
@@ -526,10 +544,10 @@ export const useStore = create<State>((set, get) => ({
     set({ dirty: true });
   },
   newEmpty: () => {
-    get().loadProject({ format: 'archiplan', version: 1, meta: emptyMeta(), nodes: [], edges: [], decisions: [] }, null);
+    get().loadProject({ format: 'archiplan', version: 1, meta: emptyMeta(), nodes: [], edges: [], decisions: [], threats: {} }, null);
   },
   toProject: () => {
-    const { nodes, edges, decisions, meta } = get();
+    const { nodes, edges, decisions, meta, threats } = get();
     return {
       format: 'archiplan',
       version: 1,
@@ -545,6 +563,7 @@ export const useStore = create<State>((set, get) => ({
         return e as AppEdge;
       }),
       decisions,
+      threats,
     };
   },
   setProjectId: (id) => set({ projectId: id }),
@@ -600,7 +619,7 @@ export const useStore = create<State>((set, get) => ({
 // Autoguardado local (por si se cierra el navegador)
 let t: ReturnType<typeof setTimeout> | undefined;
 useStore.subscribe((s, prev) => {
-  if (s.nodes === prev.nodes && s.edges === prev.edges && s.decisions === prev.decisions && s.meta === prev.meta && s.projectId === prev.projectId) return;
+  if (s.nodes === prev.nodes && s.edges === prev.edges && s.decisions === prev.decisions && s.meta === prev.meta && s.threats === prev.threats && s.projectId === prev.projectId) return;
   clearTimeout(t);
   t = setTimeout(() => {
     try {

@@ -9,10 +9,13 @@ import type { AppEdge, AppNode, ConnData, Decision, Issue, PropDef, PropValue, S
 import { ServiceIcon } from './ServiceIcon';
 import { fmtRps, profileFor } from '../sim/profiles';
 import { useSim } from '../sim/store';
+import { ThreatsPanel } from './ThreatsPanel';
+import { summarizeThreats, type Threat } from '../threats/model';
+import { useThreatsUi } from '../threats/ui';
 
-type Tab = 'props' | 'issues' | 'guide' | 'adr';
+type Tab = 'props' | 'issues' | 'guide' | 'adr' | 'threats';
 
-export function Sidebar({ issues, guide }: { issues: Issue[]; guide: GuideStep[] }) {
+export function Sidebar({ issues, guide, threats }: { issues: Issue[]; guide: GuideStep[]; threats: Threat[] }) {
   const [tab, setTab] = useState<Tab>('guide');
   const nodes = useStore((s) => s.nodes);
   const edges = useStore((s) => s.edges);
@@ -21,6 +24,10 @@ export function Sidebar({ issues, guide }: { issues: Issue[]; guide: GuideStep[]
   const selEdges = edges.filter((e) => e.selected);
   const counts = { error: issues.filter((i) => i.severity === 'error').length, warn: issues.filter((i) => i.severity === 'warn').length };
   const done = guide.filter((g) => g.done).length;
+  useEffect(() => {
+    useThreatsUi.getState().setOverlay(tab === 'threats');
+  }, [tab]);
+  const tsum = summarizeThreats(threats);
   useEffect(() => {
     const h = (e: Event) => setTab((e as CustomEvent).detail as Tab);
     window.addEventListener('archiplan:tab', h);
@@ -32,7 +39,7 @@ export function Sidebar({ issues, guide }: { issues: Issue[]; guide: GuideStep[]
   const [lastSel, setLastSel] = useState('');
   if (selKey !== lastSel) {
     setLastSel(selKey);
-    if (selKey && tab !== 'props') setTab('props');
+    if (selKey && tab !== 'props' && tab !== 'threats') setTab('props');
   }
 
   return (
@@ -47,7 +54,11 @@ export function Sidebar({ issues, guide }: { issues: Issue[]; guide: GuideStep[]
           {counts.error === 0 && counts.warn > 0 && <span className="count warn">{counts.warn}</span>}
         </button>
         <button className={tab === 'guide' ? 'on' : ''} onClick={() => setTab('guide')}>
-          Guía <span className="count plain">{done}/{guide.length}</span>
+          Guía {done < guide.length && <span className="count plain">{guide.length - done}</span>}
+        </button>
+        <button className={tab === 'threats' ? 'on' : ''} onClick={() => setTab('threats')} title="Modelo de amenazas STRIDE">
+          Amenazas
+          {tsum.critical + tsum.high > 0 ? <span className="count err">{tsum.critical + tsum.high}</span> : tsum.open > 0 ? <span className="count plain">{tsum.open}</span> : null}
         </button>
         <button className={tab === 'adr' ? 'on' : ''} onClick={() => setTab('adr')}>
           ADR {decisions.length > 0 && <span className="count plain">{decisions.length}</span>}
@@ -58,6 +69,7 @@ export function Sidebar({ issues, guide }: { issues: Issue[]; guide: GuideStep[]
         {tab === 'issues' && <IssuesPanel issues={issues} />}
         {tab === 'guide' && <GuidePanel guide={guide} />}
         {tab === 'adr' && <DecisionsPanel decisions={decisions} />}
+        {tab === 'threats' && <ThreatsPanel threats={threats} />}
       </div>
     </aside>
   );
@@ -501,6 +513,11 @@ function GuidePanel({ guide }: { guide: GuideStep[] }) {
                     </button>
                   ))}
                 </div>
+              )}
+              {g.id === 'threats' && (
+                <button className="btn small" onClick={() => window.dispatchEvent(new CustomEvent('archiplan:tab', { detail: 'threats' }))}>
+                  Ir a amenazas
+                </button>
               )}
               {g.id === 'adr' && (
                 <button className="btn small" onClick={() => window.dispatchEvent(new CustomEvent('archiplan:tab', { detail: 'adr' }))}>

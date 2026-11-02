@@ -7,8 +7,9 @@ export interface CanvasCtx {
   edgeIssues: Map<string, Severity>;
   dimmed: Set<string>;
   readOnly: boolean;
+  stride: { nodes: Map<string, { open: number; worst: string | null }>; boundaries: Map<string, string> } | null;
   sim: { nodes: Record<string, NodeFrame>; edges: Record<string, { rps: number; attack: number }>; targetId: string | null; playing: boolean } | null;
 }
 
-export const CanvasContext = createContext<CanvasCtx>({ nodeIssues: new Map(), edgeIssues: new Map(), dimmed: new Set(), readOnly: false, sim: null });
+export const CanvasContext = createContext<CanvasCtx>({ nodeIssues: new Map(), edgeIssues: new Map(), dimmed: new Set(), readOnly: false, sim: null, stride: null });
 export const useCanvasCtx = () => useContext(CanvasContext);

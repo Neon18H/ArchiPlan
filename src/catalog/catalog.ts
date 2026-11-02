@@ -85,6 +85,8 @@ export const ZONE_PARENT: Record<ZoneKind, (ZoneKind | null)[]> = {
 };
 
 const OUT_REG = ['outside', 'region'] as const;
+export const DATA_CLASSES = ['Público', 'Interno', 'Confidencial', 'Restringido'] as const;
+const DATA_CLASS: PropDef = { key: 'dataClass', label: 'Clasificación de los datos', type: 'select', default: 'Confidencial', options: [...DATA_CLASSES], help: 'Define el impacto en el modelo de amenazas. Restringido: datos personales, financieros o de salud.' };
 const VPC_APP = ['subnet-private', 'subnet-public'] as const;
 
 const S = (d: Omit<ServiceDef, 'provider'> & { provider?: ServiceDef['provider'] }): ServiceDef => ({
@@ -136,40 +138,40 @@ export const SERVICES: ServiceDef[] = [
   S({ id: 'apprunner', name: 'AWS App Runner', short: 'AR', category: 'containers', role: 'compute', layer: 'aplicacion', zones: [...OUT_REG], description: 'Despliega contenedores web sin gestionar balanceadores ni clústeres.', inboundProtocol: 'HTTPS' }),
 
   // ───────── Almacenamiento
-  S({ id: 's3', name: 'Amazon S3', short: 'S3', category: 'storage', role: 'storage', layer: 'datos', zones: [...OUT_REG], emitsEvents: true, description: 'Almacenamiento de objetos (archivos, estáticos, data lake).', inboundProtocol: 'HTTPS (S3 API)', props: [
+  S({ id: 's3', name: 'Amazon S3', short: 'S3', category: 'storage', role: 'storage', layer: 'datos', zones: [...OUT_REG], emitsEvents: true, description: 'Almacenamiento de objetos (archivos, estáticos, data lake).', inboundProtocol: 'HTTPS (S3 API)', props: [DATA_CLASS, 
     { key: 'public', label: 'Acceso público', type: 'bool', default: false },
     { key: 'versioning', label: 'Versionado', type: 'bool', default: true },
     { key: 'encrypted', label: 'Cifrado (SSE)', type: 'bool', default: true },
   ] }),
-  S({ id: 'efs', name: 'Amazon EFS', short: 'EFS', category: 'storage', role: 'storage', layer: 'datos', zones: ['subnet-private', 'subnet-data'], vpcBound: true, description: 'Sistema de archivos NFS compartido.', inboundProtocol: 'NFS 2049', props: [{ key: 'encrypted', label: 'Cifrado', type: 'bool', default: true }] }),
+  S({ id: 'efs', name: 'Amazon EFS', short: 'EFS', category: 'storage', role: 'storage', layer: 'datos', zones: ['subnet-private', 'subnet-data'], vpcBound: true, description: 'Sistema de archivos NFS compartido.', inboundProtocol: 'NFS 2049', props: [DATA_CLASS, { key: 'encrypted', label: 'Cifrado', type: 'bool', default: true }] }),
 
   // ───────── Bases de datos
-  S({ id: 'rds', name: 'Amazon RDS', short: 'RDS', category: 'database', role: 'datastore', layer: 'datos', zones: ['subnet-data', 'subnet-private'], vpcBound: true, description: 'Base de datos relacional administrada.', inboundProtocol: 'SQL', props: [
+  S({ id: 'rds', name: 'Amazon RDS', short: 'RDS', category: 'database', role: 'datastore', layer: 'datos', zones: ['subnet-data', 'subnet-private'], vpcBound: true, description: 'Base de datos relacional administrada.', inboundProtocol: 'SQL', props: [DATA_CLASS, 
     { key: 'engine', label: 'Motor', type: 'select', default: 'postgres', options: ['postgres', 'mysql', 'mariadb', 'sqlserver-ex', 'oracle-se2'] },
     { key: 'instanceClass', label: 'Clase', type: 'text', default: 'db.t4g.medium' },
     { key: 'multiAZ', label: 'Multi‑AZ', type: 'bool', default: true },
     { key: 'encrypted', label: 'Cifrado en reposo', type: 'bool', default: true },
     { key: 'storage', label: 'Almacenamiento (GB)', type: 'number', default: 50 },
   ] }),
-  S({ id: 'aurora', name: 'Amazon Aurora', short: 'AUR', category: 'database', role: 'datastore', layer: 'datos', zones: ['subnet-data', 'subnet-private'], vpcBound: true, description: 'Relacional compatible con MySQL/PostgreSQL, alta disponibilidad nativa.', inboundProtocol: 'SQL', props: [
+  S({ id: 'aurora', name: 'Amazon Aurora', short: 'AUR', category: 'database', role: 'datastore', layer: 'datos', zones: ['subnet-data', 'subnet-private'], vpcBound: true, description: 'Relacional compatible con MySQL/PostgreSQL, alta disponibilidad nativa.', inboundProtocol: 'SQL', props: [DATA_CLASS, 
     { key: 'engine', label: 'Motor', type: 'select', default: 'aurora-postgresql', options: ['aurora-postgresql', 'aurora-mysql'] },
     { key: 'serverless', label: 'Serverless v2', type: 'bool', default: true },
     { key: 'replicas', label: 'Réplicas de lectura', type: 'number', default: 1, min: 0, max: 15 },
     { key: 'encrypted', label: 'Cifrado en reposo', type: 'bool', default: true },
   ] }),
-  S({ id: 'dynamodb', name: 'Amazon DynamoDB', short: 'DDB', category: 'database', role: 'datastore', layer: 'datos', zones: [...OUT_REG], emitsEvents: true, description: 'NoSQL clave‑valor serverless de baja latencia.', inboundProtocol: 'HTTPS (DynamoDB API)', props: [
+  S({ id: 'dynamodb', name: 'Amazon DynamoDB', short: 'DDB', category: 'database', role: 'datastore', layer: 'datos', zones: [...OUT_REG], emitsEvents: true, description: 'NoSQL clave‑valor serverless de baja latencia.', inboundProtocol: 'HTTPS (DynamoDB API)', props: [DATA_CLASS, 
     { key: 'billing', label: 'Facturación', type: 'select', default: 'PAY_PER_REQUEST', options: ['PAY_PER_REQUEST', 'PROVISIONED'] },
     { key: 'pk', label: 'Partition key', type: 'text', default: 'pk' },
     { key: 'streams', label: 'DynamoDB Streams', type: 'bool', default: false },
     { key: 'pitr', label: 'Point‑in‑time recovery', type: 'bool', default: true },
   ] }),
-  S({ id: 'elasticache', name: 'Amazon ElastiCache', short: 'EC', category: 'database', role: 'cache', layer: 'datos', zones: ['subnet-data', 'subnet-private'], vpcBound: true, description: 'Caché en memoria (Redis/Valkey/Memcached).', inboundProtocol: 'Redis 6379', props: [
+  S({ id: 'elasticache', name: 'Amazon ElastiCache', short: 'EC', category: 'database', role: 'cache', layer: 'datos', zones: ['subnet-data', 'subnet-private'], vpcBound: true, description: 'Caché en memoria (Redis/Valkey/Memcached).', inboundProtocol: 'Redis 6379', props: [DATA_CLASS, 
     { key: 'engine', label: 'Motor', type: 'select', default: 'valkey', options: ['valkey', 'redis', 'memcached'] },
     { key: 'nodeType', label: 'Tipo de nodo', type: 'text', default: 'cache.t4g.small' },
     { key: 'replicas', label: 'Réplicas', type: 'number', default: 1, min: 0 },
   ] }),
-  S({ id: 'documentdb', name: 'Amazon DocumentDB', short: 'DOC', category: 'database', role: 'datastore', layer: 'datos', zones: ['subnet-data', 'subnet-private'], vpcBound: true, description: 'Base documental compatible con MongoDB.', inboundProtocol: 'MongoDB 27017', props: [{ key: 'instances', label: 'Instancias', type: 'number', default: 2 }, { key: 'encrypted', label: 'Cifrado en reposo', type: 'bool', default: true }] }),
-  S({ id: 'opensearch', name: 'Amazon OpenSearch', short: 'OS', category: 'database', role: 'search', layer: 'datos', zones: ['subnet-data', 'subnet-private'], vpcBound: true, description: 'Búsqueda de texto completo y analítica de logs.', inboundProtocol: 'HTTPS 443', props: [{ key: 'instances', label: 'Nodos de datos', type: 'number', default: 2 }, { key: 'encrypted', label: 'Cifrado en reposo', type: 'bool', default: true }] }),
+  S({ id: 'documentdb', name: 'Amazon DocumentDB', short: 'DOC', category: 'database', role: 'datastore', layer: 'datos', zones: ['subnet-data', 'subnet-private'], vpcBound: true, description: 'Base documental compatible con MongoDB.', inboundProtocol: 'MongoDB 27017', props: [DATA_CLASS, { key: 'instances', label: 'Instancias', type: 'number', default: 2 }, { key: 'encrypted', label: 'Cifrado en reposo', type: 'bool', default: true }] }),
+  S({ id: 'opensearch', name: 'Amazon OpenSearch', short: 'OS', category: 'database', role: 'search', layer: 'datos', zones: ['subnet-data', 'subnet-private'], vpcBound: true, description: 'Búsqueda de texto completo y analítica de logs.', inboundProtocol: 'HTTPS 443', props: [DATA_CLASS, { key: 'instances', label: 'Nodos de datos', type: 'number', default: 2 }, { key: 'encrypted', label: 'Cifrado en reposo', type: 'bool', default: true }] }),
 
   // ───────── Integración
   S({ id: 'sqs', name: 'Amazon SQS', short: 'SQS', category: 'integration', role: 'queue', layer: 'integracion', zones: [...OUT_REG], description: 'Cola de mensajes para desacoplar productores y consumidores.', inboundProtocol: 'async (SendMessage)', props: [
@@ -206,7 +208,7 @@ export const SERVICES: ServiceDef[] = [
   // ───────── Analítica
   S({ id: 'glue', name: 'AWS Glue', short: 'GLU', category: 'analytics', role: 'analytics', layer: 'datos', zones: [...OUT_REG], description: 'ETL serverless y catálogo de datos.' }),
   S({ id: 'athena', name: 'Amazon Athena', short: 'ATH', category: 'analytics', role: 'analytics', layer: 'datos', zones: [...OUT_REG], description: 'SQL sobre datos en S3.', inboundProtocol: 'SQL' }),
-  S({ id: 'redshift', name: 'Amazon Redshift', short: 'RS', category: 'analytics', role: 'datastore', layer: 'datos', zones: ['subnet-data', 'subnet-private'], vpcBound: true, description: 'Data warehouse columnar.', inboundProtocol: 'SQL 5439', props: [{ key: 'encrypted', label: 'Cifrado en reposo', type: 'bool', default: true }] }),
+  S({ id: 'redshift', name: 'Amazon Redshift', short: 'RS', category: 'analytics', role: 'datastore', layer: 'datos', zones: ['subnet-data', 'subnet-private'], vpcBound: true, description: 'Data warehouse columnar.', inboundProtocol: 'SQL 5439', props: [DATA_CLASS, { key: 'encrypted', label: 'Cifrado en reposo', type: 'bool', default: true }] }),
   S({ id: 'quicksight', name: 'Amazon QuickSight', short: 'QS', category: 'analytics', role: 'analytics', layer: 'datos', zones: [...OUT_REG], description: 'BI y dashboards.' }),
 
   // ───────── IA

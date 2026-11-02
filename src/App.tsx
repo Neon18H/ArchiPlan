@@ -8,6 +8,8 @@ import { Palette } from './components/Palette';
 import { Sidebar } from './components/Sidebar';
 import { SimPanel } from './components/SimPanel';
 import { useSim } from './sim/store';
+import { buildThreats } from './threats/model';
+import { useThreatsUi } from './threats/ui';
 import { download } from './export/image';
 import { isService } from './lib/graph';
 import { saveProjectFile, serverAvailable, slugify } from './lib/api';
@@ -194,6 +196,8 @@ export default function App() {
   const simResult = useSim((s) => s.result);
   const simIdx = useSim((s) => s.idx);
   const simPlaying = useSim((s) => s.playing);
+  const threatState = useStore((s) => s.threats);
+  const strideOverlay = useThreatsUi((s) => s.overlay);
 
   // Validación en vivo (solo depende de la estructura, no de la selección)
   const structKey = useMemo(
@@ -202,7 +206,8 @@ export default function App() {
   );
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const issues = useMemo(() => validate(nodes, edges), [structKey]);
-  const guide = useMemo(() => buildGuide(nodes, edges, decisions, issues), [structKey, decisions, issues]); // eslint-disable-line react-hooks/exhaustive-deps
+  const threatModel = useMemo(() => buildThreats(nodes, edges, threatState), [structKey, threatState]); // eslint-disable-line react-hooks/exhaustive-deps
+  const guide = useMemo(() => buildGuide(nodes, edges, decisions, issues, threatModel.threats), [structKey, decisions, issues, threatModel]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const ctx = useMemo(() => {
     const rank = { error: 3, warn: 2, info: 1 } as const;
@@ -220,8 +225,24 @@ export default function App() {
     if (layers.length) for (const n of nodes) if (isService(n) && !layers.includes(getService(n.data.serviceId).layer)) dimmed.add(n.id);
     const frame = simOpen && simResult && view === 'c2' ? simResult.frames[simIdx] : null;
     const sim = frame ? { nodes: frame.nodes, edges: frame.edges, targetId: simResult!.targetId, playing: simPlaying } : null;
-    return { nodeIssues, edgeIssues, dimmed, readOnly: view !== 'c2', sim };
-  }, [issues, layers, nodes, view, simOpen, simResult, simIdx, simPlaying]);
+    let stride: { nodes: Map<string, { open: number; worst: string | null }>; boundaries: Map<string, string> } | null = null;
+    if (strideOverlay && !sim && view === 'c2') {
+      const rank: Record<string, number> = { Bajo: 1, Medio: 2, Alto: 3, Crítico: 4 };
+      const nm = new Map<string, { open: number; worst: string | null }>();
+      for (const t of threatModel.threats) {
+        if (!(t.status === 'abierta' || t.status === 'parcial') || t.kind === 'flow') continue;
+        for (const id of t.nodeIds.slice(0, 1)) {
+          const cur = nm.get(id) ?? { open: 0, worst: null };
+          cur.open++;
+          if (!cur.worst || rank[t.risk] > rank[cur.worst]) cur.worst = t.risk;
+          nm.set(id, cur);
+        }
+      }
+      const short: Record<string, string> = { 'Borde AWS': 'Borde', 'Servicios AWS': 'AWS', 'Subnet pública': 'Pública', 'Subnet privada': 'Privada', 'Subnet de datos': 'Datos', 'Red corporativa': 'Corp.' };
+      stride = { nodes: nm, boundaries: new Map(threatModel.boundaries.filter((b) => b.inbound).map((b) => [b.edgeId, `${short[b.from] ?? b.from}→${short[b.to] ?? b.to}`])) };
+    }
+    return { nodeIssues, edgeIssues, dimmed, readOnly: view !== 'c2', sim, stride };
+  }, [issues, layers, nodes, view, simOpen, simResult, simIdx, simPlaying, strideOverlay, threatModel]);
 
   const counts = { error: issues.filter((i) => i.severity === 'error').length, warn: issues.filter((i) => i.severity === 'warn').length, info: issues.filter((i) => i.severity === 'info').length };
 
@@ -286,7 +307,7 @@ export default function App() {
               <Canvas />
               {simOpen && <SimPanel />}
             </div>
-            <Sidebar issues={issues} guide={guide} />
+            <Sidebar issues={issues} guide={guide} threats={threatModel.threats} />
           </div>
           {modal === 'templates' && <TemplatesModal onClose={() => setModal(null)} />}
           {modal === 'wizard' && <WizardModal onClose={() => setModal(null)} />}
