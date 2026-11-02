@@ -15,6 +15,7 @@ import { CATEGORIES, getService, ZONES } from '../catalog/catalog';
 import { byId, isService } from '../lib/graph';
 import { evaluateConnection } from '../rules/connections';
 import { useStore } from '../store';
+import { useSim } from '../sim/store';
 import type { AppEdge, AppNode, ConnData, ZoneKind } from '../types';
 import { FloatingEdge } from './FloatingEdge';
 import { ServiceNodeView, SystemNodeView, ZoneNodeView } from './nodes';
@@ -69,6 +70,7 @@ export function Canvas() {
   const view = useStore((s) => s.view);
   const meta = useStore((s) => s.meta);
   const focusRequest = useStore((s) => s.focusRequest);
+  const simOpen = useSim((s) => s.open);
   const { onNodesChange, onEdgesChange, onConnect, addService, addZone, reparent, commit, setViewportCenter, toast } = useStore.getState();
   const rf = useReactFlow();
   const wrapper = useRef<HTMLDivElement>(null);
@@ -165,14 +167,14 @@ export function Canvas() {
       >
         <Background variant={BackgroundVariant.Dots} gap={16} size={1.2} color="#cfd4da" />
         <Controls showInteractive={false} />
-        <MiniMap
+        {!simOpen && <MiniMap
           pannable
           zoomable
           nodeStrokeWidth={2}
           nodeColor={(n) => (n.type === 'service' ? CATEGORIES[getService((n.data as { serviceId: string }).serviceId).category].color : n.type === 'zone' ? 'transparent' : '#14171c')}
           nodeStrokeColor={(n) => (n.type === 'zone' ? ZONES[(n.data as { zoneKind: ZoneKind }).zoneKind].color : 'transparent')}
           maskColor="rgba(240,242,245,0.7)"
-        />
+        />}
       </ReactFlow>
       {nodes.length === 0 && view === 'c2' && (
         <div className="empty-hint">

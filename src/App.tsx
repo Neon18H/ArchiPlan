@@ -6,6 +6,8 @@ import { CanvasContext } from './components/context';
 import { ExportModal, ProjectsModal, TemplatesModal, WizardModal } from './components/Modals';
 import { Palette } from './components/Palette';
 import { Sidebar } from './components/Sidebar';
+import { SimPanel } from './components/SimPanel';
+import { useSim } from './sim/store';
 import { download } from './export/image';
 import { isService } from './lib/graph';
 import { saveProjectFile, serverAvailable, slugify } from './lib/api';
@@ -106,6 +108,10 @@ function Toolbar({ openModal, onSave, issuesCount }: { openModal: (m: ModalKind)
       </div>
 
       <div className="tb-group">
+        <SimToggle />
+      </div>
+
+      <div className="tb-group">
         <div className="seg" role="tablist" aria-label="Nivel C4">
           <button className={view === 'c1' ? 'on' : ''} onClick={() => setView('c1')} title="C4 nivel 1: actores, sistema y externos">
             C1 Contexto
@@ -145,6 +151,24 @@ function Toolbar({ openModal, onSave, issuesCount }: { openModal: (m: ModalKind)
   );
 }
 
+function SimToggle() {
+  const open = useSim((s) => s.open);
+  const setOpen = useSim((s) => s.setOpen);
+  const setView = useStore((s) => s.setView);
+  return (
+    <button
+      className={`tb-btn sim-toggle ${open ? 'on' : ''}`}
+      onClick={() => {
+        if (!open) setView('c2');
+        setOpen(!open);
+      }}
+      title="Simula carga, fallas y ataques sobre esta arquitectura"
+    >
+      {open ? '■ Cerrar simulación' : '▶ Simular'}
+    </button>
+  );
+}
+
 function Toasts() {
   const toasts = useStore((s) => s.toasts);
   const dismiss = useStore((s) => s.dismissToast);
@@ -166,6 +190,10 @@ export default function App() {
   const layers = useStore((s) => s.layers);
   const view = useStore((s) => s.view);
   const [modal, setModal] = useState<ModalKind>(null);
+  const simOpen = useSim((s) => s.open);
+  const simResult = useSim((s) => s.result);
+  const simIdx = useSim((s) => s.idx);
+  const simPlaying = useSim((s) => s.playing);
 
   // Validación en vivo (solo depende de la estructura, no de la selección)
   const structKey = useMemo(
@@ -190,8 +218,10 @@ export default function App() {
     }
     const dimmed = new Set<string>();
     if (layers.length) for (const n of nodes) if (isService(n) && !layers.includes(getService(n.data.serviceId).layer)) dimmed.add(n.id);
-    return { nodeIssues, edgeIssues, dimmed, readOnly: view !== 'c2' };
-  }, [issues, layers, nodes, view]);
+    const frame = simOpen && simResult && view === 'c2' ? simResult.frames[simIdx] : null;
+    const sim = frame ? { nodes: frame.nodes, edges: frame.edges, targetId: simResult!.targetId, playing: simPlaying } : null;
+    return { nodeIssues, edgeIssues, dimmed, readOnly: view !== 'c2', sim };
+  }, [issues, layers, nodes, view, simOpen, simResult, simIdx, simPlaying]);
 
   const counts = { error: issues.filter((i) => i.severity === 'error').length, warn: issues.filter((i) => i.severity === 'warn').length, info: issues.filter((i) => i.severity === 'info').length };
 
@@ -252,7 +282,10 @@ export default function App() {
           <Toolbar openModal={setModal} onSave={save} issuesCount={counts} />
           <div className="main">
             <Palette />
-            <Canvas />
+            <div className={`center ${simOpen ? 'with-sim' : ''}`}>
+              <Canvas />
+              {simOpen && <SimPanel />}
+            </div>
             <Sidebar issues={issues} guide={guide} />
           </div>
           {modal === 'templates' && <TemplatesModal onClose={() => setModal(null)} />}

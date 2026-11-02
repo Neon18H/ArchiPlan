@@ -33,7 +33,28 @@ Los proyectos se guardan como archivos `*.archi.json` en la carpeta `projects/`.
 | **Asistente** | Te hace unas 13 preguntas y genera la arquitectura inicial junto con sus ADR. |
 | **Plantillas** | Web en 3 capas, API serverless, microservicios en ECS, orientada a eventos, sitio estático y pipeline de datos. |
 | **Decisiones (ADR)** | Registro de decisiones con contexto, decisión y consecuencias. |
+| **Simulación** | Carga, picos, caída de instancias o AZ, falla de dependencias, DDoS L7 y L3/L4, y ataques web contra el WAF (ver abajo). |
 | **Exportar** | PNG, SVG, PDF (A3), documento de arquitectura en HTML (imprimible a PDF) o Markdown, Mermaid, Terraform y JSON. |
+
+## Simulación
+
+El botón **▶ Simular** abre un panel debajo del lienzo y corre escenarios sobre la arquitectura que dibujaste:
+
+| Escenario | Qué evalúa |
+|---|---|
+| Prueba de carga / Pico súbito | El primer cuello de botella, cuándo reacciona el autoescalado y cuánto tráfico se pierde mientras tanto. |
+| Falla de una instancia | El failover: el health check del balanceador, el reemplazo por Auto Scaling, la promoción de la réplica o del standby de la BD y la caché fría. |
+| Caída de una AZ | Qué pasa con las piezas sin Multi‑AZ o con una sola instancia, y si la VPC usa una sola AZ. |
+| Falla de una dependencia | El radio de impacto cuando una pieza deja de responder (una API externa, Cognito, la BD…). |
+| DDoS L7 (HTTP flood) | El rate limit del WAF (según las IPs de la botnet), Bot Control, la caché de la CDN, Shield Advanced, el throttling de API Gateway y el costo en Lambda ("denial of wallet"). |
+| DDoS L3/L4 | Si el punto de entrada está protegido por Shield Standard o queda expuesto. |
+| Ataques web | SQLi, XSS, path traversal y bots contra las reglas del WAF (Core Rule Set, reglas de SQLi, Bot Control). |
+
+Mientras corre, el lienzo muestra el tráfico de cada flecha y la carga y el estado de cada pieza (OK, alta carga, saturado, degradado, caído). La línea de tiempo trae los eventos (escalado, failover, bloqueos) y el panel derecho lista los hallazgos con recomendaciones.
+
+**Cómo se calcula.** Es un modelo de flujo por pasos de 5 s: el tráfico nace en los actores, se reparte por las flechas según el rol de cada pieza y cada pieza atiende hasta su capacidad (capacidad por instancia × instancias sanas). Lo que excede la capacidad falla, las colas acumulan y se vacían a la velocidad de sus consumidores, y el éxito de un request es el producto del éxito de cada salto síncrono.
+
+Las capacidades son **estimaciones** de orden de magnitud: cuotas por defecto de AWS (API Gateway 10k req/s, concurrencia de Lambda 1.000, Cognito 120 req/s…) y cargas típicas por tamaño de instancia. Sirven para comparar diseños y encontrar puntos únicos de falla, **no reemplazan una prueba de carga real**. Cada pieza permite poner su capacidad medida en *Propiedades → Simulación*. Los supuestos están en `src/sim/profiles.ts` y el modelo en `src/sim/engine.ts`.
 
 ### Sobre el Terraform
 Es un **esqueleto** para el provider AWS 5.x. Incluye VPC, subnets por AZ, IGW/NAT, rutas y los recursos de cada pieza. Los **security groups** salen de las flechas (origen → destino, con el puerto del protocolo) y el **IAM de mínimo privilegio** sale de lo que cada cómputo consume, además de los triggers (SQS/Kinesis/S3 → Lambda), suscripciones SNS y reglas de EventBridge. Lo que falta por completar está marcado con `TODO`. Revísalo antes de `terraform apply`.
@@ -46,6 +67,7 @@ src/catalog/       Catálogo de servicios, categorías, capas y zonas  ← agreg
 src/rules/         connections.ts (matriz de reglas), validate.ts (hallazgos), guide.ts (checklist)
 src/templates/     Plantillas y lógica del asistente
 src/export/        Mermaid, Terraform, documento, imagen/PDF
+src/sim/           Simulación: perfiles de capacidad, escenarios y motor
 src/components/    Lienzo, paleta, panel lateral, modales
 ```
 

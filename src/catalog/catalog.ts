@@ -185,7 +185,12 @@ export const SERVICES: ServiceDef[] = [
   S({ id: 'msk', name: 'Amazon MSK (Kafka)', short: 'MSK', category: 'integration', role: 'stream', layer: 'integracion', zones: ['subnet-private', 'subnet-data'], vpcBound: true, description: 'Apache Kafka administrado.', inboundProtocol: 'Kafka 9098', props: [{ key: 'brokers', label: 'Brokers', type: 'number', default: 3 }] }),
 
   // ───────── Seguridad
-  S({ id: 'waf', name: 'AWS WAF', short: 'WAF', category: 'security', role: 'waf', layer: 'seguridad', zones: ['outside', 'region'], description: 'Firewall de aplicación web (OWASP, rate limiting, bots).', props: [{ key: 'managedRules', label: 'Reglas administradas', type: 'bool', default: true }, { key: 'rateLimit', label: 'Límite req/5min por IP', type: 'number', default: 2000 }] }),
+  S({ id: 'waf', name: 'AWS WAF', short: 'WAF', category: 'security', role: 'waf', layer: 'seguridad', zones: ['outside', 'region'], description: 'Firewall de aplicación web (OWASP, rate limiting, bots).', props: [
+    { key: 'managedRules', label: 'Core Rule Set (OWASP: XSS, LFI…)', type: 'bool', default: true },
+    { key: 'sqliRules', label: 'Reglas de inyección SQL', type: 'bool', default: true },
+    { key: 'botControl', label: 'Bot Control', type: 'bool', default: false, help: 'Grupo de pago: detecta bots y scrapers aunque vengan de muchas IPs.' },
+    { key: 'rateLimit', label: 'Límite req/5min por IP', type: 'number', default: 2000 },
+  ] }),
   S({ id: 'shield', name: 'AWS Shield Advanced', short: 'SHD', category: 'security', role: 'waf', layer: 'seguridad', zones: ['outside'], description: 'Protección DDoS avanzada.' }),
   S({ id: 'cognito', name: 'Amazon Cognito', short: 'COG', category: 'security', role: 'identity', layer: 'seguridad', zones: [...OUT_REG], emitsEvents: true, description: 'Registro, login y emisión de tokens (OIDC/OAuth2).', inboundProtocol: 'OIDC/HTTPS', props: [{ key: 'mfa', label: 'MFA', type: 'select', default: 'OPTIONAL', options: ['OFF', 'OPTIONAL', 'ON'] }] }),
   S({ id: 'secrets', name: 'AWS Secrets Manager', short: 'SM', category: 'security', role: 'secrets', layer: 'seguridad', zones: [...OUT_REG], description: 'Credenciales y secretos con rotación.', inboundProtocol: 'HTTPS (GetSecretValue)', props: [{ key: 'rotation', label: 'Rotación automática', type: 'bool', default: true }] }),
