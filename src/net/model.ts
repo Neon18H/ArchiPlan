@@ -31,7 +31,7 @@ const role = (n: ServiceNode) => getService(n.data.serviceId).role;
 /** ¿La pieza lleva Security Groups? (recursos con interfaz de red en la VPC) */
 export function needsSg(n: ServiceNode, map: Map<string, AppNode>): boolean {
   if (!inVpc(n, map)) return false;
-  return !['netgw'].includes(role(n));
+  return !['netgw', 'inspection'].includes(role(n));
 }
 
 export function isLb(n: ServiceNode) {
@@ -144,6 +144,8 @@ export type ConnKind =
   | 'egress'
   /** Lo invoca la nube (eventos, triggers, plano de control): sin chequeo de red. */
   | 'managed'
+  /** GWLB → firewall: túnel GENEVE (UDP 6081) más el health check. */
+  | 'geneve'
   | 'none';
 
 export interface ConnSemantics {
@@ -169,6 +171,26 @@ export function semantics(e: AppEdge, map: Map<string, AppNode>): ConnSemantics 
     if (['lb', 'cdn', 'api', 'compute'].includes(rt) && inVpc(t, map)) return { kind: 'connect', from: s, to: t, port: isLb(t) ? requestPort(s, t) : listenPort(t) };
     return { kind: 'none', from: s, to: t, port: 0 };
   }
+  // Inspección transparente: el GWLB habla GENEVE con los firewalls; hacia adelante, el tráfico
+  // conserva su origen real (el GWLB no cambia IPs), así que se valida desde quien lo envió.
+  if (rs === 'inspection' && rt === 'appliance') return { kind: 'geneve', from: s, to: t, port: 6081 };
+  if (rt === 'inspection' || rs === 'appliance' || rt === 'appliance') return { kind: 'none', from: s, to: t, port: 0 };
+  if (rs === 'inspection') {
+    const seen = new Set<string>([s.id]);
+    let cur: ServiceNode | null = s;
+    let origin: ServiceNode | null = null;
+    while (cur && !origin) {
+      const prevE = edgesInto(cur.id, map);
+      const prev = prevE.map((x) => map.get(x)).find((x): x is ServiceNode => isService(x) && !seen.has(x.id));
+      if (!prev) break;
+      seen.add(prev.id);
+      if (role(prev) === 'inspection') cur = prev;
+      else origin = prev;
+    }
+    if (!origin) return { kind: 'none', from: s, to: t, port: 0 };
+    const inner = semantics({ ...e, source: origin.id }, map);
+    return inner ? { ...inner, from: inner.from.id === origin.id ? origin : inner.from } : null;
+  }
   if (CONTROL_SRC.includes(rs) || rt === 'actor' || rt === 'dns' || rt === 'waf' || rt === 'cert') return { kind: 'none', from: s, to: t, port: 0 };
   if (rs === 'identity') return { kind: 'managed', from: s, to: t, port: 0 };
   // La pieza que consume "tira" de la cola / stream / registro
@@ -184,6 +206,18 @@ export function semantics(e: AppEdge, map: Map<string, AppNode>): ConnSemantics 
   if (inVpc(s, map)) return { kind: 'egress', from: s, to: t, port: 443 };
   return { kind: 'managed', from: s, to: t, port: 0 };
 }
+
+/** Orígenes de las flechas que entran a una pieza (lo registra analyzeNetwork / generateSecurityGroups). */
+const INCOMING = new WeakMap<Map<string, AppNode>, Map<string, string[]>>();
+export function registerEdges(map: Map<string, AppNode>, edges: AppEdge[]) {
+  const m = new Map<string, string[]>();
+  for (const e of edges) {
+    if (!m.has(e.target)) m.set(e.target, []);
+    m.get(e.target)!.push(e.source);
+  }
+  INCOMING.set(map, m);
+}
+const edgesInto = (id: string, map: Map<string, AppNode>) => INCOMING.get(map)?.get(id) ?? [];
 
 /** Puerto con el que el origen llama a un balanceador. */
 export function requestPort(s: ServiceNode, lb: ServiceNode): number {
@@ -212,6 +246,7 @@ export interface GeneratedNet {
 /** Un SG por pieza en la VPC con las reglas exactas que piden las flechas. */
 export function generateSecurityGroups(nodes: AppNode[], edges: AppEdge[]): GeneratedNet {
   const map = byId(nodes);
+  registerEdges(map, edges);
   const services = nodes.filter(isService);
   const groups: SecurityGroup[] = [];
   const assign: Record<string, string[]> = {};
@@ -235,6 +270,14 @@ export function generateSecurityGroups(nodes: AppNode[], edges: AppEdge[]): Gene
   };
   for (const e of edges) {
     const sem = semantics(e, map);
+    if (sem?.kind === 'geneve') {
+      const g = byNode(sem.to.id);
+      if (!g) continue;
+      const cidr = vpcCidr(nodes);
+      if (!g.inbound.some((r) => r.protocol !== 'tcp' && r.from <= 6081 && r.to >= 6081)) g.inbound.push({ id: `${g.id}_in${g.inbound.length + 1}`, protocol: 'udp', from: 6081, to: 6081, peer: { kind: 'cidr', value: cidr }, description: `GENEVE desde ${sem.from.data.label}` });
+      addIn(g, 80, { kind: 'cidr', value: cidr }, `Health check de ${sem.from.data.label}`);
+      continue;
+    }
     if (!sem || sem.kind !== 'connect') continue;
     const g = byNode(sem.to.id);
     if (!g) continue;

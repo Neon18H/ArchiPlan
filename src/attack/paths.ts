@@ -143,9 +143,11 @@ interface Ctx {
   mode: Mode;
   profile?: AttackProfile;
   waf: Record<string, PropValue> | null;
+  /** IPS en línea por el que pasó el ataque: ve el contenido o no. */
+  ips?: { fw: ServiceNode; sees: boolean } | null;
 }
 
-const ROUTERS = ['cdn', 'lb', 'api', 'dns'];
+const ROUTERS = ['cdn', 'lb', 'api', 'dns', 'inspection'];
 const DATA_ROLES = ['datastore', 'storage', 'search', 'cache'];
 const CLASS_VALUE: Record<string, number> = { Restringido: 5, Confidencial: 4, Interno: 2, Público: 1 };
 
@@ -202,6 +204,41 @@ export function buildAttackPaths(nodes: AppNode[], edges: AppEdge[], opts: { sec
     ];
   };
 
+  /* ── IPS en línea (firewall virtual detrás de un GWLB) */
+  const fwOf = (g: ServiceNode): ServiceNode | null => {
+    const stack = [g.id];
+    const seenI = new Set(stack);
+    while (stack.length) {
+      const cur = stack.pop()!;
+      for (const e of out.get(cur) ?? []) {
+        const x = svc(e.target);
+        if (!x) continue;
+        if (role(x) === 'appliance') return x;
+        if (role(x) === 'inspection' && !seenI.has(x.id)) {
+          seenI.add(x.id);
+          stack.push(x.id);
+        }
+      }
+    }
+    return null;
+  };
+  const ipsAt = (g: ServiceNode): Ctx['ips'] => {
+    const fw = fwOf(g);
+    if (!fw) return null;
+    const clear = edges.some((e) => e.target === g.id && svc(e.source) && ['lb', 'api'].includes(role(svc(e.source)!)));
+    return { fw, sees: clear || !!fw.data.props.tlsDecryption };
+  };
+  const anyFw = services.find((n) => role(n) === 'appliance');
+  const ipsCtrl = (ips: Ctx['ips']): AttackControl[] => {
+    if (!anyFw) return [];
+    if (!ips) return [ctrl('M1031', 'IPS en línea (el firewall virtual no está en este camino)', false, 0.4)];
+    const p = ips.fw.data.props;
+    const blocking = !String(p.mode ?? 'IPS').startsWith('IDS') && p.threatPrevention !== false;
+    if (!ips.sees) return [ctrl('M1031', `IPS de ${ips.fw.data.label} (hoy no ve HTTPS)`, false, 0.4, { label: 'Activar descifrado TLS en el firewall', nodeId: ips.fw.id, props: { tlsDecryption: true } })];
+    if (!blocking) return [ctrl('M1031', `IPS de ${ips.fw.data.label} (está en modo IDS: solo alerta)`, false, 0.4, { label: 'Pasar el firewall a modo IPS', nodeId: ips.fw.id, props: { mode: 'IPS (bloquea)' } })];
+    return [ctrl('M1031', `IPS de ${ips.fw.data.label} con firmas de exploits`, true, 0.4)];
+  };
+
   /* ── salto posible desde «from» (con el contexto del camino) hacia «to» */
   const likelihoodOf = (base: number, cs: AttackControl[]) => Math.max(0.01, cs.reduce((a, c) => a * (c.ok ? c.factor : 1), base));
   const step = (from: string, to: string, edgeIds: string[], tactic: Tactic, technique: Technique | null, how: string, base: number, controls: AttackControl[], virtual = false): AttackStep => ({ from, to, edgeIds, virtual, tactic, technique, how: tx(how), likelihood: likelihoodOf(base, controls), controls });
@@ -236,8 +273,10 @@ export function buildAttackPaths(nodes: AppNode[], edges: AppEdge[], opts: { sec
         if (!t) continue;
         const tr = role(t);
         const waf = wafOf.get(t.id) ?? ctx.waf;
+        if (r === 'inspection' && (tr === 'inspection' || tr === 'appliance')) continue;
         if (ROUTERS.includes(tr)) {
-          moves.push({ step: step(id, t.id, [e.id], 'Acceso inicial', null, `Las peticiones maliciosas pasan por ${t.data.label} hacia el backend.`, 1, []), ctx: { mode: ctx.mode, waf } });
+          const ips = tr === 'inspection' ? ipsAt(t) : ctx.ips;
+          moves.push({ step: step(id, t.id, [e.id], 'Acceso inicial', null, tr === 'inspection' && ips ? `Las peticiones pasan por ${t.data.label}: ${ips.fw.data.label} las inspecciona${ips.sees ? '' : ', pero van cifradas y no ve su contenido'}.` : `Las peticiones maliciosas pasan por ${t.data.label} hacia el backend.`, 1, []), ctx: { mode: ctx.mode, waf, ips } });
         } else if (tr === 'compute' && ctx.mode === 'transit') {
           if (lid(t) === 'ec2')
             moves.push({
@@ -246,6 +285,7 @@ export function buildAttackPaths(nodes: AppNode[], edges: AppEdge[], opts: { sec
             });
           const cs = [
             ...wafCtrls(waf, 'web'),
+            ...ipsCtrl(ctx.ips ?? null),
             secCtrl('inputValidation', 'M1048', 'Validación de entradas y consultas parametrizadas', 0.3),
             secCtrl('patching', 'M1051', 'Parcheo automático e Inspector', 0.6),
             secCtrl('sca', 'M1016', 'Escaneo de dependencias (SCA)', 0.75),
@@ -373,7 +413,7 @@ export function buildAttackPaths(nodes: AppNode[], edges: AppEdge[], opts: { sec
         entries.add(t2.id);
         if (!entryEdges.has(t2.id)) entryEdges.set(t2.id, edgeIds);
         if (ROUTERS.includes(tr)) {
-          starts.push({ step: step(a.id, t2.id, edgeIds, 'Reconocimiento', T.scan, `Desde Internet escanea ${t2.data.label} buscando rutas, versiones y errores explotables.`, 1, []), ctx: { mode: 'transit', waf: wafOf.get(t2.id) ?? null } });
+          starts.push({ step: step(a.id, t2.id, edgeIds, 'Reconocimiento', T.scan, `Desde Internet escanea ${t2.data.label} buscando rutas, versiones y errores explotables.`, 1, []), ctx: { mode: 'transit', waf: wafOf.get(t2.id) ?? null, ips: tr === 'inspection' ? ipsAt(t2) : null } });
         } else if (tr === 'identity') {
           const cs = [
             ctrl('M1032', 'MFA obligatorio', String(t2.data.props.mfa ?? 'OPTIONAL') === 'ON', 0.1, { label: 'Hacer MFA obligatorio', nodeId: t2.id, props: { mfa: 'ON' } }),
@@ -451,8 +491,9 @@ export function buildAttackPaths(nodes: AppNode[], edges: AppEdge[], opts: { sec
     target = `${profile}|${target}`;
     const list = best.get(target) ?? [];
     const lk = steps.reduce((a, s) => a * s.likelihood, 1);
-    const sig = steps.map((s) => s.to).join('>');
-    if (list.some((p) => p.map((s) => s.to).join('>') === sig)) return;
+    const sigOf = (p: AttackStep[]) => p.map((s) => `${s.to}:${s.technique?.id ?? ''}`).join('>');
+    const sig = sigOf(steps);
+    if (list.some((p) => sigOf(p) === sig)) return;
     list.push(steps);
     list.sort((a, b) => b.reduce((x, s) => x * s.likelihood, 1) - a.reduce((x, s) => x * s.likelihood, 1) || a.length - b.length);
     best.set(target, list.slice(0, 3));
@@ -495,7 +536,7 @@ export function buildAttackPaths(nodes: AppNode[], edges: AppEdge[], opts: { sec
   /* ── rutas finales */
   const paths: AttackPath[] = [];
   const hasNat = services.some((n) => lid(n) === 'natgw');
-  const hasNfw = services.some((n) => lid(n) === 'networkfirewall');
+  const hasNfw = services.some((n) => lid(n) === 'networkfirewall' || (role(n) === 'appliance' && n.data.props.urlFiltering !== false));
   const hasGd = services.some((n) => lid(n) === 'guardduty');
   const impactsFor = (t: ServiceNode, profile: AttackProfile): AttackImpact[] => {
     const out: AttackImpact[] = [];

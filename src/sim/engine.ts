@@ -18,6 +18,7 @@ import { cloudText, getService, lid, primaryCloud } from '../catalog/catalog';
 import { ancestors, byId, isService, placementOf } from '../lib/graph';
 import type { AppEdge, AppNode, Role, ServiceNode } from '../types';
 import { fmtRps, profileFor, type SimProfile } from './profiles';
+import { originProtocol } from '../net/model';
 import type { Scenario } from './scenarios';
 import { coverage, MODE_MAP, replicationLinks, suggestLinks, type FailureKind, type ReplicaLink } from '../resilience/replication';
 import { criticalPath, DEFAULT_DR, dataRecovery, dnsCutover, fmtDur, holdsData, nodeRes, regionRecovery, type DnsCutover, type DrConfig, type NodeRes } from '../resilience/model';
@@ -134,7 +135,7 @@ const sum = (a: ArrayLike<number>) => {
   for (let i = 0; i < a.length; i++) s += a[i];
   return s;
 };
-const ROUTERS: Role[] = ['cdn', 'lb', 'api', 'dns'];
+const ROUTERS: Role[] = ['cdn', 'lb', 'api', 'dns', 'inspection'];
 const MESSAGING: Role[] = ['queue', 'topic', 'eventbus', 'stream', 'workflow'];
 
 function sourceWeight(n: ServiceNode) {
@@ -145,6 +146,11 @@ function classify(s: ServiceNode, t: ServiceNode, ps: SimProfile, pt: SimProfile
   const sd = getService(s.data.serviceId);
   const td = getService(t.data.serviceId);
   if (td.role === 'actor') return null;
+  // El firewall recibe el tráfico por el túnel GENEVE del GWLB, no como una llamada
+  if (td.role === 'appliance' || sd.role === 'appliance') return null;
+  if (sd.role === 'inspection' && td.role === 'inspection') return null;
+  // Inspección de salida: solo pasan por ella las llamadas que salen de la VPC
+  if (td.role === 'inspection' && ['compute', 'workflow'].includes(sd.role)) return { kind: 'sync', w: 0.1 };
   if (sd.role === 'actor' || sd.role === 'external') {
     if (td.role === 'identity') return { kind: 'login', w: LOGIN_RATIO };
     if (pt.passive && td.role !== 'dns') return null;
@@ -237,7 +243,7 @@ export function pickDefaultTarget(nodes: AppNode[], edges: AppEdge[], kind: Scen
 export function targetCandidates(nodes: AppNode[], kind: Scenario['kind']): ServiceNode[] {
   const services = nodes.filter(isService);
   const role = (n: ServiceNode) => getService(n.data.serviceId).role;
-  if (kind === 'instance-failure') return services.filter((n) => getService(n.data.serviceId).vpcBound && !['lb', 'netgw'].includes(role(n)) || profileFor(n).stateful);
+  if (kind === 'instance-failure') return services.filter((n) => getService(n.data.serviceId).vpcBound && !['lb', 'netgw', 'inspection'].includes(role(n)) || profileFor(n).stateful);
   if (kind === 'node-outage' || kind === 'slow-dependency') return services.filter((n) => !['actor'].includes(role(n)) && !profileFor(n).passive);
   if (kind === 'exfiltration') return services.filter((n) => role(n) === 'compute');
   if (kind === 'credential-stuffing') return services.filter((n) => role(n) === 'identity' || (['cdn', 'lb', 'api', 'compute'].includes(role(n)) && lid(n) !== 'lambda'));
@@ -363,6 +369,63 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
     order.length = 0;
     order.push(...rest, ...[...replicaIds]);
   }
+  // Flotas de firewalls detrás de cada punto de inspección (GWLBE → GWLB → firewalls)
+  const fleetOf = new Map<string, string[]>();
+  const ipsOf = new Map<string, { block: number[]; sees: boolean; mode: 'ips' | 'ids' | 'off'; applianceId: string }>();
+  const applianceIds = services.filter((n) => def(n.id).role === 'appliance').map((n) => n.id);
+  for (const n of services) {
+    if (def(n.id).role !== 'inspection') continue;
+    const fleet = new Set<string>();
+    const seenI = new Set([n.id]);
+    const stack = [n.id];
+    while (stack.length) {
+      const cur = stack.pop()!;
+      for (const e of edges.filter((x) => x.source === cur)) {
+        const r = svcIds.has(e.target) ? def(e.target).role : null;
+        if (r === 'appliance') fleet.add(e.target);
+        else if (r === 'inspection' && !seenI.has(e.target)) {
+          seenI.add(e.target);
+          stack.push(e.target);
+        }
+      }
+    }
+    fleetOf.set(n.id, [...fleet]);
+    const first = [...fleet].map((id) => map.get(id) as ServiceNode)[0];
+    // Solo inspecciona donde pasa tráfico (el GWLB detrás de un endpoint recibe el túnel, no las peticiones)
+    const inPath = edges.some((e) => e.target === n.id && svcIds.has(e.source) && !['inspection', 'appliance'].includes(def(e.source).role));
+    if (!first || !inPath) continue;
+    // ¿Ve el contenido? Solo si alguien antes terminó el TLS (balanceador, API) o si el firewall descifra
+    const upstream = new Set<string>();
+    const back = [n.id];
+    while (back.length) {
+      const cur = back.pop()!;
+      for (const e of edges.filter((x) => x.target === cur)) {
+        if (!svcIds.has(e.source) || upstream.has(e.source)) continue;
+        upstream.add(e.source);
+        if (def(e.source).role === 'inspection') back.push(e.source);
+      }
+    }
+    const cleartext = [...upstream].some((id) => {
+      const u = map.get(id) as ServiceNode;
+      const r = def(id).role;
+      return r === 'lb' || r === 'api' || (r === 'cdn' && originProtocol(u) === 'http-only');
+    });
+    const fp = first.data.props;
+    const mode = String(fp.mode ?? 'IPS').startsWith('IDS') ? 'ids' : fp.threatPrevention === false ? 'off' : 'ips';
+    const sees = cleartext || !!fp.tlsDecryption;
+    const block = new Array(F).fill(0);
+    if (mode === 'ips' && sees) {
+      block[2] = 0.7;
+      block[3] = 0.5;
+      block[4] = 0.7;
+    }
+    ipsOf.set(n.id, { block, sees, mode, applianceId: first.id });
+  }
+  if (applianceIds.length) {
+    const rest = order.filter((id) => !applianceIds.includes(id));
+    order.length = 0;
+    order.push(...rest, ...applianceIds);
+  }
   const pos = new Map(order.map((id, i) => [id, i]));
   const isBack = (e: TEdge) => (pos.get(e.t) ?? 0) <= (pos.get(e.s) ?? 0);
 
@@ -379,10 +442,12 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
   /** Multiplicadores de capacidad: región secundaria reducida (warm standby), activo‑activo, hilos ocupados por una dependencia lenta. */
   const capMods = new Map<string, (t: number) => number>();
   const slowCap = new Map<string, number>();
-  const capacity = (id: string, t: number) => {
+  const capacity = (id: string, t: number): number => {
     const p = prof.get(id)!;
     if (p.passive) return Infinity;
     if (isDown(id, t)) return 0;
+    const fl = fleetOf.get(id);
+    if (fl?.length) return fl.reduce((a, x) => a + capacity(x, t), 0);
     const s = st.get(id)!;
     const healthy = Math.max(0, s.instances - s.lost);
     const f = (capMods.get(id)?.(t) ?? 1) * (slowCap.get(id) ?? 1);
@@ -550,6 +615,14 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
     }
     if (t1 < sc.duration) events.push({ t: t1, label: 'El ataque termina', kind: 'info' });
   }
+  if (['web-attacks', 'ddos-l7', 'scraping', 'credential-stuffing'].includes(sc.kind))
+    for (const [iid, ips] of ipsOf)
+      events.push({
+        t: t0 + 5,
+        label: ips.mode === 'ids' ? `${label(ips.applianceId)} está en modo IDS: detecta y alerta, pero no bloquea` : !ips.sees ? `${label(ips.applianceId)} no ve el contenido: el tráfico llega cifrado (TLS) a ${label(iid)} y el firewall no descifra` : ips.mode === 'off' ? `${label(ips.applianceId)} no tiene perfiles de prevención de amenazas` : `El IPS de ${label(ips.applianceId)} inspecciona el tráfico en ${label(iid)} y bloquea exploits conocidos`,
+        kind: ips.mode === 'ips' && ips.sees ? 'good' : 'bad',
+        nodeId: ips.applianceId,
+      });
   if (sc.kind === 'credential-stuffing' && targetId) {
     events.push({ t: t0, label: `Comienza el relleno de credenciales: ${fmtRps(sc.attackRps)} intentos de login/s desde ${sc.botIps} IPs contra ${label(targetId)}`, kind: 'bad', nodeId: targetId });
     const perIp = (sc.attackRps * 300) / Math.max(1, sc.botIps);
@@ -576,7 +649,7 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
       if (!place.startsWith('subnet-')) continue;
       const d = getService(n.data.serviceId);
       const p = prof.get(n.id)!;
-      if (p.passive || ['lb', 'netgw'].includes(d.role) || lid(n) === 'lambda') continue;
+      if (p.passive || ['lb', 'netgw', 'inspection'].includes(d.role) || lid(n) === 'lambda') continue;
       // Las réplicas dibujadas viven en otra AZ que la primaria
       if (replicaIds.has(n.id)) continue;
       const vpc = ancestors(n, map).find((z) => z.data.zoneKind === 'vpc');
@@ -756,6 +829,7 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
   let peakBacklog = 0;
   let lambdaFloodInvocations = 0;
   let stuffServed = 0;
+  let ipsBlocked = 0;
   let lambdaGbSeconds = 0;
   let peakLambdaConc = 0;
   let lambdaToRdsMaxConn = Infinity;
@@ -887,6 +961,26 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
         if (bl > 0) for (let f = 0; f < F; f++) s.backlog[f] -= (s.backlog[f] / bl) * drain * DT;
         peakBacklog = Math.max(peakBacklog, sum(s.backlog));
       } else if (ROUTERS.includes(d.role)) {
+        if (d.role === 'inspection') {
+          // La flota de firewalls procesa lo que pasa; el IPS bloquea lo que alcanza a ver
+          const fl = fleetOf.get(id) ?? [];
+          const capT = fl.reduce((a, x) => a + capacity(x, t), 0);
+          for (const a of fl) {
+            const share = capT > 0 ? capacity(a, t) / capT : 1 / fl.length;
+            const add = offered.get(a)!;
+            for (let f = 0; f < F; f++) add[f] += out[f] * share;
+          }
+          const ips = ipsOf.get(id);
+          if (ips)
+            for (let f = 2; f < F; f++) {
+              const b = out[f] * ips.block[f];
+              if (b <= 0) continue;
+              out[f] -= b;
+              blockedAt[f] += b;
+              perFlow[f].blocked += b * DT;
+              ipsBlocked += b * DT;
+            }
+        }
         const routes = outs.filter((e) => e.kind === 'route');
         for (const e of routes) {
           const add = offered.get(e.t)!;
@@ -1135,7 +1229,7 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
   if (sc.kind === 'exfiltration' && targetId) {
     const tn = map.get(targetId) as ServiceNode;
     const place = placementOf(tn, map);
-    const egress = has('networkfirewall') ? 'filtered' : has('natgw') || place === 'subnet-public' || !place.startsWith('subnet-') ? 'open' : 'none';
+    const egress = has('networkfirewall') || services.some((n) => lid(n) === 'ngfw' && n.data.props.urlFiltering !== false) ? 'filtered' : has('natgw') || place === 'subnet-public' || !place.startsWith('subnet-') ? 'open' : 'none';
     const rate = { open: 144, filtered: 2, none: 0.2 }[egress]!; // GB/h
     const detect = has('guardduty') ? 1200 : security.dataAuditLogs && security.siem ? 7200 : Infinity;
     const respond = security.siem ? 600 : 10800;
@@ -1185,7 +1279,7 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
     ...(impact ? { impact } : {}),
   };
 
-  const findings = buildFindings({ sc, summary, frames, peakUtil, prof, map, targetId, waf, shieldAdv, perFlow, l34Mitigated, peakLambdaConc, lambdaToRdsMaxConn, services, outE, edges, warnings, dr, dns, regionNoCopy, regionSlow, slowTarget, slowStats, slowFrom, slowTo, dataRestore, res, crit, suggested: suggestLinks(nodes, edges), security, exfil, keys });
+  const findings = buildFindings({ sc, summary, frames, peakUtil, prof, map, targetId, waf, shieldAdv, perFlow, l34Mitigated, peakLambdaConc, lambdaToRdsMaxConn, services, outE, edges, warnings, dr, dns, regionNoCopy, regionSlow, slowTarget, slowStats, slowFrom, slowTo, dataRestore, res, crit, suggested: suggestLinks(nodes, edges), security, exfil, keys, ipsOf, fleetOf, ipsBlocked });
   if (opts.blocked?.size) {
     const list = [...opts.blocked].map(([eid, why]) => {
       const e = edges.find((x) => x.id === eid);
@@ -1235,6 +1329,8 @@ function recommendFor(n: ServiceNode, p: SimProfile): string {
       return 'Solicita aumento de la cuota UserAuthentication y evita re‑autenticar en cada request (reutiliza tokens).';
     case 'bedrock':
       return 'Solicita más cuota de tokens, usa Provisioned Throughput o encola las peticiones al modelo.';
+    case 'ngfw':
+      return 'Sube el máximo del Auto Scaling Group de firewalls o usa instancias más grandes. El descifrado TLS reduce la capacidad a la mitad; una instancia nueva tarda ~10 min.';
     case 'external':
     case 'onprem':
       return 'Desacopla con una cola, aplica reintentos con backoff y un circuit breaker; no dependas en línea de un tercero.';
@@ -1287,6 +1383,9 @@ interface FindingCtx {
   security: Record<string, boolean>;
   exfil: { gb: number; rate: number; detect: number; respond: number; egress: string } | null;
   keys: { noKeys: boolean; revoke: number; rate: number; cost: number } | null;
+  ipsOf: Map<string, { block: number[]; sees: boolean; mode: 'ips' | 'ids' | 'off'; applianceId: string }>;
+  fleetOf: Map<string, string[]>;
+  ipsBlocked: number;
 }
 
 function buildFindings(c: FindingCtx): Finding[] {
@@ -1467,6 +1566,22 @@ function buildFindings(c: FindingCtx): Finding[] {
     ];
     const worst = ph.reduce((a, b) => (b.v < a.v ? b : a));
     out.push({ severity: worst.v >= 0.99 ? 'ok' : worst.v >= 0.9 ? 'warn' : 'error', title: worst.v >= 0.99 ? 'Pasó el Game Day' : `La fase más dura: ${worst.name} (${(worst.v * 100).toFixed(1)} % mínimo)`, detail: ph.map((x) => `${x.name}: ${(x.v * 100).toFixed(1)} %`).join(' · '), nodeIds: [] });
+  }
+
+  // Inspección con firewalls virtuales (GWLB)
+  if (['web-attacks', 'scraping', 'ddos-l7', 'credential-stuffing'].includes(sc.kind))
+    for (const [iid, ips] of c.ipsOf) {
+      if (ips.mode === 'ips' && ips.sees) out.push({ severity: 'ok', title: `El IPS de ${label(ips.applianceId)} bloqueó ${Math.round(c.ipsBlocked).toLocaleString('es-CO')} peticiones maliciosas`, detail: `Inspecciona en ${label(iid)}, donde el tráfico ya viene en texto claro o lo descifra. Las firmas detienen exploits conocidos; los bots, el HTTP flood y el abuso de la lógica de negocio siguen siendo trabajo del WAF y del código.`, nodeIds: [ips.applianceId] });
+      else if (ips.mode === 'ids') out.push({ severity: 'warn', title: `${label(ips.applianceId)} solo alerta (IDS)`, detail: 'En modo IDS ve los ataques pero no los detiene. Pásalo a IPS cuando las firmas estén afinadas, o asegúrate de que alguien responde las alertas.', nodeIds: [ips.applianceId] });
+      else if (!ips.sees) out.push({ severity: 'warn', title: `${label(ips.applianceId)} está ciego ante HTTPS`, detail: `En ${label(iid)} el tráfico todavía va cifrado: el IPS solo ve IPs, puertos y el SNI. Activa el descifrado TLS (cuesta ~50 % de capacidad) o pon la inspección después del balanceador, donde el tráfico ya es texto claro.`, nodeIds: [ips.applianceId, iid] });
+    }
+  for (const [iid, fl] of c.fleetOf) {
+    if (!fl.length) {
+      out.push({ severity: 'warn', title: `${label(iid)} no tiene firewalls detrás`, detail: 'Conecta el Gateway Load Balancer a una flota de firewalls virtuales (NGFW / IDS‑IPS); sin ella no inspecciona nada.', nodeIds: [iid] });
+      continue;
+    }
+    if (frames.some((f) => fl.every((a) => f.nodes[a]?.status === 'down')))
+      out.push({ severity: 'error', title: `Sin firewalls sanos, se corta todo lo que pasa por ${label(iid)}`, detail: 'Toda la flota quedó fuera de servicio. Ojo: si los firewalls siguen vivos pero fallan el health check, el GWLB les sigue enviando tráfico (fail‑open) y podría pasar sin inspección. Pon una alarma sobre UnHealthyHostCount y reparte la flota en varias AZ.', nodeIds: [...fl, iid] });
   }
 
   // Ataques nuevos

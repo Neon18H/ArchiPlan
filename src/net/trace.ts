@@ -71,7 +71,7 @@ export interface TraceResult {
   failedNodeId?: string;
 }
 
-const ROUTERS = ['actor', 'external', 'dns', 'cdn', 'lb', 'api'];
+const ROUTERS = ['actor', 'external', 'dns', 'cdn', 'lb', 'api', 'inspection'];
 const LEAVES = ['datastore', 'cache', 'search', 'storage', 'secrets', 'identity', 'external', 'ai'];
 const ASYNC = ['queue', 'topic', 'stream', 'eventbus'];
 const IGNORE = ['observability', 'kms', 'cert', 'devops', 'analytics', 'netgw', 'waf', 'registry'];
@@ -275,6 +275,48 @@ export function traceRequest(
   /** Controles en la puerta de una pieza de borde: WAF y autenticación. */
   const gate = (n: ServiceNode, depth: number): boolean => {
     const r = role(n);
+    if (r === 'inspection') {
+      // Firewall virtual detrás del GWLB: ¿ve el contenido y bloquea?
+      const fleet: ServiceNode[] = [];
+      const stack = [n.id];
+      const seenI = new Set(stack);
+      while (stack.length) {
+        const cur = stack.pop()!;
+        for (const e of outEdges(cur)) {
+          const x = svc(e.target);
+          if (!x) continue;
+          if (role(x) === 'appliance') fleet.push(x);
+          else if (role(x) === 'inspection' && !seenI.has(x.id)) {
+            seenI.add(x.id);
+            stack.push(x.id);
+          }
+        }
+      }
+      const fw = fleet[0];
+      if (!fw) return true;
+      const fp = fw.data.props;
+      const clear = result.hops.some((h) => ['lb', 'api'].includes(role(svc(h.nodeId) ?? fw))) || !!fp.tlsDecryption;
+      const ips = !String(fp.mode ?? 'IPS').startsWith('IDS') && fp.threatPrevention !== false;
+      clock += fp.tlsDecryption ? 6 : 2;
+      if (request.id === 'sqli' && clear && ips) {
+        push({ nodeId: fw.id, fromId: n.id, title: `${fw.data.label} (vía ${n.data.label})`, detail: 'El IPS reconoce la firma del exploit en el contenido y descarta la conexión.', status: 'blocked', at: clock, depth, checks: [] });
+        blocked = true;
+        result.status = 0;
+        result.statusText = 'ERR_CONNECTION_RESET (IPS)';
+        return false;
+      }
+      push({
+        nodeId: fw.id,
+        fromId: n.id,
+        title: `${fw.data.label} (vía ${n.data.label})`,
+        detail: !clear ? 'Inspecciona solo IPs, puertos y SNI: el contenido viaja cifrado (TLS) y el firewall no lo descifra.' : request.id === 'sqli' ? (ips ? 'Inspecciona el contenido.' : 'Modo IDS: genera una alerta pero deja pasar la petición.') : 'Inspecciona la petición y la deja pasar.',
+        status: !clear && request.id === 'sqli' ? 'warn' : request.id === 'sqli' && !ips ? 'warn' : 'ok',
+        at: clock,
+        depth,
+        checks: [],
+      });
+      return true;
+    }
     if (!['cdn', 'lb', 'api'].includes(r)) return true;
     const wafs = protectorsOf(n.id).filter((w) => lid(w) === 'waf');
     const waf = wafs[0];
@@ -400,7 +442,7 @@ export function traceRequest(
     const outs = outEdges(n.id).filter((e) => {
       const t = svc(e.target)!;
       const rt = role(t);
-      return rt !== 'identity' && rt !== 'dns' && !ASYNC.includes(rt) && !visited.has(`${n.id}>${t.id}`);
+      return rt !== 'identity' && rt !== 'dns' && rt !== 'appliance' && !(r === 'inspection' && rt === 'inspection') && !ASYNC.includes(rt) && !visited.has(`${n.id}>${t.id}`);
     });
     if (!outs.length) {
       if (r === 'cdn' || r === 'lb' || r === 'api') {

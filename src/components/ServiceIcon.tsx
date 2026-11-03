@@ -146,6 +146,19 @@ const GLYPHS: Record<string, React.ReactNode> = {
       <path d="M8 12h8M13 9l3 3-3 3" />
     </>
   ),
+  inspection: (
+    <>
+      <path d="M3 12h4M17 12h4" />
+      <rect x="7" y="7" width="10" height="10" rx="2" />
+      <path d="M10 12l1.5 1.5L14 10.5" />
+    </>
+  ),
+  appliance: (
+    <>
+      <path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z" />
+      <path d="M8 12h8M8 9h8M8 15h5" />
+    </>
+  ),
   analytics: <path d="M4 20V10M10 20V4M16 20v-7M22 20H2" />,
   ai: (
     <>

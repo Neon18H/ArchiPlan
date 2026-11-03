@@ -824,6 +824,75 @@ export function buildThreats(
     });
   }
 
+  /* ── J. Inspección con firewalls virtuales (GWLB + NGFW / IDS‑IPS) */
+  const inspections = services.filter((n) => role(n) === 'inspection');
+  for (const fw of services.filter((n) => role(n) === 'appliance')) {
+    const fp = fw.data.props;
+    const vendor = String(fp.vendor ?? 'Firewall virtual');
+    const feeders = inspections.filter((g) => out(g).some(({ t }) => t.id === fw.id));
+    const points = inspections.filter((g) => out(g).some(({ t }) => feeders.some((f) => f.id === t.id)) || feeders.some((f) => f.id === g.id));
+    const clear = points.some((g) => inc(g).some(({ s }) => ['lb', 'api'].includes(role(s))));
+    const count = Number(fp.count ?? 2);
+    const gwlb = feeders.find((g) => sid(g) === 'gwlb');
+    push({
+      id: `ngfw-mgmt:${fw.id}`,
+      ruleId: 'ngfw-mgmt',
+      stride: ['S', 'E'],
+      title: `Toma de control de ${fw.data.label} por su interfaz de administración`,
+      description: `Quien controla el firewall controla el tráfico que inspecciona. Las interfaces de administración de ${vendor} expuestas o sin parchear han tenido vulnerabilidades críticas explotadas en masa.`,
+      kind: 'element',
+      nodeIds: [fw.id],
+      element: fw.data.label,
+      likelihood: fp.mgmtPublic ? 3 : 2,
+      impact: 3,
+      refs: ['CVE-2024-0012', 'CVE-2024-3400', 'ATT&CK T1190'],
+      controls: [
+        { key: 'mgmt-private', label: 'Administración solo por red privada (sin IP pública)', auto: true, ok: !fp.mgmtPublic, required: true, fix: fp.mgmtPublic ? setProps(fw, { mgmtPublic: false }, 'Quitar la IP pública de administración') : undefined },
+        { key: 'patch', label: 'Sistema operativo del firewall parcheado (avisos del fabricante)', auto: false, required: true },
+        { key: 'root-mfa', label: 'Acceso de administradores por SSO con MFA', auto: false, required: true },
+      ],
+    });
+    push({
+      id: `ngfw-bypass:${fw.id}`,
+      ruleId: 'ngfw-bypass',
+      stride: ['T', 'I', 'D'],
+      title: `Tráfico sin inspeccionar o cortado si falla ${fw.data.label}`,
+      description: 'Si un firewall cae, sus flujos se cortan; si todos fallan el health check pero siguen vivos, el GWLB les sigue enviando tráfico (fail‑open) y puede pasar sin inspección. Con rutas asimétricas (Transit Gateway sin appliance mode) la respuesta llega a otro firewall y se descarta.',
+      kind: 'element',
+      nodeIds: [fw.id, ...feeders.map((g) => g.id)],
+      element: fw.data.label,
+      likelihood: count >= 2 ? 2 : 3,
+      impact: 3,
+      refs: ['ATT&CK T1562.004'],
+      controls: [
+        { key: 'fleet', label: 'Al menos 2 firewalls repartidos en 2 AZ', auto: true, ok: count >= 2, required: true, fix: count >= 2 ? undefined : setProps(fw, { count: 2, azSpread: 2 }, 'Correr 2 firewalls en 2 AZ') },
+        { key: 'rebalance', label: 'Mover los flujos de un firewall caído a otro (target failover)', auto: true, ok: !gwlb || gwlb.data.props.targetFailover !== false, required: false, fix: gwlb && gwlb.data.props.targetFailover === false ? setProps(gwlb, { targetFailover: true }, 'Activar target failover') : undefined },
+        { key: 'alerts', label: 'Alarma sobre UnHealthyHostCount y hallazgos enviados al equipo', auto: false, required: true },
+        ...(has('transitgw') ? [{ key: 'appliancemode', label: 'Transit Gateway con appliance mode (rutas simétricas)', auto: false, required: true }] : []),
+      ],
+      sim: { kind: 'instance-failure', targetId: fw.id, label: 'Simular caída de un firewall' },
+    });
+    if (!clear && !fp.tlsDecryption)
+      push({
+        id: `ngfw-blind:${fw.id}`,
+        ruleId: 'ngfw-blind',
+        stride: ['T', 'E'],
+        title: `${fw.data.label} no ve el contenido del tráfico HTTPS`,
+        description: 'La inspección está antes de que alguien termine el TLS y el firewall no descifra: las firmas de exploits no ven el contenido. El IPS se limita a IPs, puertos y el nombre del sitio.',
+        kind: 'element',
+        nodeIds: [fw.id, ...points.map((g) => g.id)],
+        element: fw.data.label,
+        likelihood: 3,
+        impact: 3,
+        refs: ['ATT&CK T1573', 'ATT&CK T1190'],
+        controls: [
+          { key: 'decrypt', label: 'Descifrado TLS en el firewall (o inspección después del balanceador)', auto: true, ok: false, required: true, fix: setProps(fw, { tlsDecryption: true }, 'Activar descifrado TLS') },
+          { key: 'crs', label: 'WAF con reglas administradas en el borde', auto: true, ok: !!anyWaf, required: false },
+        ],
+        sim: { kind: 'web-attacks', label: 'Simular ataques web' },
+      });
+  }
+
   /* ── I. Flujos que cruzan límites de confianza */
   const boundaries: Boundary[] = [];
   for (const e of E) {

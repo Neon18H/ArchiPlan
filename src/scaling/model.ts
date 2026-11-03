@@ -32,6 +32,7 @@ export function scalingKind(n: ServiceNode): ScalingKind | null {
   switch (lid(n)) {
     case 'ec2':
     case 'beanstalk':
+    case 'ngfw':
       return 'instances';
     case 'ecs':
       return 'tasks';

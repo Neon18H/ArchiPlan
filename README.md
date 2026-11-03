@@ -31,12 +31,13 @@ Los proyectos se guardan como archivos `*.archi.json` en la carpeta `projects/`.
 | **Vistas C4** | C1 Contexto (actores, sistema y externos, calculada automáticamente), C2 Contenedores (la que se edita) y C3 Componentes (doble clic sobre un servicio). Con el filtro por **capas** resaltas borde, aplicación, datos, seguridad, etc. |
 | **Guía paso a paso** | Un checklist de 12 pasos (actores → entrada → borde → identidad → cómputo → datos → red → asíncrono → secretos → observabilidad → conexiones → ADR) que indica la siguiente pieza y la agrega con un clic. |
 | **Asistente** | Te hace unas 13 preguntas y genera la arquitectura inicial junto con sus ADR. |
-| **Plantillas** | Web en 3 capas, API serverless, microservicios en ECS, orientada a eventos, sitio estático y pipeline de datos. |
+| **Plantillas** | Web en 3 capas, defensa en profundidad con firewall de terceros, API serverless, microservicios en ECS, orientada a eventos, sitio estático y pipeline de datos. |
 | **Decisiones (ADR)** | Registro de decisiones con contexto, decisión y consecuencias. |
 | **Multinube** | Catálogos de AWS y Azure con las mismas reglas, simulación y modelo de amenazas. Convierte un diagrama completo de AWS a Azure (o al revés) con un clic. |
 | **Simulación** | Carga, picos, caída de instancias, AZ o región, dependencias caídas o lentas, corrupción de datos, ransomware, Game Day combinado, DDoS L7 y L3/L4, y ataques web contra el WAF (ver abajo). |
 | **Modelo de amenazas (STRIDE)** | Genera las amenazas por pieza, por flujo que cruza un límite de confianza y de la cuenta. Calcula el riesgo, detecta controles en el diagrama y aplica mitigaciones con un clic; se conecta con la simulación (ver abajo). |
 | **Resiliencia y DR** | A qué recurso falla cada pieza ante la caída de una instancia, una AZ o la región, con RTO/RPO, estrategia de DR y backups (ver abajo). |
+| **Firewalls de terceros** | Gateway Load Balancer, sus endpoints y flotas de NGFW / IDS‑IPS (Palo Alto, Fortinet, Check Point…) con IPS que solo bloquea lo que ve (ver abajo). |
 | **Rutas de ataque** | Grafo animado desde Internet hasta los datos más valiosos, mapeado a MITRE ATT&CK, con el control que corta cada ruta (ver abajo). |
 | **Variantes A/B** | Clona el diseño, prueba alternativas y compáralas con las mismas simulaciones: disponibilidad, latencia, costo, amenazas y complejidad, con puntaje y ADR automático (ver abajo). |
 | **Exportar** | PNG, SVG, PDF (A3), documento de arquitectura en HTML (imprimible a PDF) o Markdown, Mermaid, Terraform (AWS y/o Azure) y JSON. |
@@ -129,6 +130,24 @@ En **▶ Simular → Ataque** (o desde la pestaña Amenazas) ArchiPlan calcula *
 - **Cómo cortar la ruta:** el control faltante que más baja la probabilidad, con su arreglo de un clic. Al aplicarlo, las rutas se recalculan.
 
 Es un modelo cualitativo para priorizar defensas, no una prueba de penetración. La lógica está en `src/attack/paths.ts`.
+
+## Inspección con firewalls de terceros (Gateway Load Balancer)
+
+Para el patrón «bump in the wire» hay tres piezas nuevas:
+
+- **Gateway Load Balancer (GWLB):** reparte el tráfico, de forma transparente (GENEVE, UDP 6081), entre la flota de firewalls. Se configuran el balanceo entre zonas, el *target failover* y la afinidad de flujos.
+- **Gateway Load Balancer Endpoint (GWLBE):** el punto de inspección en la ruta. Se dibuja en el camino del tráfico (por ejemplo, ALB → GWLBE → aplicación) y se conecta al GWLB.
+- **Firewall virtual de terceros (NGFW / IDS‑IPS):** Palo Alto VM‑Series, FortiGate, Check Point, Cisco FTDv o un Suricata propio. Se configuran el modo IPS (bloquea) o IDS (solo alerta), la prevención de amenazas, el descifrado TLS, el filtrado de URL, la flota (instancias, Auto Scaling), la licencia PAYG o BYOL y la interfaz de administración.
+
+Qué tiene en cuenta ArchiPlan:
+
+- **Simulación:** la capacidad la pone la flota de firewalls. Si la flota cae, se corta lo que pasa por ella. El IPS bloquea exploits (SQLi, XSS, path traversal) **solo si ve el contenido**: el tráfico ya viene en texto claro porque un balanceador o una API terminó el TLS, o el firewall descifra (lo que cuesta ~50 % de su capacidad). En modo IDS solo alerta. Las peticiones de usuario muestran el salto por el firewall.
+- **Red:** el GWLB no cambia las IPs, así que la flecha que sale del endpoint se valida desde el origen real. El Security Group del firewall debe aceptar UDP 6081 y el health check.
+- **Amenazas y ataques:** toma de control por la interfaz de administración (CVE‑2024‑0012, CVE‑2024‑3400), tráfico sin inspeccionar si falla la flota (fail‑open, rutas asimétricas) e IPS ciego ante HTTPS. En las rutas de ataque, el IPS en el camino es un control (MITRE M1031) con su arreglo.
+- **Costo:** horas del GWLB y GLCU, endpoints por AZ y GB procesados, instancias y licencia PAYG (referencia de Palo Alto VM‑Series; varía por fabricante).
+- **Terraform:** GWLB, target group GENEVE con *target failover*, listener, servicio de endpoint, alarma de `UnHealthyHostCount`, endpoint y un Auto Scaling Group de firewalls (la AMI del Marketplace y el bootstrap quedan como variables/TODO).
+
+La plantilla **«Defensa en profundidad con firewall de terceros»** trae el patrón armado, con sus ADR. Para comparar contra AWS Network Firewall, crea dos variantes y usa ⚖ Comparar.
 
 ## Red configurable (Security Groups, puertos, listeners)
 
