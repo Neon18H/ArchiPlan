@@ -78,6 +78,32 @@ Mientras corre, el lienzo muestra el tráfico de cada flecha y la carga y el est
 
 Las capacidades son **estimaciones** de orden de magnitud: cuotas por defecto de AWS (API Gateway 10k req/s, concurrencia de Lambda 1.000, Cognito 120 req/s…) y cargas típicas por tamaño de instancia. Sirven para comparar diseños y encontrar puntos únicos de falla, **no reemplazan una prueba de carga real**. Cada pieza permite poner su capacidad medida en *Propiedades → Simulación*. Los supuestos están en `src/sim/profiles.ts` y el modelo en `src/sim/engine.ts`.
 
+## Red configurable (Security Groups, puertos, listeners)
+
+Todo lo de red se configura y queda enlazado con la validación, las simulaciones y el Terraform:
+
+- **Puertos.** Cada pieza en la VPC tiene su puerto de escucha (*Propiedades → Red y seguridad*). Por defecto sale del servicio (EC2/ECS 8080, PostgreSQL 5432, MySQL 3306, Redis 6379…). Al cambiarlo se actualizan las etiquetas de las flechas que lo mencionan.
+- **Balanceadores.** Listeners (protocolo, puerto, reenviar o redirigir a HTTPS, certificado) y un target group por destino (protocolo, puerto y ruta de health check).
+- **CDN.** Protocolo hacia el origen (solo HTTPS, solo HTTP o igual que el cliente).
+- **Auto Scaling.** Mínimo, máximo y CPU objetivo en EC2/VMSS; tareas o réplicas máximas en ECS/Container Apps. La simulación escala con esos valores.
+- **Security Groups / NSG** (botón **⛨ Red** de la barra):
+  - **Modo automático** (por defecto): cada pieza recibe un grupo con lo mínimo que piden sus flechas.
+  - **Modo manual**: con *Configurar manualmente* los grupos generados pasan a ser tuyos. Puedes crear, renombrar y borrar grupos, editar reglas de entrada y salida (TCP/UDP/todo, rango de puertos; origen CIDR, otro SG o la prefix list de CloudFront/Front Door) y asignarlos a cada pieza.
+
+**Qué revisa el análisis de red, flecha por flecha:** listener en el puerto llamado, certificado TLS, bucle de redirección CDN→HTTP→HTTPS, balanceador interno llamado desde Internet, puerto del target group distinto del puerto de la app, regla de entrada del SG destino, regla de salida del SG origen, pieza sin SG, ruta de salida (NAT Gateway / VPC Endpoint), cómputo fuera de la VPC y bases de datos abiertas a Internet o SSH/RDP abiertos. Las flechas bloqueadas se pintan en rojo (⛔) en el lienzo. Cada problema aparece en *Validación* con su explicación y un arreglo ⚡ cuando lo hay.
+
+### Petición de usuario
+
+En **▶ Simular → Petición de usuario** se sigue una petición real, salto a salto: DNS → CDN → WAF → balanceador → aplicación → caché/BD/secretos, y las ramas asíncronas (colas, eventos). Hay cinco peticiones:
+
+| Petición | Resultado esperado |
+|---|---|
+| Abrir la web, API con sesión, iniciar sesión | 200 OK |
+| API sin token | 401 (si responde 200, hay un problema de autenticación) |
+| Inyección SQL | 403 en el WAF (si llega a la BD, no hay protección) |
+
+Cuando algo está mal configurado, la petición se corta donde fallaría en la nube real. El panel muestra el código que vería el usuario (por ejemplo 504 si un SG bloquea el balanceador → app, 503 si el target group apunta a otro puerto, 502 si falta el listener, 500 si la app no llega a la BD, o `ERR_TOO_MANY_REDIRECTS`). También dice **dónde te equivocaste** y trae el botón para corregirlo. La **batería de pruebas** corre las cinco peticiones a la vez. Los escenarios de carga también tienen en cuenta las conexiones bloqueadas.
+
 ## Modelo de amenazas (STRIDE)
 
 La pestaña **Amenazas** genera un modelo STRIDE a partir del diagrama, y se actualiza cada vez que lo cambias:
@@ -92,7 +118,7 @@ La pestaña **Amenazas** genera un modelo STRIDE a partir del diagrama, y se act
 - **Exportación.** CSV (para Jira, Excel o GRC) y una sección completa en el documento de arquitectura.
 
 ### Sobre el Terraform
-Es un **esqueleto** para el provider AWS 5.x. Incluye VPC, subnets por AZ, IGW/NAT, rutas y los recursos de cada pieza. Los **security groups** salen de las flechas (origen → destino, con el puerto del protocolo) y el **IAM de mínimo privilegio** sale de lo que cada cómputo consume, además de los triggers (SQS/Kinesis/S3 → Lambda), suscripciones SNS y reglas de EventBridge. Lo que falta por completar está marcado con `TODO`. Revísalo antes de `terraform apply`.
+Es un **esqueleto** para el provider AWS 5.x. Incluye VPC, subnets por AZ, IGW/NAT, rutas y los recursos de cada pieza. Los **security groups** son los que configuraste en modo manual o, si no, los derivados de las flechas (incluida la prefix list administrada de CloudFront). Los **listeners** (HTTPS con `var.certificate_arn`, redirección 80→443), los **target groups** (puerto y health check, uno por destino con reglas por ruta) y el **Auto Scaling** (mín/máx y target tracking de CPU) salen de la configuración de red. En Azure se genera un NSG por subnet con la unión de las reglas de los grupos de sus piezas. El **IAM de mínimo privilegio** sale de lo que cada cómputo consume, además de los triggers (SQS/Kinesis/S3 → Lambda), suscripciones SNS y reglas de EventBridge. Lo que falta por completar está marcado con `TODO`. Revísalo antes de `terraform apply`.
 
 ## Estructura
 
@@ -105,6 +131,7 @@ src/templates/     Plantillas y lógica del asistente
 src/export/        Mermaid, Terraform AWS y Azure, documento, imagen/PDF
 src/sim/           Simulación: perfiles de capacidad, escenarios y motor
 src/threats/       Modelo de amenazas STRIDE: zonas de confianza, reglas y controles
+src/net/           Red configurable: modelo (SG, puertos, listeners), alcanzabilidad y trazado de peticiones
 src/components/    Lienzo, paleta, panel lateral, modales
 ```
 

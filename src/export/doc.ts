@@ -3,6 +3,9 @@ import { byId, isService, isZone, placementOf } from '../lib/graph';
 import { buildGuide } from '../rules/guide';
 import { COMPONENT_KINDS } from '../c3/model';
 import { validate } from '../rules/validate';
+import { analyzeNetwork } from '../net/reach';
+import { netIssues } from '../net/issues';
+import { effectiveNet, isLb, listenersOf, listenPort, needsSg, ruleText } from '../net/model';
 import type { ConnData, Project, ServiceNode } from '../types';
 import { buildThreats, STATUS_LABEL, STRIDE, summarizeThreats, type Stride, type Threat } from '../threats/model';
 
@@ -17,6 +20,8 @@ interface DocModel {
   layers: { layer: string; rows: string[][] }[];
   c3: { service: string; kind: string; rows: string[][]; rels: string[] }[];
   network: string[];
+  sgMode: 'auto' | 'manual';
+  sgs: string[][];
   flows: string[][];
   decisions: Project['decisions'];
   risks: { sev: string; title: string; detail: string }[];
@@ -32,7 +37,17 @@ function model(p: Project): DocModel {
   const map = byId(nodes);
   const services = nodes.filter(isService);
   const label = (id: string) => (map.get(id)?.data as { label?: string })?.label ?? id;
-  const issues = validate(nodes, edges);
+  const issues = [...validate(nodes, edges), ...netIssues(analyzeNetwork(nodes, edges, p.securityGroups), nodes)];
+  const netCfg = effectiveNet(nodes, edges, p.securityGroups);
+  const nmap = byId(nodes);
+  const sgUsers = (id: string) => nodes.filter((n): n is ServiceNode => isService(n) && needsSg(n, nmap) && netCfg.sgIdsOf(n).includes(id));
+  const cdnName = primaryCloud(nodes) === 'azure' ? 'Front Door' : 'CloudFront';
+  const sgs = netCfg.groups.map((g) => [
+    g.name,
+    sgUsers(g.id).map((n) => `${n.data.label} (${isLb(n) ? listenersOf(n).map((l) => `${l.protocol} ${l.port}`).join(', ') : `:${listenPort(n)}`})`).join('; ') || '—',
+    g.inbound.map((r) => ruleText(r, netCfg.groups, cdnName)).join('; ') || 'nada',
+    g.outbound.map((r) => ruleText(r, netCfg.groups, cdnName)).join('; ') || 'nada',
+  ]);
   const cloud = primaryCloud(nodes, meta.provider ?? 'aws');
   const tm = buildThreats(nodes, edges, p.threats ?? {});
   const guide = buildGuide(nodes, edges, decisions, issues, tm.threats);
@@ -94,6 +109,8 @@ function model(p: Project): DocModel {
     },
     layers,
     network,
+    sgMode: netCfg.mode,
+    sgs,
     flows: edges.map((e) => {
       const d = (e.data ?? {}) as ConnData;
       return [label(e.source), label(e.target), d.protocol || '', d.async ? 'Asíncrona' : 'Síncrona', d.description || ''];
@@ -150,6 +167,10 @@ export function toMarkdown(p: Project, diagramFile = 'diagrama.png'): string {
   }
   L.push('## 5. Red y ubicación', '');
   L.push(...(m.network.length ? m.network : ['Sin zonas de red definidas.']), '');
+  if (m.sgs.length) {
+    L.push(`### Security Groups (${m.sgMode === 'manual' ? 'configurados por el arquitecto' : 'derivados de las conexiones, mínimo privilegio'})`, '');
+    L.push('| Grupo | Asignado a | Entrada | Salida |', '|---|---|---|---|', ...m.sgs.map((r) => `| ${r.map(mdEsc).join(' | ')} |`), '');
+  }
   L.push('## 6. Flujos y conexiones', '');
   if (m.flows.length) L.push('| Origen | Destino | Protocolo | Tipo | Descripción |', '|---|---|---|---|---|', ...m.flows.map((r) => `| ${r.map(mdEsc).join(' | ')} |`), '');
   else L.push('Sin conexiones.', '');
@@ -232,6 +253,7 @@ ${m.layers.map((l) => `<h3>${h(l.layer)}</h3>${table(['Componente', 'Servicio', 
 ${m.c3.map((c) => `<h3>Componentes internos de ${h(c.service)} (C4 nivel 3)</h3><p class="muted">Contenedor: ${h(c.kind)}</p>${table(['Componente', 'Tipo', 'Tecnología', 'Responsabilidad'], c.rows)}${c.rels.length ? `<ul>${c.rels.map((r) => `<li>${h(r)}</li>`).join('')}</ul>` : ''}`).join('')}
 <h2>5. Red y ubicación</h2>
 ${m.network.length ? `<ul class="tree">${m.network.map((n) => `<li style="padding-left:${(n.match(/^ */)?.[0].length ?? 0) * 10}px">${md(n.trim().replace(/^- /, ''))}</li>`).join('')}</ul>` : '<p>Sin zonas de red definidas.</p>'}
+${m.sgs.length ? `<h3>Security Groups (${m.sgMode === 'manual' ? 'configurados por el arquitecto' : 'derivados de las conexiones, mínimo privilegio'})</h3>${table(['Grupo', 'Asignado a', 'Entrada', 'Salida'], m.sgs)}` : ''}
 <h2>6. Flujos y conexiones</h2>
 ${m.flows.length ? table(['Origen', 'Destino', 'Protocolo', 'Tipo', 'Descripción'], m.flows) : '<p>Sin conexiones.</p>'}
 <h2>7. Decisiones de arquitectura (ADR)</h2>

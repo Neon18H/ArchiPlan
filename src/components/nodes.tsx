@@ -37,15 +37,16 @@ function simExtra(f: NodeFrame): { text: string; tone?: 'good' | 'bad' } | null 
 
 export const ServiceNodeView = memo(function ServiceNodeView({ id, data, selected }: NodeProps<ServiceNode>) {
   const def = getService(data.serviceId);
-  const { nodeIssues, dimmed, readOnly, sim, stride } = useCanvasCtx();
+  const { nodeIssues, dimmed, readOnly, sim, stride, trace } = useCanvasCtx();
   const simF = sim?.nodes[id];
   const thr = stride?.nodes.get(id);
-  const issue = sim || stride ? undefined : nodeIssues.get(id);
+  const issue = sim || stride || trace ? undefined : nodeIssues.get(id);
+  const tr = trace ? trace.nodes.get(id) ?? 'none' : null;
   const color = CATEGORIES[def.category].color;
   const isActor = def.role === 'actor' || def.role === 'external';
   return (
     <div
-      className={`svc ${selected ? 'is-selected' : ''} ${issue ? `has-${issue}` : ''} ${dimmed.has(id) ? 'is-dimmed' : ''} ${isActor ? 'is-actor' : ''} ${simF ? `sim-${simF.status}` : ''}`}
+      className={`svc ${selected ? 'is-selected' : ''} ${issue ? `has-${issue}` : ''} ${dimmed.has(id) ? 'is-dimmed' : ''} ${isActor ? 'is-actor' : ''} ${simF ? `sim-${simF.status}` : ''} ${tr ? `tr-${tr}` : ''} ${trace?.current === id ? 'tr-current' : ''}`}
       style={{ ['--cat' as string]: color }}
       title={`${def.name}\n${def.description}`}
     >
@@ -72,6 +73,7 @@ export const ServiceNodeView = memo(function ServiceNodeView({ id, data, selecte
       </div>
       {simF && !isActor && ['saturated', 'down', 'degraded', 'hot'].includes(simF.status) && <span className={`sim-pill st-${simF.status}`}>{STATUS_LABEL[simF.status]}</span>}
       {simF && sim?.targetId === id && <span className="sim-target">Objetivo</span>}
+      {tr && ['fail', 'blocked'].includes(tr) && <span className={`tr-pill ${tr}`}>{tr === 'fail' ? 'Falla aquí' : 'Bloqueado'}</span>}
       {thr && thr.open > 0 && (
         <span className={`thr-badge r-${thr.worst}`} title={`${thr.open} amenaza(s) pendiente(s) · máximo riesgo ${thr.worst}`}>
           ⛨ {thr.open}

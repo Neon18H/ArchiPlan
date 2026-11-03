@@ -116,12 +116,64 @@ export interface C3Model {
   links: C3Link[];
 }
 
+/* ───────── Red configurable */
+
+export type SgSource = { kind: 'cidr'; value: string } | { kind: 'sg'; sgId: string } | { kind: 'prefix'; value: 'cdn' };
+
+export interface SgRule {
+  id: string;
+  protocol: 'tcp' | 'udp' | 'all';
+  from: number;
+  to: number;
+  /** En reglas de entrada es el origen; en reglas de salida, el destino. */
+  peer: SgSource;
+  description?: string;
+}
+
+/** Security Group (AWS) o NSG / Application Security Group (Azure). */
+export interface SecurityGroup {
+  id: string;
+  name: string;
+  description?: string;
+  inbound: SgRule[];
+  outbound: SgRule[];
+}
+
+export interface Listener {
+  id: string;
+  port: number;
+  protocol: 'HTTP' | 'HTTPS' | 'TCP' | 'TLS';
+  action: 'forward' | 'redirect-https';
+  /** Certificado TLS asociado (HTTPS/TLS). */
+  cert?: boolean;
+}
+
+export interface TargetConfig {
+  port: number;
+  protocol: 'HTTP' | 'HTTPS' | 'TCP';
+  healthPath: string;
+}
+
+/** Configuración de red de una pieza. */
+export interface NetConfig {
+  /** Puerto en el que escucha la aplicación / el motor. */
+  port?: number;
+  sgIds?: string[];
+  listeners?: Listener[];
+  /** Target groups del balanceador por pieza destino. */
+  targets?: Record<string, TargetConfig>;
+  /** Protocolo de CloudFront/Front Door hacia sus orígenes. */
+  originProtocol?: 'https-only' | 'http-only' | 'match-viewer';
+  publicIp?: boolean;
+}
+
 export interface ServiceData extends Record<string, unknown> {
   serviceId: string;
   label: string;
   props: Record<string, PropValue>;
   notes?: string;
   c3?: C3Model;
+  net?: NetConfig;
   /** Estado de validación, calculado (no se persiste). */
   issue?: 'error' | 'warn' | 'info';
   dimmed?: boolean;
@@ -187,9 +239,20 @@ export interface Project {
   edges: AppEdge[];
   decisions: Decision[];
   threats?: Record<string, ThreatState>;
+  /** Security Groups configurados. Vacío = modo automático (derivados de las flechas). */
+  securityGroups?: SecurityGroup[];
 }
 
 export type Severity = 'error' | 'warn' | 'info';
+
+/** Arreglo propuesto por el análisis de red. */
+export type NetFix =
+  | { kind: 'add-rule'; sgId: string; dir: 'inbound' | 'outbound'; rule: Omit<SgRule, 'id'>; label: string }
+  | { kind: 'create-sg'; nodeId: string; label: string }
+  | { kind: 'set-net'; nodeId: string; patch: Partial<NetConfig>; label: string }
+  | { kind: 'set-target'; lbId: string; targetId: string; target: TargetConfig; label: string }
+  | { kind: 'set-edge'; edgeId: string; protocol: string; label: string }
+  | { kind: 'service'; fix: Fix; label: string };
 
 export interface Issue {
   id: string;
@@ -199,6 +262,7 @@ export interface Issue {
   nodeIds: string[];
   edgeIds?: string[];
   fix?: Fix;
+  netFix?: NetFix;
 }
 
 /** Arreglo automático propuesto por una regla: agregar piezas y conectarlas. */

@@ -392,8 +392,8 @@ export function ExportModal({ onClose }: { onClose: () => void }) {
   };
   const texts: Record<CodeKind, { label: string; file: string; mime: string; text: () => string }> = {
     mermaid: { label: 'Mermaid', file: `${base}.mmd`, mime: 'text/plain', text: () => toMermaid(project.nodes, project.edges, project.meta.name) },
-    terraform: { label: 'Terraform (AWS)', file: `main.tf`, mime: 'text/plain', text: () => toTerraform(project.nodes, project.edges, project.meta) },
-    'terraform-azure': { label: 'Terraform (Azure)', file: hasAws ? `azure.tf` : `main.tf`, mime: 'text/plain', text: () => toTerraformAzure(project.nodes, project.edges, project.meta) },
+    terraform: { label: 'Terraform (AWS)', file: `main.tf`, mime: 'text/plain', text: () => toTerraform(project.nodes, project.edges, project.meta, project.securityGroups) },
+    'terraform-azure': { label: 'Terraform (Azure)', file: hasAws ? `azure.tf` : `main.tf`, mime: 'text/plain', text: () => toTerraformAzure(project.nodes, project.edges, project.meta, project.securityGroups) },
     markdown: { label: 'Documento (Markdown)', file: `${base}-arquitectura.md`, mime: 'text/markdown', text: () => toMarkdown(project, `${base}.png`) },
     json: { label: 'Proyecto JSON', file: `${base}.archi.json`, mime: 'application/json', text: () => JSON.stringify(project, null, 2) },
   };

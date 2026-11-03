@@ -17,6 +17,7 @@ import { c3Eligible, COMPONENT_KINDS, coverage, neighbors } from '../c3/model';
 import type { C3Model, ComponentKind } from '../types';
 import { summarizeThreats, type Threat } from '../threats/model';
 import { useThreatsUi } from '../threats/ui';
+import { EdgeNetSection, NetSection } from './NetInspector';
 
 type Tab = 'props' | 'issues' | 'guide' | 'adr' | 'threats';
 
@@ -329,6 +330,7 @@ function ServiceInspector({ node, issues }: { node: ServiceNode; issues: Issue[]
           ))}
         </div>
       ) : null}
+      <NetSection node={node} />
       {c3Eligible(node) && (
         <button className="btn block c3-open" onClick={() => useStore.getState().openC3(node.id)}>
           ⧉ Ver componentes (C3){node.data.c3?.components.length ? ` · ${node.data.c3.components.length}` : ''}
@@ -472,6 +474,7 @@ function EdgeInspector({ edge }: { edge: AppEdge }) {
       <Field label="Descripción del flujo">
         <textarea rows={3} placeholder="Ej.: consulta de catálogo, publica OrdenCreada…" value={d.description ?? ''} onChange={(e) => updateEdge(edge.id, { description: e.target.value })} />
       </Field>
+      <EdgeNetSection edge={edge} />
       <div className="row gap">
         <button className="btn" onClick={() => reverseEdge(edge.id)}>
           Invertir dirección
@@ -570,7 +573,7 @@ function ProjectInspector() {
 /* ───────────────────────── Validación */
 
 function IssueCard({ issue, compact }: { issue: Issue; compact?: boolean }) {
-  const { focus, applyFix } = useStore.getState();
+  const { focus, applyFix, applyNetFix } = useStore.getState();
   return (
     <div className={`issue ${issue.severity}`}>
       <button className="issue-main" onClick={() => (issue.nodeIds.length || issue.edgeIds?.length) && focus([...(issue.edgeIds ?? []), ...issue.nodeIds])}>
@@ -581,6 +584,11 @@ function IssueCard({ issue, compact }: { issue: Issue; compact?: boolean }) {
       {issue.fix && (
         <button className="btn small fix" onClick={() => applyFix(issue.fix!)}>
           ⚡ {issue.fix.label}
+        </button>
+      )}
+      {issue.netFix && (
+        <button className="btn small fix" onClick={() => applyNetFix(issue.netFix!)}>
+          ⚡ {issue.netFix.label}
         </button>
       )}
     </div>

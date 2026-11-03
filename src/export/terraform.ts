@@ -1,13 +1,14 @@
 import { getService } from '../catalog/catalog';
 import { byId, isService, isZone, placementOf } from '../lib/graph';
-import type { AppEdge, AppNode, ConnData, ProjectMeta, ServiceNode } from '../types';
+import type { AppEdge, AppNode, ProjectMeta, SecurityGroup, ServiceNode, SgRule } from '../types';
+import { effectiveNet, listenersOf, listenPort, originProtocol, targetOf } from '../net/model';
 
 /**
  * Genera un esqueleto de Terraform (provider AWS ~> 5) a partir del diagrama.
  * No pretende ser un despliegue final: es un punto de partida con la red,
  * los recursos, los security groups derivados de las conexiones y TODOs.
  */
-export function toTerraform(nodes: AppNode[], edges: AppEdge[], meta: ProjectMeta): string {
+export function toTerraform(nodes: AppNode[], edges: AppEdge[], meta: ProjectMeta, securityGroups?: SecurityGroup[]): string {
   const map = byId(nodes);
   const services = nodes.filter(isService).filter((n) => getService(n.data.serviceId).provider !== 'azure');
   const zones = nodes.filter(isZone);
@@ -47,6 +48,7 @@ export function toTerraform(nodes: AppNode[], edges: AppEdge[], meta: ProjectMet
   const placement = (n: ServiceNode) => placementOf(n, map);
   const inVpc = (n: ServiceNode) => !!vpc && placement(n).startsWith('subnet-');
   const hasNat = services.some((n) => n.data.serviceId === 'natgw');
+  const needsCert = services.some((n) => ['alb', 'nlb'].includes(n.data.serviceId) && listenersOf(n).some((l) => l.protocol === 'HTTPS' || l.protocol === 'TLS'));
 
   block(`
 # ─────────────────────────────────────────────────────────────
@@ -87,7 +89,12 @@ variable "environment" {
   type    = string
   default = ${q(meta.environment || 'prod')}
 }
-
+${needsCert ? `
+variable "certificate_arn" {
+  type        = string
+  description = "ARN del certificado de ACM para los listeners HTTPS de los balanceadores"
+}
+` : ''}
 locals {
   name = "\${var.project}-\${var.environment}"
   tags = {
@@ -202,67 +209,67 @@ resource "aws_route_table_association" "${short}" {
     }
   }
 
-  // ───────── Security groups derivados de las conexiones
-  const sgNodes = services.filter((n) => inVpc(n) && !['natgw', 'vpce'].includes(n.data.serviceId));
-  const sgOf = (n: ServiceNode) => (sgNodes.includes(n) ? `aws_security_group.${tfName(n)}.id` : null);
-  const portOf = (e: AppEdge, t: ServiceNode) => {
-    const m = String((e.data as ConnData)?.protocol ?? '').match(/(\d{2,5})/);
-    if (m) return Number(m[1]);
-    const d = def(t);
-    if (d.role === 'lb') return 443;
-    if (d.id === 'rds' || d.id === 'aurora') return String(t.data.props.engine ?? '').includes('mysql') ? 3306 : 5432;
-    if (d.id === 'elasticache') return 6379;
-    return 443;
+  // ───────── Security groups (los del arquitecto en modo manual; derivados de las flechas en modo automático)
+  const net = effectiveNet(nodes, edges, securityGroups);
+  const sgName = new Map<string, string>();
+  {
+    const usedSg = new Set<string>();
+    for (const g of net.groups) {
+      const owner = net.mode === 'auto' ? services.find((n) => `sg_${n.id}` === g.id) : undefined;
+      let base = owner ? tfName(owner) : g.name.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').replace(/^(\d)/, '_$1') || 'sg';
+      base = base.slice(0, 40);
+      let nm = base;
+      let i = 2;
+      while (usedSg.has(nm)) nm = `${base.slice(0, 37)}_${i++}`;
+      usedSg.add(nm);
+      sgName.set(g.id, nm);
+    }
+  }
+  const sgOf = (n: ServiceNode) => {
+    if (!inVpc(n)) return null;
+    const ids = net.sgIdsOf(n).filter((id) => sgName.has(id));
+    return ids.length ? ids.map((id) => `aws_security_group.${sgName.get(id)}.id`).join(', ') : null;
   };
-  if (sgNodes.length) {
-    out.push('# ═════════════ Security groups (mínimo privilegio a partir de las flechas del diagrama)\n');
-    for (const n of sgNodes) {
-      const name = tfName(n);
+  const usesCdnPrefix = net.groups.some((g) => [...g.inbound, ...g.outbound].some((r) => r.peer.kind === 'prefix'));
+  const ruleBlock = (g: SecurityGroup, r: SgRule, dir: 'ingress' | 'egress', idx: number) => {
+    const gn = sgName.get(g.id)!;
+    const peer =
+      r.peer.kind === 'sg'
+        ? sgName.has(r.peer.sgId)
+          ? `referenced_security_group_id = aws_security_group.${sgName.get(r.peer.sgId)}.id`
+          : `# TODO: el SG de origen ya no existe\n  cidr_ipv4 = "10.0.0.0/8"`
+        : r.peer.kind === 'prefix'
+          ? 'prefix_list_id = data.aws_ec2_managed_prefix_list.cloudfront.id'
+          : r.peer.value.includes(':')
+            ? `cidr_ipv6 = ${q(r.peer.value)}`
+            : `cidr_ipv4 = ${q(r.peer.value)}`;
+    const ports = r.protocol === 'all' ? '  ip_protocol = "-1"' : `  ip_protocol = ${q(r.protocol)}\n  from_port   = ${r.from}\n  to_port     = ${r.to}`;
+    const what = r.protocol === 'all' ? 'all' : r.from === r.to ? String(r.from) : `${r.from}_${r.to}`;
+    return `
+resource "aws_vpc_security_group_${dir}_rule" "${gn}_${dir === 'ingress' ? 'in' : 'out'}_${what}_${idx}" {
+  security_group_id = aws_security_group.${gn}.id
+${ports}
+  ${peer}${r.description ? `\n  description = ${q(r.description.replace(/[^\x20-\x7E]/g, '').slice(0, 250) || 'regla')}` : ''}
+}
+`;
+  };
+  if (net.groups.length && vpc) {
+    out.push(`# ═════════════ Security groups (${net.mode === 'manual' ? 'configurados en ArchiPlan' : 'mínimo privilegio a partir de las flechas del diagrama'})\n`);
+    if (usesCdnPrefix)
       block(`
-resource "aws_security_group" "${name}" {
-  name        = "\${local.name}-${name.replace(/_/g, '-')}"
-  description = ${q(`SG de ${n.data.label}`)}
+data "aws_ec2_managed_prefix_list" "cloudfront" {
+  name = "com.amazonaws.global.cloudfront.origin-facing"
+}
+`);
+    for (const g of net.groups) {
+      const gn = sgName.get(g.id)!;
+      block(`
+resource "aws_security_group" "${gn}" {
+  name        = "\${local.name}-${gn.replace(/_/g, '-')}"
+  description = ${q((g.description || `SG ${g.name}`).replace(/[^\x20-\x7E]/g, '').slice(0, 250) || 'Security group')}
   vpc_id      = aws_vpc.main.id
 }
-
-resource "aws_vpc_security_group_egress_rule" "${name}_all" {
-  security_group_id = aws_security_group.${name}.id
-  ip_protocol       = "-1"
-  cidr_ipv4         = "0.0.0.0/0"
-}
-`);
-      if (def(n).role === 'lb' && n.data.props.scheme === 'internet-facing') {
-        for (const p of [80, 443]) {
-          block(`
-resource "aws_vpc_security_group_ingress_rule" "${name}_internet_${p}" {
-  security_group_id = aws_security_group.${name}.id
-  ip_protocol       = "tcp"
-  from_port         = ${p}
-  to_port           = ${p}
-  cidr_ipv4         = "0.0.0.0/0"
-}
-`);
-        }
-      }
-    }
-    for (const e of edges) {
-      const s = map.get(e.source);
-      const t = map.get(e.target);
-      if (!isService(s) || !isService(t)) continue;
-      const ss = sgOf(s);
-      const ts = sgOf(t);
-      if (!ss || !ts) continue;
-      const port = portOf(e, t);
-      block(`
-resource "aws_vpc_security_group_ingress_rule" "${tfName(t)}_from_${tfName(s)}" {
-  security_group_id            = ${ts}
-  referenced_security_group_id = ${ss}
-  ip_protocol                  = "tcp"
-  from_port                    = ${port}
-  to_port                      = ${port}
-  description                  = ${q(`${s.data.label} -> ${t.data.label}`)}
-}
-`);
+${g.inbound.map((r, i) => ruleBlock(g, r, 'ingress', i + 1)).join('')}${g.outbound.map((r, i) => ruleBlock(g, r, 'egress', i + 1)).join('')}`);
     }
   }
 
@@ -360,6 +367,13 @@ resource "aws_iam_role_policy_attachment" "ecs_execution" {
 `);
   }
   const lbTarget = (n: ServiceNode) => ins(n).find(({ s }) => def(s).role === 'lb')?.s;
+  const lbTargets = (lb: ServiceNode) => outs(lb).map(({ t }) => t).filter((t) => ['ec2', 'ecs'].includes(t.data.serviceId));
+  const tgName = (lb: ServiceNode, t: ServiceNode) => `${tfName(lb)}_${tfName(t)}`;
+  const pathOf = (lb: ServiceNode, t: ServiceNode) => {
+    const e = edges.find((x) => x.source === lb.id && x.target === t.id);
+    const m = String((e?.data as { protocol?: string })?.protocol ?? '').match(/(\/[\w\-/]+)/);
+    return m ? `${m[1].replace(/\/$/, '')}*` : `/${tfName(t).replace(/_/g, '-')}*`;
+  };
   const dataSubnets = hasSubnet('subnet-data') ? 'aws_subnet.data[*].id' : hasSubnet('subnet-private') ? 'aws_subnet.private[*].id' : null;
 
   for (const n of services) {
@@ -399,7 +413,7 @@ resource "aws_route53_record" "${name}_apex" {
           if (t.data.serviceId === 's3')
             return `  origin {\n    origin_id                = ${q(tfName(t))}\n    domain_name              = aws_s3_bucket.${tfName(t)}.bucket_regional_domain_name\n    origin_access_control_id = aws_cloudfront_origin_access_control.${name}.id\n  }`;
           const domain = t.data.serviceId === 'apigw' ? `replace(aws_apigatewayv2_api.${tfName(t)}.api_endpoint, "https://", "")` : `aws_lb.${tfName(t)}.dns_name`;
-          return `  origin {\n    origin_id   = ${q(tfName(t))}\n    domain_name = ${domain}\n    custom_origin_config {\n      http_port              = 80\n      https_port             = 443\n      origin_protocol_policy = "https-only"\n      origin_ssl_protocols   = ["TLSv1.2"]\n    }\n  }`;
+          return `  origin {\n    origin_id   = ${q(tfName(t))}\n    domain_name = ${domain}\n    custom_origin_config {\n      http_port              = 80\n      https_port             = 443\n      origin_protocol_policy = ${q(originProtocol(n))}\n      origin_ssl_protocols   = ["TLSv1.2"]\n    }\n  }`;
         });
         block(`
 ${header}
@@ -552,27 +566,77 @@ resource "aws_lb" "${name}" {
   subnets            = ${subnets ?? '[] # TODO: ubícalo en una subnet'}${sg ? `\n  security_groups    = [${sg}]` : ''}
 }
 
-resource "aws_lb_target_group" "${name}" {
-  name        = substr("\${local.name}-${name.replace(/_/g, '-')}", 0, 32)
-  port        = 8080
-  protocol    = ${q(isAlb ? 'HTTP' : 'TCP')}
-  target_type = ${q(outs(n).some(({ t }) => t.data.serviceId === 'ecs') ? 'ip' : 'instance')}
+${lbTargets(n)
+  .map((t, i) => {
+    const tg = targetOf(n, t);
+    return `
+resource "aws_lb_target_group" "${tgName(n, t)}" {
+  name        = substr("\${local.name}-${tfName(t).replace(/_/g, '-')}", 0, 32)
+  port        = ${tg.port}
+  protocol    = ${q(isAlb ? tg.protocol : 'TCP')}
+  target_type = ${q(t.data.serviceId === 'ecs' ? 'ip' : 'instance')}
   vpc_id      = aws_vpc.main.id${isAlb ? `
   health_check {
-    path = "/health"
+    path    = ${q(tg.healthPath || '/')}
+    matcher = "200-399"
   }` : ''}
 }
-
-resource "aws_lb_listener" "${name}" {
-  load_balancer_arn = aws_lb.${name}.arn
-  port              = ${isAlb ? 80 : 443}
-  protocol          = ${q(isAlb ? 'HTTP' : 'TCP')} # TODO: HTTPS (443) con certificado de ACM
-  default_action {
+${i > 0 && isAlb ? `
+resource "aws_lb_listener_rule" "${tgName(n, t)}" {
+  listener_arn = aws_lb_listener.${name}_${(listenersOf(n).find((l) => l.action === 'forward') ?? { port: 443 }).port}.arn
+  priority     = ${i * 10}
+  action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.${name}.arn
+    target_group_arn = aws_lb_target_group.${tgName(n, t)}.arn
+  }
+  condition {
+    path_pattern {
+      values = [${q(pathOf(n, t))}]
+    }
   }
 }
-`);
+` : ''}`;
+  })
+  .join('')}${!lbTargets(n).length ? `
+# TODO: conecta ${n.data.label} a su destino (EC2 / ECS) para generar el target group
+` : ''}${listenersOf(n)
+  .map((l) => {
+    const first = lbTargets(n)[0];
+    const tls = l.protocol === 'HTTPS' || l.protocol === 'TLS';
+    const action =
+      l.action === 'redirect-https'
+        ? `  default_action {
+    type = "redirect"
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
+    }
+  }`
+        : first
+          ? `  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.${tgName(n, first)}.arn
+  }`
+          : `  default_action {
+    type = "fixed-response"
+    fixed_response {
+      content_type = "text/plain"
+      status_code  = "503"
+    }
+  }`;
+    return `
+resource "aws_lb_listener" "${name}_${l.port}" {
+  load_balancer_arn = aws_lb.${name}.arn
+  port              = ${l.port}
+  protocol          = ${q(l.protocol)}${tls ? `
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  certificate_arn   = var.certificate_arn${l.cert ? '' : ' # ⚠ en ArchiPlan este listener está sin certificado'}` : ''}
+${action}
+}
+`;
+  })
+  .join('')}`);
         break;
       }
       case 'apigw': {
@@ -694,14 +758,26 @@ resource "aws_launch_template" "${name}" {
 ${asg ? `
 resource "aws_autoscaling_group" "${name}" {
   name_prefix         = "\${local.name}-${name.replace(/_/g, '-')}-"
-  min_size            = ${Math.max(1, Number(p.count) || 2)}
-  max_size            = ${Math.max(2, (Number(p.count) || 2) * 3)}
+  min_size            = ${p.minSize !== undefined ? Math.max(0, Number(p.minSize)) : Math.max(1, Number(p.count) || 2)}
+  max_size            = ${p.maxSize !== undefined ? Math.max(1, Number(p.maxSize)) : Math.max(2, (Number(p.count) || 2) * 3)}
   desired_capacity    = ${Math.max(1, Number(p.count) || 2)}
-  vpc_zone_identifier = ${subnets ?? '[] # TODO'}${lb ? `\n  target_group_arns   = [aws_lb_target_group.${tfName(lb)}.arn]` : ''}
+  vpc_zone_identifier = ${subnets ?? '[] # TODO'}${lb ? `\n  target_group_arns   = [aws_lb_target_group.${tgName(lb, n)}.arn]` : ''}
   health_check_type   = ${q(lb ? 'ELB' : 'EC2')}
   launch_template {
     id      = aws_launch_template.${name}.id
     version = "$Latest"
+  }
+}
+
+resource "aws_autoscaling_policy" "${name}_cpu" {
+  name                   = "${name.replace(/_/g, '-')}-cpu"
+  autoscaling_group_name = aws_autoscaling_group.${name}.name
+  policy_type            = "TargetTrackingScaling"
+  target_tracking_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ASGAverageCPUUtilization"
+    }
+    target_value = ${Number(p.targetCpu) || 60}
   }
 }
 ` : `
@@ -738,7 +814,7 @@ resource "aws_ecs_task_definition" "${name}" {
     name         = ${q(name)}
     image        = ${q(p.image || 'app:latest')} # TODO: URI de ECR
     essential    = true
-    portMappings = [{ containerPort = 8080, protocol = "tcp" }]
+    portMappings = [{ containerPort = ${listenPort(n)}, protocol = "tcp" }]
     logConfiguration = {
       logDriver = "awslogs"
       options = {
@@ -761,9 +837,9 @@ resource "aws_ecs_service" "${name}" {
     security_groups = [${sg ?? ''}]
   }${lb ? `
   load_balancer {
-    target_group_arn = aws_lb_target_group.${tfName(lb)}.arn
+    target_group_arn = aws_lb_target_group.${tgName(lb, n)}.arn
     container_name   = ${q(name)}
-    container_port   = 8080
+    container_port   = ${listenPort(n)}
   }` : ''}
 }
 ${p['sim.autoscaling'] !== false ? `
@@ -772,7 +848,7 @@ resource "aws_appautoscaling_target" "${name}" {
   resource_id        = "service/\${aws_ecs_cluster.main.name}/\${aws_ecs_service.${name}.name}"
   scalable_dimension = "ecs:service:DesiredCount"
   min_capacity       = ${Number(p.desired) || 2}
-  max_capacity       = ${(Number(p.desired) || 2) * 4}
+  max_capacity       = ${p.maxTasks !== undefined ? Math.max(Number(p.desired) || 1, Number(p.maxTasks)) : (Number(p.desired) || 2) * 4}
 }
 
 resource "aws_appautoscaling_policy" "${name}_cpu" {
@@ -782,7 +858,7 @@ resource "aws_appautoscaling_policy" "${name}_cpu" {
   resource_id        = aws_appautoscaling_target.${name}.resource_id
   scalable_dimension = aws_appautoscaling_target.${name}.scalable_dimension
   target_tracking_scaling_policy_configuration {
-    target_value = 60
+    target_value = ${Number(p.targetCpu) || 60}
     predefined_metric_specification {
       predefined_metric_type = "ECSServiceAverageCPUUtilization"
     }
@@ -904,7 +980,7 @@ resource "aws_db_instance" "${name}" {
   identifier                  = "\${local.name}-${name.replace(/_/g, '-')}"
   engine                      = ${q(p.engine || 'postgres')}
   instance_class              = ${q(p.instanceClass || 'db.t4g.medium')}
-  allocated_storage           = ${Number(p.storage) || 50}
+  allocated_storage           = ${Number(p.storage) || 50}${n.data.net?.port ? `\n  port                        = ${n.data.net.port}` : ''}
   username                    = "app_admin"
   manage_master_user_password = true # contraseña en Secrets Manager con rotación
   multi_az                    = ${!!p.multiAZ}
@@ -928,7 +1004,7 @@ resource "aws_db_subnet_group" "${name}" {
 
 resource "aws_rds_cluster" "${name}" {
   cluster_identifier          = "\${local.name}-${name.replace(/_/g, '-')}"
-  engine                      = ${q(p.engine || 'aurora-postgresql')}
+  engine                      = ${q(p.engine || 'aurora-postgresql')}${n.data.net?.port ? `\n  port                        = ${n.data.net.port}` : ''}
   master_username             = "app_admin"
   manage_master_user_password = true
   storage_encrypted           = ${p.encrypted !== false}
@@ -985,7 +1061,7 @@ resource "aws_elasticache_replication_group" "${name}" {
   replication_group_id       = substr("\${local.name}-${name.replace(/_/g, '-')}", 0, 40)
   description                = ${q(n.data.label)}
   engine                     = ${q(p.engine === 'memcached' ? 'redis' : p.engine || 'valkey')}${p.engine === 'memcached' ? ' # TODO: memcached usa aws_elasticache_cluster' : ''}
-  node_type                  = ${q(p.nodeType || 'cache.t4g.small')}
+  node_type                  = ${q(p.nodeType || 'cache.t4g.small')}${n.data.net?.port ? `\n  port                       = ${n.data.net.port}` : ''}
   num_cache_clusters         = ${1 + (Number(p.replicas) || 0)}
   automatic_failover_enabled = ${(Number(p.replicas) || 0) > 0}
   at_rest_encryption_enabled = true
