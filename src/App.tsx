@@ -9,7 +9,7 @@ import { ExportModal, ProjectsModal, TemplatesModal, WizardModal } from './compo
 import { Palette } from './components/Palette';
 import { Sidebar } from './components/Sidebar';
 import { SimPanel } from './components/SimPanel';
-import { NetModal } from './components/NetInspector';
+import { NetLegend, NetModal, netViewData, useNetUi } from './components/NetInspector';
 import { useSim } from './sim/store';
 import { buildThreats } from './threats/model';
 import { useThreatsUi } from './threats/ui';
@@ -118,7 +118,7 @@ function Toolbar({ openModal, onSave, issuesCount }: { openModal: (m: ModalKind)
       </div>
 
       <div className="tb-group">
-        <NetButton openModal={openModal} />
+        <NetButton />
         <SimToggle />
       </div>
 
@@ -173,7 +173,10 @@ function SimToggle() {
     <button
       className={`tb-btn sim-toggle ${open ? 'on' : ''}`}
       onClick={() => {
-        if (!open) setView('c2');
+        if (!open) {
+          setView('c2');
+          useNetUi.getState().setView(false);
+        }
         setOpen(!open);
       }}
       title={open ? 'Cerrar la simulación' : 'Simula carga, fallas, ataques y peticiones de usuario sobre esta arquitectura'}
@@ -184,12 +187,25 @@ function SimToggle() {
   );
 }
 
-function NetButton({ openModal }: { openModal: (m: ModalKind) => void }) {
+function NetButton() {
   const manual = useStore((s) => s.securityGroups.length > 0);
+  const on = useNetUi((s) => s.view);
+  const setView = useStore((s) => s.setView);
   const azure = useCloud() === 'azure';
   return (
-    <button className="tb-btn" onClick={() => openModal('net')} title={`Puertos, ${azure ? 'NSG' : 'Security Groups'}, listeners y reglas de red`}>
-      ⛨ Red{manual && <span className="tb-dot" aria-label="configuración manual" />}
+    <button
+      className={`tb-btn ${on ? 'on' : ''}`}
+      aria-pressed={on}
+      onClick={() => {
+        if (!on) {
+          setView('c2');
+          useSim.getState().setOpen(false);
+        }
+        useNetUi.getState().setView(!on);
+      }}
+      title={`Vista de red: puertos, ${azure ? 'NSG' : 'Security Groups'} y qué tráfico pasa por cada flecha`}
+    >
+      ⛨ Red{manual && <span className="tb-dot" aria-label="red personalizada" />}
     </button>
   );
 }
@@ -223,6 +239,7 @@ export default function App() {
   const trace = useSim((s) => s.trace);
   const traceStep = useSim((s) => s.step);
   const securityGroups = useStore((s) => s.securityGroups);
+  const netViewOn = useNetUi((s) => s.view);
   const threatState = useStore((s) => s.threats);
   const strideOverlay = useThreatsUi((s) => s.overlay);
   const cloud = useCloud();
@@ -259,7 +276,8 @@ export default function App() {
     const frame = simOpen && simMode === 'load' && simResult && view === 'c2' ? simResult.frames[simIdx] : null;
     const sim = frame ? { nodes: frame.nodes, edges: frame.edges, targetId: simResult!.targetId, playing: simPlaying } : null;
     let stride: { nodes: Map<string, { open: number; worst: string | null }>; boundaries: Map<string, string> } | null = null;
-    if (strideOverlay && !sim && !traceCtx && view === 'c2') {
+    const netView = netViewOn && view === 'c2' && !sim && !traceCtx ? netViewData(nodes, edges, netAnalysis) : null;
+    if (strideOverlay && !sim && !traceCtx && !netView && view === 'c2') {
       const rank: Record<string, number> = { Bajo: 1, Medio: 2, Alto: 3, Crítico: 4 };
       const nm = new Map<string, { open: number; worst: string | null }>();
       for (const t of threatModel.threats) {
@@ -274,8 +292,8 @@ export default function App() {
       const short: Record<string, string> = { 'Borde AWS': 'Borde', 'Servicios AWS': cloud === 'azure' ? 'PaaS' : 'AWS', 'Borde Azure': 'Borde', 'Servicios Azure': 'PaaS', 'Subnet pública': 'Pública', 'Subnet privada': 'Privada', 'Subnet de datos': 'Datos', 'Red corporativa': 'Corp.' };
       stride = { nodes: nm, boundaries: new Map(threatModel.boundaries.filter((b) => b.inbound).map((b) => [b.edgeId, `${short[b.from] ?? b.from}→${short[b.to] ?? b.to}`])) };
     }
-    return { nodeIssues, edgeIssues, dimmed, readOnly: view !== 'c2', sim, stride, cloud, trace: traceCtx, netBlocked };
-  }, [issues, layers, nodes, view, simOpen, simMode, simResult, simIdx, simPlaying, strideOverlay, threatModel, cloud, trace, traceStep, netAnalysis]);
+    return { nodeIssues, edgeIssues, dimmed, readOnly: view !== 'c2', sim, stride, cloud, trace: traceCtx, netBlocked, netView };
+  }, [issues, layers, nodes, edges, view, simOpen, simMode, simResult, simIdx, simPlaying, strideOverlay, threatModel, cloud, trace, traceStep, netAnalysis, netViewOn]);
 
   const counts = { error: issues.filter((i) => i.severity === 'error').length, warn: issues.filter((i) => i.severity === 'warn').length, info: issues.filter((i) => i.severity === 'info').length };
 
@@ -338,6 +356,7 @@ export default function App() {
             <Palette />
             <div className={`center ${simOpen ? 'with-sim' : ''}`}>
               {view === 'c3' ? <C3Canvas /> : <Canvas />}
+              {netViewOn && view === 'c2' && <NetLegend />}
               {simOpen && view !== 'c3' && <SimPanel />}
             </div>
             <Sidebar issues={issues} guide={guide} threats={threatModel.threats} />

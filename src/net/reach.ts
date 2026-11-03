@@ -17,6 +17,8 @@ import {
   listenPort,
   needsSg,
   originProtocol,
+  peerIs,
+  ruleCovers,
   ruleText,
   semantics,
   targetOf,
@@ -91,16 +93,8 @@ export function analyzeNetwork(nodes: AppNode[], edges: AppEdge[], groups?: Secu
     return null;
   };
 
-  const portIn = (r: SgRule, port: number) => r.protocol === 'all' || (r.protocol === 'tcp' && r.from <= port && r.to >= port);
-  const peerMatches = (peer: SgRule['peer'], other: ServiceNode) => {
-    if (peer.kind === 'cidr') {
-      if (isAnyCidr(peer.value)) return true;
-      const c = inVpc(other, map) ? cidrOf(other, map) : null;
-      return !!c && cidrContains(peer.value, c);
-    }
-    if (peer.kind === 'prefix') return role(other) === 'cdn';
-    return inVpc(other, map) && net.sgIdsOf(other).includes(peer.sgId);
-  };
+  const portIn = ruleCovers;
+  const peerMatches = (peer: SgRule['peer'], other: ServiceNode) => peerIs(peer, other, map, net.sgIdsOf);
   const describeRules = (gs: SecurityGroup[], dir: 'inbound' | 'outbound') => {
     const rs = gs.flatMap((g) => g[dir].map((r) => `${g.name}: ${ruleText(r, net.groups, CDN)}`));
     return rs.length ? rs.join(' · ') : 'ninguna regla';
