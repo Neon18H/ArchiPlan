@@ -12,6 +12,7 @@ import { SimPanel } from './components/SimPanel';
 import { SecurityModal } from './components/SecurityPanel';
 import { VariantBar } from './components/VariantBar';
 import { CompareModal } from './components/CompareModal';
+import { ResilienceModal } from './components/ResilienceModal';
 import { AiButton, AiPanel, AiWatcher } from './components/AiPanel';
 import { NetLegend, NetModal, netViewData, useNetUi } from './components/NetInspector';
 import { useSim } from './sim/store';
@@ -26,10 +27,11 @@ import { validate } from './rules/validate';
 import { analyzeNetwork } from './net/reach';
 import { netIssues } from './net/issues';
 import { traceOverlay } from './net/trace';
+import { attackOverlay } from './attack/paths';
 import { useStore } from './store';
 import type { Layer, Severity } from './types';
 
-type ModalKind = 'templates' | 'wizard' | 'projects' | 'export' | 'net' | 'security' | 'ai' | 'compare' | null;
+type ModalKind = 'templates' | 'wizard' | 'projects' | 'export' | 'net' | 'security' | 'ai' | 'compare' | 'resilience' | null;
 
 function Menu({ label, children }: { label: React.ReactNode; children: (close: () => void) => React.ReactNode }) {
   const [open, setOpen] = useState(false);
@@ -124,6 +126,10 @@ function Toolbar({ openModal, onSave, issuesCount }: { openModal: (m: ModalKind)
 
       <div className="tb-group">
         <NetButton />
+        <button className="tb-btn" onClick={() => openModal('resilience')} title="Resiliencia y DR: a qué falla cada pieza, RTO y RPO ante caídas de instancia, AZ o región, y backups" aria-label="Resiliencia">
+          <span aria-hidden>⛑</span>
+          <span className="wide-only"> Resiliencia</span>
+        </button>
         <SimToggle />
         <AiButton />
       </div>
@@ -244,6 +250,9 @@ export default function App() {
   const simMode = useSim((s) => s.mode);
   const trace = useSim((s) => s.trace);
   const traceStep = useSim((s) => s.step);
+  const attackRes = useSim((s) => s.attack);
+  const attackSel = useSim((s) => s.attackSel);
+  const attackStep = useSim((s) => s.attackStep);
   const securityGroups = useStore((s) => s.securityGroups);
   const netViewOn = useNetUi((s) => s.view);
   const threatState = useStore((s) => s.threats);
@@ -278,12 +287,14 @@ export default function App() {
     if (layers.length) for (const n of nodes) if (isService(n) && !layers.includes(getService(n.data.serviceId).layer)) dimmed.add(n.id);
     const traceOn = simOpen && simMode === 'request' && view === 'c2' && trace ? traceOverlay({ ...trace, hops: trace.hops.slice(0, traceStep) }) : null;
     const traceCtx = traceOn && trace ? { ...traceOn, failedEdgeId: traceStep >= trace.hops.length ? trace.failedEdgeId ?? null : null, current: trace.hops[Math.min(traceStep, trace.hops.length) - 1]?.nodeId ?? null } : null;
+    const atkPath = simOpen && simMode === 'attack' && view === 'c2' ? attackRes?.paths[attackSel] : null;
+    const attack = atkPath ? attackOverlay(atkPath, attackStep) : simOpen && simMode === 'attack' && view === 'c2' ? { nodes: new Map(), edges: new Map(), virtual: [], labels: new Map() } : null;
     const netBlocked = new Map<string, string>();
     for (const v of netAnalysis.verdicts.values()) if (!v.ok) netBlocked.set(v.edgeId, v.short ?? 'bloqueado');
     const frame = simOpen && simMode === 'load' && simResult && view === 'c2' ? simResult.frames[simIdx] : null;
     const sim = frame ? { nodes: frame.nodes, edges: frame.edges, targetId: simResult!.targetId, playing: simPlaying } : null;
     let stride: { nodes: Map<string, { open: number; worst: string | null }>; boundaries: Map<string, string> } | null = null;
-    const netView = netViewOn && view === 'c2' && !sim && !traceCtx ? netViewData(nodes, edges, netAnalysis) : null;
+    const netView = netViewOn && view === 'c2' && !sim && !traceCtx && !attack ? netViewData(nodes, edges, netAnalysis) : null;
     if (strideOverlay && !sim && !traceCtx && !netView && view === 'c2') {
       const rank: Record<string, number> = { Bajo: 1, Medio: 2, Alto: 3, Crítico: 4 };
       const nm = new Map<string, { open: number; worst: string | null }>();
@@ -299,8 +310,8 @@ export default function App() {
       const short: Record<string, string> = { 'Borde AWS': 'Borde', 'Servicios AWS': cloud === 'azure' ? 'PaaS' : 'AWS', 'Borde Azure': 'Borde', 'Servicios Azure': 'PaaS', 'Subnet pública': 'Pública', 'Subnet privada': 'Privada', 'Subnet de datos': 'Datos', 'Red corporativa': 'Corp.' };
       stride = { nodes: nm, boundaries: new Map(threatModel.boundaries.filter((b) => b.inbound).map((b) => [b.edgeId, `${short[b.from] ?? b.from}→${short[b.to] ?? b.to}`])) };
     }
-    return { nodeIssues, edgeIssues, dimmed, readOnly: view !== 'c2', sim, stride, cloud, trace: traceCtx, netBlocked, netView };
-  }, [issues, layers, nodes, edges, view, simOpen, simMode, simResult, simIdx, simPlaying, strideOverlay, threatModel, cloud, trace, traceStep, netAnalysis, netViewOn]);
+    return { nodeIssues, edgeIssues, dimmed, readOnly: view !== 'c2', sim, stride: attack ? null : stride, cloud, trace: traceCtx, netBlocked, netView, attack };
+  }, [issues, layers, nodes, edges, view, simOpen, simMode, simResult, simIdx, simPlaying, strideOverlay, threatModel, cloud, trace, traceStep, netAnalysis, netViewOn, attackRes, attackSel, attackStep]);
 
   const counts = { error: issues.filter((i) => i.severity === 'error').length, warn: issues.filter((i) => i.severity === 'warn').length, info: issues.filter((i) => i.severity === 'info').length };
 
@@ -377,6 +388,7 @@ export default function App() {
           {modal === 'net' && <NetModal onClose={() => setModal(null)} />}
           <AiWatcher issues={issues} threats={threatModel.threats} />
           {modal === 'compare' && <CompareModal onClose={() => setModal(null)} />}
+          {modal === 'resilience' && <ResilienceModal onClose={() => setModal(null)} />}
           {modal === 'security' && <SecurityModal onClose={() => setModal(null)} threats={threatModel.threats} />}
           <Toasts />
         </div>

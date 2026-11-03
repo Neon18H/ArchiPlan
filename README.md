@@ -34,8 +34,10 @@ Los proyectos se guardan como archivos `*.archi.json` en la carpeta `projects/`.
 | **Plantillas** | Web en 3 capas, API serverless, microservicios en ECS, orientada a eventos, sitio estático y pipeline de datos. |
 | **Decisiones (ADR)** | Registro de decisiones con contexto, decisión y consecuencias. |
 | **Multinube** | Catálogos de AWS y Azure con las mismas reglas, simulación y modelo de amenazas. Convierte un diagrama completo de AWS a Azure (o al revés) con un clic. |
-| **Simulación** | Carga, picos, caída de instancias o AZ, falla de dependencias, DDoS L7 y L3/L4, y ataques web contra el WAF (ver abajo). |
+| **Simulación** | Carga, picos, caída de instancias, AZ o región, dependencias caídas o lentas, corrupción de datos, ransomware, Game Day combinado, DDoS L7 y L3/L4, y ataques web contra el WAF (ver abajo). |
 | **Modelo de amenazas (STRIDE)** | Genera las amenazas por pieza, por flujo que cruza un límite de confianza y de la cuenta. Calcula el riesgo, detecta controles en el diagrama y aplica mitigaciones con un clic; se conecta con la simulación (ver abajo). |
+| **Resiliencia y DR** | A qué recurso falla cada pieza ante la caída de una instancia, una AZ o la región, con RTO/RPO, estrategia de DR y backups (ver abajo). |
+| **Rutas de ataque** | Grafo animado desde Internet hasta los datos más valiosos, mapeado a MITRE ATT&CK, con el control que corta cada ruta (ver abajo). |
 | **Variantes A/B** | Clona el diseño, prueba alternativas y compáralas con las mismas simulaciones: disponibilidad, latencia, costo, amenazas y complejidad, con puntaje y ADR automático (ver abajo). |
 | **Exportar** | PNG, SVG, PDF (A3), documento de arquitectura en HTML (imprimible a PDF) o Markdown, Mermaid, Terraform (AWS y/o Azure) y JSON. |
 
@@ -69,6 +71,11 @@ El botón **▶ Simular** abre un panel debajo del lienzo y corre escenarios sob
 | Falla de una instancia | El failover: el health check del balanceador, el reemplazo por Auto Scaling, la promoción de la réplica o del standby de la BD y la caché fría. |
 | Caída de una AZ | Qué pasa con las piezas sin Multi‑AZ o con una sola instancia, y si la VPC usa una sola AZ. |
 | Falla de una dependencia | El radio de impacto cuando una pieza deja de responder (una API externa, Cognito, la BD…). |
+| Caída de la región | La estrategia de DR: cuándo vuelve cada pieza en la región secundaria, si los datos tienen copia allá, cuánto tarda el DNS (Route 53 con o sin health checks) y cuántos datos se pierden. En activo‑activo, si la región sana aguanta el doble de carga. |
+| Dependencia lenta | Una pieza no se cae, se pone lenta. Muestra el agotamiento de hilos de quien la llama, la tormenta de reintentos y si los timeouts y el circuit breaker contienen la falla. |
+| Corrupción de datos | Un bug o un error humano daña los datos: Multi‑AZ y las réplicas copian el daño. Mide cuánto tiempo se sirvieron datos malos, cuánto tarda la restauración (PITR, versionado) y cuántos datos se pierden. |
+| Ransomware | Un atacante con credenciales cifra los datos y borra los backups a su alcance. Solo sobrevive lo que está en otra cuenta con bloqueo inmutable. |
+| Game Day | Prueba combinada: pico de tráfico, en pleno pico cae una AZ y después una dependencia se pone lenta. Reporta la fase más dura. |
 | DDoS L7 (HTTP flood) | El rate limit del WAF (según las IPs de la botnet), Bot Control, la caché de la CDN, Shield Advanced, el throttling de API Gateway y el costo en Lambda ("denial of wallet"). |
 | DDoS L3/L4 | Si el punto de entrada está protegido por Shield Standard o queda expuesto. |
 | Ataques web | SQLi, XSS, path traversal y bots contra las reglas del WAF (Core Rule Set, reglas de SQLi, Bot Control). |
@@ -78,6 +85,34 @@ Mientras corre, el lienzo muestra el tráfico de cada flecha y la carga y el est
 **Cómo se calcula.** Es un modelo de flujo por pasos de 5 s: el tráfico nace en los actores, se reparte por las flechas según el rol de cada pieza y cada pieza atiende hasta su capacidad (capacidad por instancia × instancias sanas). Lo que excede la capacidad falla, las colas acumulan y se vacían a la velocidad de sus consumidores, y el éxito de un request es el producto del éxito de cada salto síncrono.
 
 Las capacidades son **estimaciones** de orden de magnitud: cuotas por defecto de AWS (API Gateway 10k req/s, concurrencia de Lambda 1.000, Cognito 120 req/s…) y cargas típicas por tamaño de instancia. Sirven para comparar diseños y encontrar puntos únicos de falla, **no reemplazan una prueba de carga real**. Cada pieza permite poner su capacidad medida en *Propiedades → Simulación*. Los supuestos están en `src/sim/profiles.ts` y el modelo en `src/sim/engine.ts`.
+
+## Resiliencia y DR
+
+El botón **⛑ Resiliencia** de la barra muestra, para cada pieza, **a qué recurso falla y en cuánto tiempo**:
+
+| Si… | Qué se revisa |
+|---|---|
+| Falla una instancia o nodo | Health checks del balanceador (intervalo × fallos), reemplazo por Auto Scaling, standby de RDS Multi‑AZ, réplicas de Aurora, réplica de la caché, RDS Proxy. |
+| Cae una AZ | En cuántas AZ corre cada flota, Single‑AZ vs Multi‑AZ, NAT Gateway por AZ, subnets del balanceador. |
+| Cae la región | La estrategia de DR del proyecto (sin DR, backup y restauración, pilot light, warm standby o activo‑activo), la región secundaria, las réplicas entre regiones (Aurora Global Database, Global Tables, réplica cross‑region de RDS, CRR de S3…) y el cambio de DNS. |
+| Se dañan los datos | Backups y retención, PITR, versionado de S3, copias en otra cuenta (ransomware) y si las restauraciones se han probado. |
+
+Arriba están los totales de RTO (cuándo vuelve el servicio) y RPO (cuántos datos se pierden) contra tus objetivos; abajo, la tabla pieza por pieza con arreglos de un clic (⚡). Cada total tiene **▶ Simular**, que corre el escenario correspondiente.
+
+Cada pieza también tiene una sección **Resiliencia y failover** en el panel de propiedades: zonas de disponibilidad, health checks, despliegue de RDS, réplicas, failover automático, backups, réplica en otra región, política de Route 53 y, en el cómputo, las **llamadas a dependencias** (timeout, reintentos y circuit breaker) que usa la simulación de dependencia lenta.
+
+En **Comparar variantes** aparecen el RTO y el RPO de cada variante ante la caída de la región, datos dañados y ransomware. El asistente IA también recibe el plan de resiliencia.
+
+## Rutas de ataque (MITRE ATT&CK)
+
+En **▶ Simular → Ataque** (o desde la pestaña Amenazas) ArchiPlan calcula **cómo llegaría un atacante desde Internet hasta los datos más valiosos**: «así llegaría un atacante a la BD en 4 saltos». La ruta se anima sobre el lienzo, salto a salto.
+
+- **Saltos posibles:** escaneo y explotación de la aplicación expuesta (T1190), relleno de credenciales contra el login (T1110.004), cuentas válidas y abuso de autorización (T1078, BOLA), robo de secretos (T1555.006), abuso del rol IAM de la pieza comprometida, aunque no haya flecha en el diagrama (T1078.004), snapshot de la BD compartido con la cuenta del atacante (T1537), movimiento lateral entre servicios y por colas (T1210, T1565), buckets públicos (T1530) y puertos de administración o bases de datos abiertas a Internet.
+- **Probabilidad:** cada salto empieza con una probabilidad base que baja con los controles presentes: WAF y sus reglas, validación de entradas, parcheo, SCA/SAST, MFA y threat protection en Cognito, autorización por objeto, autenticación entre servicios, permission boundaries, SCP, cifrado con KMS, etc. Cada control lleva su mitigación de MITRE (M10xx).
+- **Valor del objetivo:** según la clasificación de los datos de la pieza (Restringido, Confidencial, Interno, Público).
+- **Cómo cortar la ruta:** el control faltante que más baja la probabilidad, con su arreglo de un clic. Al aplicarlo, las rutas se recalculan.
+
+Es un modelo cualitativo para priorizar defensas, no una prueba de penetración. La lógica está en `src/attack/paths.ts`.
 
 ## Red configurable (Security Groups, puertos, listeners)
 
@@ -206,6 +241,8 @@ src/net/           Red configurable: modelo (SG, puertos, listeners), alcanzabil
 src/scaling/       Escalado configurable (políticas por tipo de pieza)
 src/security/      Seguridad del proyecto (guardrails y prácticas que cumplen controles)
 src/ai/            Asistente IA: contexto del diagrama y cliente
+src/resilience/    Resiliencia: failover por pieza, estrategia de DR, RTO/RPO y backups
+src/attack/        Rutas de ataque mapeadas a MITRE ATT&CK
 src/variants/      Variantes A/B: comparación con las mismas pruebas, puntaje y ADR
 src/cost/          Costo mensual estimado por pieza (precios de lista)
 server/ai.mjs      Proxy local hacia OpenAI, Anthropic, DeepSeek y OpenRouter

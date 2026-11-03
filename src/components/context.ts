@@ -16,6 +16,8 @@ export interface CanvasCtx {
   /** Flechas que la configuración de red bloquea (id → etiqueta corta). */
   netBlocked?: Map<string, string>;
   /** Vista de red: estado y puerto de cada flecha, puerto y grupos de cada pieza. */
+  /** Ruta de ataque animada (modo «Rutas de ataque»). */
+  attack?: { nodes: Map<string, 'start' | 'hop' | 'target' | 'current'>; edges: Map<string, number>; virtual: { id: string; source: string; target: string; step: number; label: string }[]; labels: Map<string, string> } | null;
   netView?: { edges: Map<string, { state: 'ok' | 'bad' | 'warn' | 'na'; text: string; title?: string }>; nodes: Map<string, { port?: number; sgs: { name: string; color: string }[]; relevant: boolean }> } | null;
 }
 

@@ -19,6 +19,7 @@ import { summarizeThreats, type Threat } from '../threats/model';
 import { useThreatsUi } from '../threats/ui';
 import { EdgeNetSection, NetSection, useNetUi } from './NetInspector';
 import { ScalingSection } from './ScalingInspector';
+import { ResilienceSection } from './ResilienceInspector';
 import { openSecurity } from './SecurityPanel';
 import { SCALING_KEYS, scalingKind } from '../scaling/model';
 
@@ -329,6 +330,7 @@ function ServiceInspector({ node, issues }: { node: ServiceNode; issues: Issue[]
       <NodeIssues id={node.id} issues={issues} />
       {netView && <NetSection node={node} />}
       <ScalingSection node={node} />
+      <ResilienceSection node={node} />
       {configProps.length ? (
         <div className="insp-section">
           <div className="insp-section-title">Configuración</div>

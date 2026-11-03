@@ -1,3 +1,4 @@
+import { drOf } from '../resilience/model';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { buildContext, QUICK_ACTIONS, REVIEW_PROMPT, SYSTEM_PROMPT } from '../ai/context';
 import { aiApi, useAi, type ProviderId } from '../ai/store';
@@ -110,7 +111,7 @@ function useAiContext(issues: Issue[], threats: Threat[]) {
   return () => {
     const { variants, activeVariant } = useStore.getState();
     const variant = variants.length ? { names: variants.map((v) => v.name), active: variants.find((v) => v.id === activeVariant)?.name ?? '' } : null;
-    return buildContext({ meta, nodes, edges, securityGroups, security, issues, threats, net, sim, trace, variant });
+    return buildContext({ meta, nodes, edges, securityGroups, security, issues, threats, net, sim, trace, variant, dr: drOf(meta) });
   };
 }
 

@@ -1050,10 +1050,10 @@ resource "aws_db_instance" "${name}" {
   allocated_storage           = ${Number(p.storage) || 50}${n.data.net?.port ? `\n  port                        = ${n.data.net.port}` : ''}${security.dbTls ? `\n  parameter_group_name        = aws_db_parameter_group.${name}_tls.name` : ''}${security.dataAuditLogs ? `\n  enabled_cloudwatch_logs_exports = [${String(p.engine || 'postgres').includes('postgres') ? '"postgresql"' : '"audit", "error"'}]` : ''}
   username                    = "app_admin"
   manage_master_user_password = true # contraseña en Secrets Manager con rotación
-  multi_az                    = ${!!p.multiAZ}
+  multi_az                    = ${p.multiAZ !== false}${p.multiAZ !== false && p.deployment === 'multi-az-cluster' ? ' # Multi-AZ cluster (2 standbys legibles): migrar a aws_rds_cluster con db_cluster_instance_class' : ''}
   storage_encrypted           = ${p.encrypted !== false}
   db_subnet_group_name        = aws_db_subnet_group.${name}.name${sg ? `\n  vpc_security_group_ids      = [${sg}]` : ''}
-  backup_retention_period     = 7
+  backup_retention_period     = ${Math.max(0, Number(p.backupDays ?? 7))}${p.rdsProxy ? '\n  # RDS Proxy: agrega aws_db_proxy + aws_db_proxy_default_target_group apuntando a esta instancia' : ''}${p.crossRegion ? '\n  # DR: crea una réplica en la región secundaria (aws_db_instance con replicate_source_db = this.arn en un provider alias)' : ''}
   deletion_protection         = true
   skip_final_snapshot         = false
   final_snapshot_identifier   = "\${local.name}-${name.replace(/_/g, '-')}-final"
@@ -1077,7 +1077,7 @@ resource "aws_rds_cluster" "${name}" {
   manage_master_user_password = true
   storage_encrypted           = ${p.encrypted !== false}
   db_subnet_group_name        = aws_db_subnet_group.${name}.name${sg ? `\n  vpc_security_group_ids      = [${sg}]` : ''}
-  backup_retention_period     = 7
+  backup_retention_period     = ${Math.max(1, Number(p.backupDays ?? 7))}${p.crossRegion ? '\n  global_cluster_identifier   = null # DR: crea aws_rds_global_cluster y un clúster secundario en la otra región' : ''}
   deletion_protection         = true
   skip_final_snapshot         = false
   final_snapshot_identifier   = "\${local.name}-${name.replace(/_/g, '-')}-final"${asc.serverless ? `
@@ -1366,7 +1366,8 @@ resource "aws_elasticache_replication_group" "${name}" {
   engine                     = ${q(p.engine === 'memcached' ? 'redis' : p.engine || 'valkey')}${p.engine === 'memcached' ? ' # TODO: memcached usa aws_elasticache_cluster' : ''}
   node_type                  = ${q(p.nodeType || 'cache.t4g.small')}${n.data.net?.port ? `\n  port                       = ${n.data.net.port}` : ''}
   num_cache_clusters         = ${1 + (Number(p.replicas) || 0)}
-  automatic_failover_enabled = ${(Number(p.replicas) || 0) > 0}
+  automatic_failover_enabled = ${(Number(p.replicas ?? 1) || 0) > 0 && p.autoFailover !== false}
+  multi_az_enabled           = ${(Number(p.replicas ?? 1) || 0) > 0 && p.autoFailover !== false}
   at_rest_encryption_enabled = true
   transit_encryption_enabled = true
   subnet_group_name          = aws_elasticache_subnet_group.${name}.name${sg ? `\n  security_group_ids         = [${sg}]` : ''}

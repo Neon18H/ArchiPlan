@@ -19,6 +19,7 @@ import { ancestors, byId, isService, placementOf } from '../lib/graph';
 import type { AppEdge, AppNode, Role, ServiceNode } from '../types';
 import { fmtRps, profileFor, type SimProfile } from './profiles';
 import type { Scenario } from './scenarios';
+import { criticalPath, DEFAULT_DR, dataRecovery, dnsCutover, fmtDur, holdsData, nodeRes, regionRecovery, type DnsCutover, type DrConfig, type NodeRes } from '../resilience/model';
 
 export const DT = 5;
 const UNDETECTED = 30; // s que tarda un health check en sacar una instancia caída
@@ -99,6 +100,12 @@ export interface SimSummary {
   peakBacklog: number;
   attack?: { sent: number; blocked: number; absorbed: number; toApp: number; perFlow: { flow: Flow; sent: number; blocked: number; toApp: number; toData: number }[] };
   lambdaCostUsd?: number;
+  /** Escenarios de región y datos: datos perdidos (s de escrituras; Infinity = sin copia; null = no aplica). */
+  dataLossS?: number | null;
+  /** Tiempo que el servicio estuvo por debajo del 99 % desde el evento (s). */
+  downtimeS?: number;
+  /** Segundos sirviendo datos corruptos sin saberlo. */
+  corruptS?: number;
 }
 
 export interface SimResult {
@@ -181,7 +188,12 @@ export function pickDefaultTarget(nodes: AppNode[], edges: AppEdge[], kind: Scen
     }
     return null;
   }
-  if (kind === 'node-outage') {
+  if (kind === 'data-corruption' || kind === 'ransomware') {
+    const data = services.filter((n) => holdsData(nodeRes(n, map).kind));
+    const crit = criticalPath(nodes, edges);
+    return (data.find((n) => crit.has(n.id) && role(n) === 'datastore') ?? data.find((n) => role(n) === 'datastore') ?? data[0])?.id ?? null;
+  }
+  if (kind === 'node-outage' || kind === 'slow-dependency' || kind === 'gameday') {
     return (services.find((n) => role(n) === 'external' && edges.some((e) => e.target === n.id)) ?? services.find((n) => role(n) === 'datastore') ?? services.find((n) => role(n) === 'compute'))?.id ?? null;
   }
   // Punto de entrada: el primer destino del usuario (resolviendo el DNS)
@@ -209,7 +221,11 @@ export function targetCandidates(nodes: AppNode[], kind: Scenario['kind']): Serv
   const services = nodes.filter(isService);
   const role = (n: ServiceNode) => getService(n.data.serviceId).role;
   if (kind === 'instance-failure') return services.filter((n) => getService(n.data.serviceId).vpcBound && !['lb', 'netgw'].includes(role(n)) || profileFor(n).stateful);
-  if (kind === 'node-outage') return services.filter((n) => !['actor'].includes(role(n)) && !profileFor(n).passive);
+  if (kind === 'node-outage' || kind === 'slow-dependency') return services.filter((n) => !['actor'].includes(role(n)) && !profileFor(n).passive);
+  if (kind === 'data-corruption' || kind === 'ransomware') {
+    const map = byId(nodes);
+    return services.filter((n) => holdsData(nodeRes(n, map).kind) || lid(n) === 'memorydb' || lid(n) === 'elasticache');
+  }
   return services.filter((n) => ['cdn', 'lb', 'api', 'compute', 'external'].includes(role(n)) && lid(n) !== 'lambda');
 }
 
@@ -218,6 +234,12 @@ export function targetCandidates(nodes: AppNode[], kind: Scenario['kind']): Serv
 export interface SimOptions {
   /** Flechas que la configuración de red bloquea (id → motivo). Las peticiones por ahí fallan. */
   blocked?: Map<string, string>;
+  /** Estrategia de DR del proyecto (caída de región). */
+  dr?: DrConfig;
+  /** Seguridad del proyecto (backups fuera de la cuenta, timeouts por defecto…). */
+  security?: Record<string, boolean>;
+  /** Región principal (para los textos). */
+  region?: string;
 }
 
 export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts: SimOptions = {}): SimResult {
@@ -235,6 +257,18 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
   const services = nodes.filter(isService);
   const svcIds = new Set(services.map((n) => n.id));
   const prof = new Map<string, SimProfile>(services.map((n) => [n.id, profileFor(n)]));
+  const dr = opts.dr ?? DEFAULT_DR;
+  const security = opts.security ?? {};
+  const res = new Map<string, NodeRes>(services.map((n) => [n.id, nodeRes(n, map, security)]));
+  // La configuración de redundancia manda sobre el perfil (Multi‑AZ cluster, RDS Proxy, failover automático…)
+  for (const n of services) {
+    const r = res.get(n.id)!;
+    const p = prof.get(n.id)!;
+    if (p.stateful && ['relational', 'cache', 'search', 'broker'].includes(r.kind)) {
+      p.failoverTime = r.failoverS;
+      p.multiAz = r.azs >= 2;
+    }
+  }
   const def = (id: string) => getService(lid(map.get(id) as ServiceNode));
   const label = (id: string) => (map.get(id) as ServiceNode)?.data.label ?? id;
   const warnings: string[] = [];
@@ -315,14 +349,18 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
     const s = st.get(id)!;
     return t >= s.downFrom && s.downFrom >= 0 && t < s.downUntil;
   };
+  /** Multiplicadores de capacidad: región secundaria reducida (warm standby), activo‑activo, hilos ocupados por una dependencia lenta. */
+  const capMods = new Map<string, (t: number) => number>();
+  const slowCap = new Map<string, number>();
   const capacity = (id: string, t: number) => {
     const p = prof.get(id)!;
     if (p.passive) return Infinity;
     if (isDown(id, t)) return 0;
     const s = st.get(id)!;
     const healthy = Math.max(0, s.instances - s.lost);
-    if (p.scale === 'instant') return healthy > 0 ? p.perInstance : 0;
-    return p.perInstance * healthy;
+    const f = (capMods.get(id)?.(t) ?? 1) * (slowCap.get(id) ?? 1);
+    if (p.scale === 'instant') return healthy > 0 ? p.perInstance * f : 0;
+    return p.perInstance * healthy * f;
   };
   const cacheHit = (id: string, t: number) => {
     if (isDown(id, t)) return 0;
@@ -332,7 +370,7 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
   };
 
   // ── 4. Objetivo y eventos del escenario
-  const autoTarget = sc.kind === 'load' || sc.kind === 'spike' || sc.kind === 'az-failure' ? null : pickDefaultTarget(nodes, edges, sc.kind);
+  const autoTarget = ['load', 'spike', 'az-failure', 'region-failure', 'gameday'].includes(sc.kind) ? null : pickDefaultTarget(nodes, edges, sc.kind);
   const targetId = sc.targetId && svcIds.has(sc.targetId) ? sc.targetId : autoTarget;
   const t0 = sc.eventAt;
   const t1 = sc.eventAt + sc.eventDuration;
@@ -364,10 +402,12 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
       return;
     }
     s.lost += k;
-    s.undetectedUntil = t + UNDETECTED;
+    const r = res.get(id)!;
+    const detect = r.kind === 'fleet' ? r.detectS : UNDETECTED;
+    s.undetectedUntil = t + detect;
     s.undetectedFrac = k / Math.max(1, healthyBefore);
     events.push({ t, label: `${label(id)}: ${cause} (${s.instances - s.lost}/${s.instances} sanas)`, kind: 'bad', nodeId: id });
-    events.push({ t: t + UNDETECTED, label: `${label(id)}: el health check saca la instancia del balanceo`, kind: 'info', nodeId: id });
+    events.push({ t: t + detect, label: `${label(id)}: el health check saca ${k > 1 ? 'las instancias caídas' : 'la instancia caída'} del balanceo (${detect} s según su configuración)`, kind: 'info', nodeId: id });
     if (Number.isFinite(p.replaceTime)) {
       s.replaceAt = t + p.replaceTime;
       if (s.replaceAt < sc.duration) events.push({ t: s.replaceAt, label: `${label(id)}: instancia de reemplazo en servicio`, kind: 'good', nodeId: id });
@@ -464,15 +504,133 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
         if (p.multiAz) loseInstances(n.id, Math.max(1, Math.floor(N / 2)), t, 'la AZ del primario cayó');
         else down(n.id, t, Infinity, 'estaba en una sola AZ (sin Multi‑AZ / réplica)');
       } else {
-        loseInstances(n.id, N >= 2 ? Math.floor(N / 2) : 1, t, 'pierde las instancias de la AZ caída');
+        const r = res.get(n.id)!;
+        const lose = r.kind === 'fleet' ? (r.azs <= 1 ? N : Math.ceil(N / r.azs)) : N >= 2 ? Math.floor(N / 2) : 1;
+        loseInstances(n.id, lose, t, r.kind === 'fleet' && r.azs <= 1 ? 'todas sus instancias estaban en la AZ caída' : 'pierde las instancias de la AZ caída');
       }
     }
   };
+
+  // ── Caída de la región: cada pieza vuelve en la región secundaria según la estrategia de DR
+  const crit = criticalPath(nodes, edges);
+  let regionLoss = (_t: number) => 0;
+  let dataLossS: number | null | undefined;
+  let dns: DnsCutover | null = null;
+  const regionNoCopy: string[] = [];
+  const regionSlow: { id: string; back: number }[] = [];
+  const quietDown = (id: string, from: number, until: number) => {
+    const s = st.get(id)!;
+    s.downFrom = from;
+    s.downUntil = until;
+  };
+  if (sc.kind === 'region-failure') {
+    dns = dnsCutover(nodes, security);
+    const where = opts.region ? `${opts.region}` : 'principal';
+    events.push({ t: t0, label: `Cae la región ${where} completa: cómputo, bases de datos, colas y servicios regionales`, kind: 'bad' });
+    let loss = 0;
+    let anyData = false;
+    for (const n of services) {
+      const r = res.get(n.id)!;
+      if (['actor', 'global', 'dns'].includes(r.kind)) continue;
+      const rr = regionRecovery(n, r, dr, security);
+      if (holdsData(r.kind) && crit.has(n.id)) {
+        anyData = true;
+        if (!Number.isFinite(rr.rpoS)) regionNoCopy.push(n.id);
+        else loss = Math.max(loss, rr.rpoS);
+      }
+      if (dr.strategy === 'active') {
+        // La otra región ya atendía la mitad del tráfico: ahora lo atiende todo
+        capMods.set(n.id, (t) => (t < t0 ? 2 : 1));
+        if (rr.rtoS > 0) {
+          quietDown(n.id, t0, t0 + rr.rtoS);
+          if (crit.has(n.id)) regionSlow.push({ id: n.id, back: rr.rtoS });
+        }
+        continue;
+      }
+      const back = Number.isFinite(rr.rtoS) ? Math.max(rr.rtoS, dns.seconds) : Infinity;
+      quietDown(n.id, t0, t0 + back);
+      if (crit.has(n.id)) regionSlow.push({ id: n.id, back });
+      if (Number.isFinite(back) && t0 + back < sc.duration && crit.has(n.id))
+        events.push({ t: t0 + back, label: `${label(n.id)}: atiende desde ${dr.secondaryRegion}${rr.capacity0 < 1 ? ` con ~${Math.round(rr.capacity0 * 100)} % de capacidad (escala en ~${fmtDur(rr.rampS)})` : ''}`, kind: 'good', nodeId: n.id });
+      if (rr.capacity0 < 1 && Number.isFinite(back)) {
+        const from = t0 + back;
+        capMods.set(n.id, (t) => (t < from ? 1 : Math.min(1, rr.capacity0 + ((1 - rr.capacity0) * (t - from)) / Math.max(1, rr.rampS))));
+      }
+    }
+    if (dr.strategy === 'active') regionLoss = (t) => (t >= t0 && t < t0 + dns!.seconds ? 0.5 : 0);
+    if (dr.strategy !== 'none' && t0 + dns.seconds < sc.duration)
+      events.push({ t: t0 + dns.seconds, label: dns.automatic ? `Route 53: los health checks fallan y el DNS manda el tráfico a ${dr.secondaryRegion}` : `El equipo cambia el DNS a mano hacia ${dr.secondaryRegion}`, kind: dns.automatic ? 'good' : 'info', nodeId: dns.dnsId ?? undefined });
+    if (dr.strategy === 'none') events.push({ t: t0, label: 'No hay región secundaria: el servicio espera a que el proveedor recupere la región', kind: 'bad' });
+    dataLossS = dr.strategy === 'none' || !anyData ? null : regionNoCopy.length ? Infinity : loss;
+  }
+
+  // ── Dependencia lenta (también en el Game Day)
+  const slowTarget = sc.kind === 'slow-dependency' ? targetId : sc.kind === 'gameday' ? pickDefaultTarget(nodes, edges, 'gameday') : null;
+  const slowFrom = sc.kind === 'gameday' ? t0 + 240 : t0;
+  const slowTo = sc.kind === 'gameday' ? t0 + 420 : t1;
+  const slowOn = (t: number) => !!slowTarget && t >= slowFrom && t < slowTo;
+  const slowEdge = new Map<string, { mult: number; ok: boolean; add: number }>();
+  const slowCallers = slowTarget ? tedges.filter((e) => e.t === slowTarget && e.kind === 'sync') : [];
+  const baseLat = (id: string) => {
+    let l = prof.get(id)!.latency;
+    for (const e of outE.get(id) ?? []) if (e.kind === 'sync') l += Math.min(1, e.w) * (prof.get(e.t)?.latency ?? 0);
+    return Math.max(5, l);
+  };
+  const slowStats = new Map<string, { minCap: number; attempts: number; breaker: boolean; timesOut: boolean; timeout: number; retries: number }>();
+  if (slowTarget) {
+    const extra = sc.extraLatency;
+    if (slowFrom < sc.duration) events.push({ t: slowFrom, label: `${label(slowTarget)} responde ${extra >= 1000 ? `${(extra / 1000).toFixed(1)} s` : `${extra} ms`} más lento (no se cae: se pone lenta)`, kind: 'bad', nodeId: slowTarget });
+    for (const e of slowCallers) {
+      const cfg = res.get(e.s)!.caller;
+      const timesOut = extra > cfg.timeoutMs;
+      const attempts = timesOut ? 1 + cfg.retries : 1;
+      const held = Math.min(extra, cfg.timeoutMs) * attempts;
+      const L0 = baseLat(e.s);
+      const factor = L0 / (L0 + Math.min(1, e.w) * held);
+      slowStats.set(e.s, { minCap: factor, attempts, breaker: cfg.breaker, timesOut, timeout: cfg.timeoutMs, retries: cfg.retries });
+      const who = label(e.s);
+      if (timesOut)
+        events.push({ t: slowFrom, label: `${who}: cada llamada espera su timeout (${cfg.timeoutMs} ms)${cfg.retries ? ` y reintenta ${cfg.retries} vez/veces → ×${attempts} llamadas a ${label(slowTarget)}` : ''}; con los hilos ocupados su capacidad cae al ${Math.round(factor * 100)} %`, kind: 'bad', nodeId: e.s });
+      else events.push({ t: slowFrom, label: `${who}: su timeout (${cfg.timeoutMs} ms) es mayor que la demora, así que espera; con los hilos ocupados su capacidad cae al ${Math.round(factor * 100)} %`, kind: 'bad', nodeId: e.s });
+      if (cfg.breaker && slowFrom + 10 < sc.duration) events.push({ t: slowFrom + 10, label: `${who}: el circuit breaker se abre — falla rápido en lo que necesita a ${label(slowTarget)} y recupera su capacidad`, kind: 'good', nodeId: e.s });
+    }
+    if (slowTo < sc.duration) events.push({ t: slowTo, label: `${label(slowTarget)} vuelve a su latencia normal`, kind: 'good', nodeId: slowTarget });
+  }
+
+  // ── Corrupción de datos y ransomware
+  let corruptUntil = -1;
+  let dataRestore: { rtoS: number; rpoS: number; text: string } | null = null;
+  if ((sc.kind === 'data-corruption' || sc.kind === 'ransomware') && targetId) {
+    const n = map.get(targetId) as ServiceNode;
+    const r = res.get(targetId)!;
+    const rec = dataRecovery(n, r, { ransomware: sc.kind === 'ransomware', security });
+    dataRestore = rec;
+    const detect = sc.kind === 'ransomware' ? 0 : Math.max(0, sc.detectMin * 60);
+    corruptUntil = t0 + detect;
+    if (sc.kind === 'ransomware') events.push({ t: t0, label: `${label(targetId)}: un atacante con credenciales cifra los datos y borra snapshots y backups a su alcance`, kind: 'bad', nodeId: targetId });
+    else {
+      events.push({ t: t0, label: `${label(targetId)}: un despliegue con un bug (o un UPDATE sin WHERE) daña los datos. Multi‑AZ y las réplicas copian el daño al instante`, kind: 'bad', nodeId: targetId });
+      if (detect > 0 && corruptUntil < sc.duration) events.push({ t: corruptUntil, label: `Alguien nota el problema (${sc.detectMin} min después). Se pone ${label(targetId)} en mantenimiento para restaurar`, kind: 'info', nodeId: targetId });
+    }
+    const until = corruptUntil + rec.rtoS;
+    if (r.kind === 'cache' && rec.rtoS === 0) {
+      const s0 = st.get(targetId)!;
+      s0.coldFrom = corruptUntil;
+      s0.coldUntil = corruptUntil + 120;
+      events.push({ t: corruptUntil, label: `${label(targetId)}: se vacía la caché y se vuelve a llenar desde la base de datos`, kind: 'good', nodeId: targetId });
+    } else {
+      quietDown(targetId, corruptUntil, until);
+      if (Number.isFinite(until) && until < sc.duration) events.push({ t: until, label: `${label(targetId)}: restaurado y de vuelta en servicio`, kind: 'good', nodeId: targetId });
+      else if (!Number.isFinite(rec.rtoS)) events.push({ t: corruptUntil, label: `${label(targetId)}: no hay copia de la que restaurar`, kind: 'bad', nodeId: targetId });
+    }
+    dataLossS = rec.rpoS;
+  }
 
   const legitAt = (t: number) => {
     switch (sc.kind) {
       case 'load':
         return sc.baseRps + (sc.peakRps - sc.baseRps) * Math.min(1, t / Math.max(1, sc.duration * 0.85));
+      case 'gameday':
       case 'spike': {
         if (t < t0 || t >= t1) return sc.baseRps;
         const ramp = Math.min(1, (t - t0) / 10);
@@ -514,6 +672,25 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
     if (sc.kind === 'az-failure' && t === Math.round(t0 / DT) * DT) {
       events.push({ t, label: 'Cae una zona de disponibilidad completa', kind: 'bad' });
       azFailure(t);
+    }
+    if (sc.kind === 'gameday' && t === Math.round((t0 + 90) / DT) * DT) {
+      events.push({ t, label: 'Game Day: en pleno pico cae una zona de disponibilidad', kind: 'bad' });
+      azFailure(t);
+    }
+    // Dependencia lenta: capacidad de quien llama y carga extra por reintentos
+    slowCap.clear();
+    slowEdge.clear();
+    if (slowOn(t)) {
+      for (const e of slowCallers) {
+        const cfg = res.get(e.s)!.caller;
+        const timesOut = sc.extraLatency > cfg.timeoutMs;
+        const open = cfg.breaker && t >= slowFrom + 10;
+        const attempts = timesOut && !open ? 1 + cfg.retries : 1;
+        const held = open ? 0 : Math.min(sc.extraLatency, cfg.timeoutMs) * attempts;
+        const L0 = baseLat(e.s);
+        slowCap.set(e.s, Math.min(slowCap.get(e.s) ?? 1, L0 / (L0 + Math.min(1, e.w) * held)));
+        slowEdge.set(e.id, { mult: open ? 0.05 : attempts, ok: !timesOut && !open, add: open ? 0 : Math.min(sc.extraLatency, cfg.timeoutMs) * attempts });
+      }
     }
     for (const n of services) {
       const s = st.get(n.id)!;
@@ -633,6 +810,8 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
           const tRole = def(e.t).role;
           if (cacheEdge && (tRole === 'datastore' || tRole === 'search')) w *= 1 - hit;
           if (e.kind === 'cache' && isDown(e.t, t)) w = 0;
+          const se = slowEdge.get(e.id);
+          if (se) w *= se.mult;
           const add = offered.get(e.t)!;
           let r = 0;
           let a = 0;
@@ -717,6 +896,7 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
       const qf = rho >= 1 ? 10 : 1 / (1 - Math.min(rho, 0.9));
       let ok = 1;
       let l = p.latency * qf;
+      if (slowOn(t) && id === slowTarget) l += sc.extraLatency;
       if (d.role === 'queue') {
         ok = 1;
       } else if (ROUTERS.includes(d.role)) {
@@ -739,7 +919,11 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
           const tRole = def(e.t).role;
           let w = e.w;
           if (cacheEdge && (tRole === 'datastore' || tRole === 'search')) w *= 1 - hit;
-          if (e.kind === 'sync') {
+          const se = slowEdge.get(e.id);
+          if (e.kind === 'sync' && se) {
+            ok *= depOk(w, se.ok ? via(id, e.t, succ.get(e.t) ?? 1) : 0);
+            l += Math.min(w, 1) * (se.ok ? lat.get(e.t) ?? 0 : se.add);
+          } else if (e.kind === 'sync') {
             ok *= depOk(w, via(id, e.t, succ.get(e.t) ?? 1));
             l += Math.min(w, 1) * (lat.get(e.t) ?? 0);
           } else if (e.kind === 'async') {
@@ -769,6 +953,8 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
       }
       for (const id of loginEdges.get(src) ?? []) legitOk += share * LOGIN_RATIO * (blockedPair.has(`${src}>${id}`) ? 0 : succ.get(id) ?? 0);
     }
+    legitOk *= 1 - regionLoss(t);
+    if (corruptUntil > 0 && targetId && t >= t0 && t < corruptUntil && nodesF[targetId]) nodesF[targetId] = { ...nodesF[targetId], status: 'degraded' };
     const attackSent = (sc.kind === 'ddos-l7' || sc.kind === 'web-attacks') && targetId && inWindow(t) ? (sc.kind === 'ddos-l7' ? sc.attackRps : sc.sqliRps + sc.xssRps + sc.lfiRps + sc.botsRps) : 0;
     const blockedNow = sum(blockedAt);
     attackTotals.blocked += blockedNow * DT;
@@ -820,9 +1006,12 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
     peakBacklog,
     ...(sc.kind === 'ddos-l7' || sc.kind === 'web-attacks' ? { attack: { ...attackTotals, perFlow: perFlow.slice(1).filter((f) => f.sent > 0) } } : {}),
     ...(lambdaCost > 0 ? { lambdaCostUsd: lambdaCost } : {}),
+    ...(dataLossS !== undefined ? { dataLossS } : {}),
+    ...(['region-failure', 'data-corruption', 'ransomware', 'gameday', 'slow-dependency'].includes(sc.kind) ? { downtimeS: frames.filter((f) => f.t >= t0 && f.success < 0.99).length * DT } : {}),
+    ...(corruptUntil > 0 ? { corruptS: Math.max(0, Math.min(corruptUntil, sc.duration) - t0) } : {}),
   };
 
-  const findings = buildFindings({ sc, summary, frames, peakUtil, prof, map, targetId, waf, shieldAdv, perFlow, l34Mitigated, peakLambdaConc, lambdaToRdsMaxConn, services, outE, edges, warnings });
+  const findings = buildFindings({ sc, summary, frames, peakUtil, prof, map, targetId, waf, shieldAdv, perFlow, l34Mitigated, peakLambdaConc, lambdaToRdsMaxConn, services, outE, edges, warnings, dr, dns, regionNoCopy, regionSlow, slowTarget, slowStats, slowFrom, slowTo, dataRestore, res, crit });
   if (opts.blocked?.size) {
     const list = [...opts.blocked].map(([eid, why]) => {
       const e = edges.find((x) => x.id === eid);
@@ -909,6 +1098,17 @@ interface FindingCtx {
   outE: Map<string, TEdge[]>;
   edges: AppEdge[];
   warnings: string[];
+  dr: DrConfig;
+  dns: DnsCutover | null;
+  regionNoCopy: string[];
+  regionSlow: { id: string; back: number }[];
+  slowTarget: string | null;
+  slowStats: Map<string, { minCap: number; attempts: number; breaker: boolean; timesOut: boolean; timeout: number; retries: number }>;
+  slowFrom: number;
+  slowTo: number;
+  dataRestore: { rtoS: number; rpoS: number; text: string } | null;
+  res: Map<string, NodeRes>;
+  crit: Set<string>;
 }
 
 function buildFindings(c: FindingCtx): Finding[] {
@@ -926,7 +1126,8 @@ function buildFindings(c: FindingCtx): Finding[] {
   else if (s.minSuccess < 0.99 && s.recoverySeconds === null && sc.kind !== 'load') out.push({ severity: 'error', title: 'No se recupera durante la simulación', detail: 'La arquitectura no volvió a estar sana antes del final del escenario.', nodeIds: [] });
 
   // Cuellos de botella
-  const hot = [...c.peakUtil.entries()].filter(([id, u]) => u > 1 && !c.prof.get(id)!.passive).sort((a, b) => b[1] - a[1]).slice(0, 4);
+  // (los que se saturan por hilos esperando a una dependencia lenta tienen su propio hallazgo)
+  const hot = [...c.peakUtil.entries()].filter(([id, u]) => u > 1 && !c.prof.get(id)!.passive && !c.slowStats.has(id)).sort((a, b) => b[1] - a[1]).slice(0, 4);
   for (const [id, u] of hot) {
     const n = c.map.get(id) as ServiceNode;
     const p = c.prof.get(id)!;
@@ -953,7 +1154,7 @@ function buildFindings(c: FindingCtx): Finding[] {
     const wasDown = frames.some((f) => f.nodes[n.id]?.status === 'down');
     if (!wasDown) continue;
     const endsDown = last.nodes[n.id]?.status === 'down';
-    if (endsDown && sc.kind !== 'node-outage' && sc.kind !== 'ddos-l34') out.push({ severity: 'error', title: `${label(n.id)} es un punto único de falla`, detail: 'Cayó y no se recuperó: no tiene réplica, Multi‑AZ ni Auto Scaling que la reemplace.', nodeIds: [n.id] });
+    if (endsDown && !['node-outage', 'ddos-l34', 'region-failure', 'data-corruption', 'ransomware'].includes(sc.kind)) out.push({ severity: 'error', title: `${label(n.id)} es un punto único de falla`, detail: 'Cayó y no se recuperó: no tiene réplica, Multi‑AZ ni Auto Scaling que la reemplace.', nodeIds: [n.id] });
   }
 
   // Colas
@@ -996,6 +1197,85 @@ function buildFindings(c: FindingCtx): Finding[] {
       return z && Number(z.data.props.azs) < 2;
     });
     if (vpcSingle) out.push({ severity: 'error', title: 'La VPC usa una sola zona de disponibilidad', detail: 'Al caer esa AZ cae todo lo que está dentro de la VPC. Configura al menos 2 AZ.', nodeIds: [] });
+  }
+
+  // Caída de región
+  if (sc.kind === 'region-failure') {
+    const dr = c.dr;
+    const dns = c.dns;
+    const dt = s.downtimeS ?? 0;
+    const end = frames[frames.length - 1];
+    const recovered = end.success >= 0.99;
+    if (dr.strategy === 'none') {
+      out.push({ severity: 'error', title: 'Sin plan de recuperación ante desastres', detail: 'Todo vive en una sola región: el servicio queda caído hasta que el proveedor la recupere (las caídas regionales reales han durado de horas a un día). Elige una estrategia en «Resiliencia y DR».', nodeIds: [] });
+    } else {
+      const slowest = [...c.regionSlow].sort((a, b) => b.back - a.back)[0];
+      out.push({
+        severity: recovered && dt <= dr.rtoMin * 60 ? 'ok' : recovered ? 'warn' : 'error',
+        title: recovered ? `El servicio volvió en ${fmtDur(dt)} (objetivo ${dr.rtoMin} min)` : 'El servicio no vuelve durante la simulación',
+        detail: recovered
+          ? `Con «${dr.strategy}» el tráfico pasó a ${dr.secondaryRegion}.${slowest ? ` Lo que más tardó: ${label(slowest.id)} (${fmtDur(slowest.back)}).` : ''}`
+          : `${c.regionNoCopy.length ? `${c.regionNoCopy.map(label).join(', ')} no tiene${c.regionNoCopy.length > 1 ? 'n' : ''} copia en ${dr.secondaryRegion}: sin datos, la región secundaria no puede atender.` : 'Alguna pieza crítica no tiene cómo volver en la región secundaria.'}`,
+        nodeIds: c.regionNoCopy.length ? c.regionNoCopy : slowest ? [slowest.id] : [],
+      });
+      if (dns && !dns.automatic) out.push({ severity: 'warn', title: `El cambio de región depende de una persona (~${fmtDur(dns.seconds)})`, detail: dns.text + ' Configura Route 53 con política de failover (o latencia) y health checks para que sea automático.', nodeIds: dns.dnsId ? [dns.dnsId] : [] });
+      else if (dns) out.push({ severity: 'ok', title: `DNS automático: ${fmtDur(dns.seconds)} para cambiar de región`, detail: dns.text, nodeIds: dns.dnsId ? [dns.dnsId] : [] });
+      if (s.dataLossS !== undefined && s.dataLossS !== null) {
+        if (!Number.isFinite(s.dataLossS)) out.push({ severity: 'error', title: 'Datos sin copia en otra región', detail: `${c.regionNoCopy.map(label).join(', ')}: si la región no vuelve, esos datos se pierden.`, nodeIds: c.regionNoCopy });
+        else out.push({ severity: s.dataLossS <= dr.rpoMin * 60 ? 'ok' : 'warn', title: `Pérdida de datos estimada: ${fmtDur(s.dataLossS)} (objetivo ${dr.rpoMin} min)`, detail: s.dataLossS <= 1 ? 'La replicación entre regiones es casi síncrona.' : 'Es el retraso de la replicación (o de la última copia de backup) hacia la región secundaria.', nodeIds: [] });
+      }
+      if (dr.strategy === 'active') out.push({ severity: 'info', title: 'Activo‑activo: la otra región absorbe todo el tráfico', detail: 'Mientras el DNS detecta la caída, la mitad de las peticiones van a la región caída. Después, la región sana recibe el doble de carga: revisa que su autoescalado alcance.', nodeIds: [] });
+    }
+  }
+
+  // Dependencia lenta
+  if ((sc.kind === 'slow-dependency' || sc.kind === 'gameday') && c.slowTarget) {
+    const window = frames.filter((f) => f.t >= c.slowFrom && f.t < c.slowTo);
+    const minS = window.length ? Math.min(...window.map((f) => f.success)) : 1;
+    if (!c.slowStats.size) out.push({ severity: 'ok', title: `Nadie espera a ${label(c.slowTarget)} en la ruta síncrona`, detail: 'La lentitud no se propaga: la pieza está detrás de una cola o fuera del camino de las peticiones.', nodeIds: [c.slowTarget] });
+    for (const [id, st] of c.slowStats) {
+      const who = label(id);
+      if (st.breaker) out.push({ severity: 'ok', title: `${who}: el circuit breaker contuvo la falla`, detail: `A los ~10 s dejó de esperar a ${label(c.slowTarget)} y falla rápido solo en lo que la necesita; el resto de la aplicación sigue atendiendo.`, nodeIds: [id] });
+      else if (st.minCap < 0.5)
+        out.push({
+          severity: 'error',
+          title: `Falla en cascada: ${who} se quedó sin hilos (capacidad al ${Math.round(st.minCap * 100)} %)`,
+          detail: `Cada petición espera ${st.timesOut ? `su timeout de ${st.timeout} ms${st.retries ? ` × ${st.attempts} intentos` : ''}` : `los ${sc.extraLatency} ms extra`}. Pon un timeout corto (≈ p99 de la dependencia), reintentos con backoff y jitter, y un circuit breaker (Resiliencia → Llamadas a dependencias).`,
+          nodeIds: [id, c.slowTarget],
+        });
+      if (st.timesOut && st.attempts > 1 && !st.breaker) out.push({ severity: 'warn', title: `Tormenta de reintentos: ×${st.attempts} llamadas a ${label(c.slowTarget)}`, detail: `${who} reintenta ${st.retries} vez/veces cada llamada que vence. Justo cuando la dependencia está mal, recibe ${st.attempts} veces más carga. Limita los reintentos y usa backoff exponencial con un presupuesto de reintentos.`, nodeIds: [c.slowTarget] });
+    }
+    if (sc.kind === 'slow-dependency') out.push({ severity: minS >= 0.99 ? 'ok' : minS >= 0.8 ? 'warn' : 'error', title: `Durante la lentitud se atendió como mínimo el ${(minS * 100).toFixed(1)} % de los usuarios`, detail: minS >= 0.99 ? 'La aplicación absorbió la lentitud.' : 'Lo que no se atendió fueron peticiones que esperaron de más o que necesitaban a la dependencia.', nodeIds: [] });
+  }
+
+  // Corrupción / ransomware
+  if ((sc.kind === 'data-corruption' || sc.kind === 'ransomware') && c.targetId && c.dataRestore) {
+    const r = c.dataRestore;
+    const id = c.targetId;
+    if (sc.kind === 'data-corruption') {
+      const rr = c.res.get(id)!;
+      if (rr.azs >= 2 || rr.readReplicas > 0 || rr.crossRegion) out.push({ severity: 'info', title: 'Multi‑AZ y las réplicas no protegen de esto', detail: `${label(id)} tiene redundancia, pero copia el daño al instante. Contra errores humanos y bugs solo sirven los backups, PITR y el versionado.`, nodeIds: [id] });
+      if ((s.corruptS ?? 0) > 0) out.push({ severity: 'warn', title: `Durante ${fmtDur(s.corruptS ?? 0)} se sirvieron datos dañados sin saberlo`, detail: 'Hasta que alguien lo notó. Alarmas sobre métricas de negocio (pedidos, pagos, errores 5xx) y validaciones de integridad acortan este tiempo.', nodeIds: [id] });
+    }
+    if (!Number.isFinite(r.rtoS)) out.push({ severity: 'error', title: sc.kind === 'ransomware' ? 'Los datos se pierden: no hay copia fuera del alcance del atacante' : `${label(id)}: los datos no se pueden recuperar`, detail: r.text, nodeIds: [id] });
+    else out.push({ severity: r.rtoS <= c.dr.rtoMin * 60 ? 'ok' : 'warn', title: `Restauración en ${fmtDur(r.rtoS)}; se pierden ${fmtDur(r.rpoS)} de datos`, detail: `${r.text}${sc.kind === 'data-corruption' ? ' Lo escrito entre el daño y la restauración hay que reconciliarlo a mano.' : ''}`, nodeIds: [id] });
+  }
+
+  // Game Day
+  if (sc.kind === 'gameday') {
+    const phase = (a: number, b: number) => {
+      const fs = frames.filter((f) => f.t >= a && f.t < b);
+      return fs.length ? Math.min(...fs.map((f) => f.success)) : 1;
+    };
+    const t0 = sc.eventAt;
+    const ph = [
+      { name: 'Pico de tráfico', v: phase(t0, t0 + 90) },
+      { name: 'Pico + caída de AZ', v: phase(t0 + 90, t0 + 240) },
+      { name: `Pico + AZ + ${c.slowTarget ? label(c.slowTarget) : 'dependencia'} lenta`, v: phase(t0 + 240, t0 + 420) },
+      { name: 'Recuperación', v: phase(t0 + 420, sc.duration + 1) },
+    ];
+    const worst = ph.reduce((a, b) => (b.v < a.v ? b : a));
+    out.push({ severity: worst.v >= 0.99 ? 'ok' : worst.v >= 0.9 ? 'warn' : 'error', title: worst.v >= 0.99 ? 'Pasó el Game Day' : `La fase más dura: ${worst.name} (${(worst.v * 100).toFixed(1)} % mínimo)`, detail: ph.map((x) => `${x.name}: ${(x.v * 100).toFixed(1)} %`).join(' · '), nodeIds: [] });
   }
 
   // Seguridad: DDoS
