@@ -37,17 +37,18 @@ function simExtra(f: NodeFrame): { text: string; tone?: 'good' | 'bad' } | null 
 
 export const ServiceNodeView = memo(function ServiceNodeView({ id, data, selected }: NodeProps<ServiceNode>) {
   const def = getService(data.serviceId);
-  const { nodeIssues, dimmed, readOnly, sim, stride, trace, netView } = useCanvasCtx();
+  const { nodeIssues, dimmed, readOnly, sim, stride, trace, netView, attack } = useCanvasCtx();
   const simF = sim?.nodes[id];
+  const atk = attack ? attack.nodes.get(id) ?? 'off' : null;
   const thr = stride?.nodes.get(id);
-  const issue = sim || stride || trace || netView ? undefined : nodeIssues.get(id);
+  const issue = sim || stride || trace || netView || attack ? undefined : nodeIssues.get(id);
   const nv = netView?.nodes.get(id);
   const tr = trace ? trace.nodes.get(id) ?? 'none' : null;
   const color = CATEGORIES[def.category].color;
   const isActor = def.role === 'actor' || def.role === 'external';
   return (
     <div
-      className={`svc ${selected ? 'is-selected' : ''} ${issue ? `has-${issue}` : ''} ${dimmed.has(id) ? 'is-dimmed' : ''} ${isActor ? 'is-actor' : ''} ${simF ? `sim-${simF.status}` : ''} ${tr ? `tr-${tr}` : ''} ${netView && !nv?.relevant ? 'nv-off' : ''} ${trace?.current === id ? 'tr-current' : ''}`}
+      className={`svc ${selected ? 'is-selected' : ''} ${issue ? `has-${issue}` : ''} ${dimmed.has(id) ? 'is-dimmed' : ''} ${isActor ? 'is-actor' : ''} ${simF ? `sim-${simF.status}` : ''} ${tr ? `tr-${tr}` : ''} ${netView && !nv?.relevant ? 'nv-off' : ''} ${trace?.current === id ? 'tr-current' : ''} ${atk ? `atk-${atk}` : ''}`}
       style={{ ['--cat' as string]: color }}
       title={`${def.name}\n${def.description}`}
     >

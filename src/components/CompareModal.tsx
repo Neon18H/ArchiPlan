@@ -4,7 +4,9 @@ import { useStore } from '../store';
 import { buildAdr, compareVariants, diffVariants, PILLARS, rescore, WEIGHT_PRESETS, type Comparison, type Pillar, type VariantMetrics, type Weights } from '../variants/compare';
 import type { Variant } from '../types';
 import { Modal } from './Modals';
+import { drOf, fmtDur } from '../resilience/model';
 
+const rto = (x: { rtoS: number; rpoS: number }) => (Number.isFinite(x.rtoS) ? `${x.rtoS > 0 ? fmtDur(x.rtoS) : 'sin corte'} / ${Number.isFinite(x.rpoS) ? (x.rpoS > 0 ? fmtDur(x.rpoS) : '0') : 'sin copia'}` : 'no vuelve');
 const money = (n: number) => `US$${Math.round(n).toLocaleString('es-CO')}`;
 const pct = (n: number) => `${(n * 100).toFixed(2)} %`;
 
@@ -71,6 +73,7 @@ function parseAdr(text: string) {
 
 export function CompareModal({ onClose }: { onClose: () => void }) {
   const security = useStore((s) => s.security);
+  const meta = useStore((s) => s.meta);
   const activeVariant = useStore((s) => s.activeVariant);
   const storeAi = useAi((s) => s.config?.configured);
   const [fetchedAi, setFetchedAi] = useState<boolean | undefined>(undefined);
@@ -102,7 +105,7 @@ export function CompareModal({ onClose }: { onClose: () => void }) {
     setVariants(vs);
     const t = setTimeout(() => {
       try {
-        setResult(compareVariants(vs, { security, avgRps, weights }));
+        setResult(compareVariants(vs, { security, avgRps, weights, dr: drOf(useStore.getState().meta) }));
         setError('');
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
@@ -112,7 +115,7 @@ export function CompareModal({ onClose }: { onClose: () => void }) {
     return () => clearTimeout(t);
     // los pesos se recalculan aparte (no hace falta volver a simular)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [security, avgRps]);
+  }, [security, avgRps, meta.dr]);
 
   // Cambiar los pesos solo recalcula el puntaje
   const comparison = useMemo(() => (result ? rescore(result, weights) : null), [result, weights]);
@@ -190,6 +193,11 @@ export function CompareModal({ onClose }: { onClose: () => void }) {
       })),
       { label: 'Ponderada (40/40/20)', value: (m) => m.availFailures, better: 'high', tol: 0.00005, cells: (m) => <b>{pct(m.availFailures)}</b> },
       { label: 'Bajo DDoS', value: (m) => m.attack.ddosAvail, better: 'high', tol: 0.00005, cells: (m) => pct(m.attack.ddosAvail) },
+    ] as Row[],
+    recovery: [
+      { label: 'Cae la región (RTO / RPO)', value: (m) => m.recovery.region.rtoS, better: 'low', cells: (m) => rto(m.recovery.region) },
+      { label: 'Datos dañados (RTO / RPO)', value: (m) => m.recovery.data.rtoS, better: 'low', cells: (m) => rto(m.recovery.data) },
+      { label: 'Ransomware (RTO / RPO)', value: (m) => m.recovery.ransomware.rtoS, better: 'low', cells: (m) => rto(m.recovery.ransomware) },
     ] as Row[],
     perf: [
       { label: 'p95 con carga normal', value: (m) => m.p95Load, better: 'low', tol: 5, cells: (m) => `${Math.round(m.p95Load)} ms` },
@@ -319,6 +327,7 @@ export function CompareModal({ onClose }: { onClose: () => void }) {
               <tbody>
                 <Section title="Resultado" rows={rows.total} metrics={metrics} />
                 <Section title="Disponibilidad" rows={rows.avail} metrics={metrics} />
+                <Section title="Recuperación (plan de resiliencia)" rows={rows.recovery} metrics={metrics} />
                 <Section title="Latencia" rows={rows.perf} metrics={metrics} />
                 <Section title="Amenazas y ataques" rows={rows.sec} metrics={metrics} />
                 <Section title="Costo estimado" rows={rows.cost} metrics={metrics} />

@@ -13,11 +13,14 @@ export function ModeSwitch() {
   const setMode = useSim((s) => s.setMode);
   return (
     <div className="seg light sim-mode" role="tablist" aria-label="Tipo de simulación">
-      <button role="tab" aria-selected={mode === 'load'} className={mode === 'load' ? 'on' : ''} onClick={() => setMode('load')} title="Carga, fallas y ataques en el tiempo">
+      <button role="tab" aria-selected={mode === 'load'} className={mode === 'load' ? 'on' : ''} onClick={() => setMode('load')} title="Carga, fallas y ataques en el tiempo" aria-label="Escenarios">
         Escenarios
       </button>
-      <button role="tab" aria-selected={mode === 'request'} className={mode === 'request' ? 'on' : ''} onClick={() => setMode('request')} title="Sigue una petición de usuario salto a salto">
-        Petición de usuario
+      <button role="tab" aria-selected={mode === 'request'} className={mode === 'request' ? 'on' : ''} onClick={() => setMode('request')} title="Sigue una petición de usuario salto a salto" aria-label="Petición de usuario">
+        Petición
+      </button>
+      <button role="tab" aria-selected={mode === 'attack'} className={mode === 'attack' ? 'on' : ''} onClick={() => setMode('attack')} title="Cómo llegaría un atacante desde Internet a tus datos, mapeado a MITRE ATT&CK" aria-label="Rutas de ataque">
+        Ataque
       </button>
     </div>
   );

@@ -220,6 +220,19 @@ export function ThreatsPanel({ threats }: { threats: Threat[] }) {
       <button className="btn small sec-open" onClick={openSecurity}>
         ⚙ Seguridad del proyecto · {SECURITY_SETTINGS.filter((x) => security[x.key]).length}/{SECURITY_SETTINGS.length} activos
       </button>
+      <button
+        className="btn small atk-open"
+        onClick={() => {
+          useStore.getState().setView('c2');
+          useNetUi.getState().setView(false);
+          const sim = useSim.getState();
+          sim.setOpen(true);
+          sim.setMode('attack');
+        }}
+        title="Cómo llegaría un atacante desde Internet hasta tus datos (MITRE ATT&CK)"
+      >
+        ☠ Ver rutas de ataque
+      </button>
       <div className="stride-filter">
         {sum.byStride.map(({ k, open: o }) => (
           <button key={k} className={strideF.includes(k) ? 'on' : ''} style={strideF.includes(k) ? { background: STRIDE[k].color, borderColor: STRIDE[k].color } : undefined} onClick={() => setStrideF(strideF.includes(k) ? strideF.filter((x) => x !== k) : [...strideF, k])} title={`${STRIDE[k].es}: ${STRIDE[k].property}`}>

@@ -1,3 +1,4 @@
+import { buildPlan, DEFAULT_DR, type DrConfig } from '../resilience/model';
 /**
  * Compara variantes del diseño corriendo las mismas pruebas a cada una: simulaciones de
  * carga y fallas, peticiones de usuario, modelo de amenazas, análisis de red, validación,
@@ -56,6 +57,8 @@ export interface VariantMetrics {
   threats: { critical: number; high: number; medium: number; low: number; open: number; total: number };
   cost: { total: number; perMillion: number; items: CostItem[] };
   complexity: { points: number; label: 'Baja' | 'Media' | 'Alta' };
+  /** RTO/RPO estimados por el plan de resiliencia (s). */
+  recovery: { region: { rtoS: number; rpoS: number }; data: { rtoS: number; rpoS: number }; ransomware: { rtoS: number; rpoS: number } };
   scores: Record<Pillar, number>;
   total: number;
 }
@@ -83,7 +86,7 @@ function complexity(nodes: AppNode[], edges: AppEdge[]) {
   return { points: Math.round(points * 10) / 10, label: (points <= 12 ? 'Baja' : points <= 24 ? 'Media' : 'Alta') as 'Baja' | 'Media' | 'Alta', types: types.size, pieces: svcs.length };
 }
 
-export function evaluateVariant(v: Variant, opts: { security: Record<string, boolean>; avgRps: number; respKb?: number }): Omit<VariantMetrics, 'scores' | 'total'> & { rawCost: number } {
+export function evaluateVariant(v: Variant, opts: { security: Record<string, boolean>; avgRps: number; respKb?: number; dr?: DrConfig }): Omit<VariantMetrics, 'scores' | 'total'> & { rawCost: number } {
   const { nodes, edges, securityGroups } = v;
   const blocked = new Map<string, string>();
   const net = analyzeNetwork(nodes, edges, securityGroups);
@@ -124,6 +127,8 @@ export function evaluateVariant(v: Variant, opts: { security: Record<string, boo
   const issues = validate(nodes, edges);
   const cx = complexity(nodes, edges);
   const atk = web.summary.attack;
+  const plan = buildPlan(nodes, edges, { dr: opts.dr ?? DEFAULT_DR, security: opts.security });
+  const rr = (t: { rtoS: number; rpoS: number }) => ({ rtoS: t.rtoS, rpoS: t.rpoS });
 
   return {
     id: v.id,
@@ -141,6 +146,7 @@ export function evaluateVariant(v: Variant, opts: { security: Record<string, boo
     attack: { webBlockedPct: atk && atk.sent > 0 ? atk.blocked / atk.sent : null, ddosAvail: ddos.summary.availability },
     validation: { errors: issues.filter((i) => i.severity === 'error').length, warns: issues.filter((i) => i.severity === 'warn').length },
     blocked: blocked.size,
+    recovery: { region: rr(plan.totals.region), data: rr(plan.totals.data), ransomware: rr(plan.totals.ransomware) },
     threats: {
       critical: open.filter((t) => t.risk === 'Crítico').length,
       high: open.filter((t) => t.risk === 'Alto').length,
@@ -162,7 +168,7 @@ export interface Comparison {
   avgRps: number;
 }
 
-export function compareVariants(variants: Variant[], opts: { security: Record<string, boolean>; avgRps: number; respKb?: number; weights: Weights }): Comparison {
+export function compareVariants(variants: Variant[], opts: { security: Record<string, boolean>; avgRps: number; respKb?: number; weights: Weights; dr?: DrConfig }): Comparison {
   const raw = variants.map((v) => evaluateVariant(v, opts));
   const cheapest = Math.min(...raw.map((r) => r.rawCost).filter((c) => c > 0), Infinity);
   const metrics: VariantMetrics[] = raw.map((r) => {

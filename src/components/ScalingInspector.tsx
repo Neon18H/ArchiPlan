@@ -6,7 +6,7 @@ import { fmtRps, profileFor } from '../sim/profiles';
 import { useStore } from '../store';
 import type { PropValue, ServiceNode } from '../types';
 
-function Num({ label, value, onChange, min = 0, max = 100000, step = 1, suffix, disabled }: { label: string; value: number; onChange: (v: number) => void; min?: number; max?: number; step?: number; suffix?: string; disabled?: boolean }) {
+export function Num({ label, value, onChange, min = 0, max = 100000, step = 1, suffix, disabled }: { label: string; value: number; onChange: (v: number) => void; min?: number; max?: number; step?: number; suffix?: string; disabled?: boolean }) {
   return (
     <label className={`scale-num ${disabled ? 'disabled' : ''}`}>
       <span>{label}</span>

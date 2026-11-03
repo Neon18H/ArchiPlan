@@ -25,7 +25,7 @@ function anchor(a: ReturnType<typeof center>, b: ReturnType<typeof center>): [nu
 export const FloatingEdge = memo(function FloatingEdge({ id, source, target, data, selected, markerEnd }: EdgeProps<AppEdge>) {
   const s = useInternalNode(source);
   const t = useInternalNode(target);
-  const { edgeIssues, dimmed, sim, stride, trace, netBlocked, netView } = useCanvasCtx();
+  const { edgeIssues, dimmed, sim, stride, trace, netBlocked, netView, attack } = useCanvasCtx();
   const boundary = stride?.boundaries.get(id);
   if (!s || !t) return null;
   const a = center(s);
@@ -34,8 +34,8 @@ export const FloatingEdge = memo(function FloatingEdge({ id, source, target, dat
   const [tx, ty, tp] = anchor(b, a);
   const [path, lx, ly] = getSmoothStepPath({ sourceX: sx, sourceY: sy, sourcePosition: sp, targetX: tx, targetY: ty, targetPosition: tp, borderRadius: 10, offset: 18 });
   const d = (data ?? {}) as ConnData;
-  const issue = sim || stride || trace || netView ? undefined : edgeIssues.get(id);
-  const blockedLabel = !sim && !stride && !trace && !netView ? netBlocked?.get(id) : undefined;
+  const issue = sim || stride || trace || netView || attack ? undefined : edgeIssues.get(id);
+  const blockedLabel = !sim && !stride && !trace && !netView && !attack ? netBlocked?.get(id) : undefined;
   const nv = netView?.edges.get(id);
   const simE = sim ? sim.edges[id] : undefined;
   // Estilos en línea (no solo CSS) para que la exportación a PNG/SVG conserve las líneas.
@@ -62,6 +62,15 @@ export const FloatingEdge = memo(function FloatingEdge({ id, source, target, dat
       ? { stroke: color, strokeWidth: 3, strokeDasharray: st === 'fail' ? '3 4' : '8 5', opacity: 1, fill: 'none', animation: st === 'fail' ? undefined : 'edge-flow 0.9s linear infinite' }
       : { ...stroke, stroke: '#c3c8cf', opacity: 0.35, strokeDasharray: d.async ? '6 4' : undefined };
     if (st === 'fail') traceLabel = trace.failedEdgeId === id ? '✗ aquí falla' : '✗';
+  }
+  let atkLabel: string | null = null;
+  if (attack) {
+    const stepNo = attack.edges.get(id) ?? attack.virtual.find((v) => v.id === id)?.step;
+    const virtual = (d as { virtual?: boolean }).virtual;
+    stroke = stepNo
+      ? { stroke: '#c92a2a', strokeWidth: 3.2, strokeDasharray: virtual ? '4 4' : '9 5', opacity: 1, fill: 'none', animation: 'edge-flow 0.7s linear infinite' }
+      : { ...stroke, stroke: '#c3c8cf', opacity: 0.3, strokeDasharray: d.async ? '6 4' : undefined };
+    atkLabel = stepNo ? attack.labels.get(id) ?? `${stepNo}` : null;
   }
   let simLabel: string | null = null;
   if (sim) {
@@ -99,6 +108,14 @@ export const FloatingEdge = memo(function FloatingEdge({ id, source, target, dat
             </button>
           </EdgeLabelRenderer>
         ) : null
+      ) : attack ? (
+        atkLabel && (
+          <EdgeLabelRenderer>
+            <div className={`edge-label atk-label ${(d as { virtual?: boolean }).virtual ? 'virtual' : ''}`} style={{ transform: `translate(-50%, -50%) translate(${lx}px, ${ly}px)` }} title={(d as { virtual?: boolean }).virtual ? 'Salto sin flecha en el diagrama: lo permiten las credenciales o el rol IAM' : undefined}>
+              {atkLabel}
+            </div>
+          </EdgeLabelRenderer>
+        )
       ) : (sim ? simLabel : traceLabel ?? boundary ?? blockedLabel ?? d.protocol) && (
         <EdgeLabelRenderer>
           <div

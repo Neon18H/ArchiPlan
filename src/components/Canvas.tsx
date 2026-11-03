@@ -19,6 +19,7 @@ import { useSim } from '../sim/store';
 import { c3Eligible } from '../c3/model';
 import type { AppEdge, AppNode, ConnData, ZoneKind } from '../types';
 import { FloatingEdge } from './FloatingEdge';
+import { useCanvasCtx } from './context';
 import { ServiceNodeView, SystemNodeView, ZoneNodeView } from './nodes';
 
 const nodeTypes = { service: ServiceNodeView, zone: ZoneNodeView, system: SystemNodeView };
@@ -76,7 +77,14 @@ export function Canvas() {
   const rf = useReactFlow();
   const wrapper = useRef<HTMLDivElement>(null);
 
-  const display = useMemo(() => (view === 'c1' ? contextView(nodes, edges, meta.name, meta.description) : { nodes: nodes as Node[], edges }), [view, nodes, edges, meta.name, meta.description]);
+  const { attack } = useCanvasCtx();
+  const display = useMemo(() => {
+    if (view === 'c1') return contextView(nodes, edges, meta.name, meta.description);
+    if (!attack?.virtual.length) return { nodes: nodes as Node[], edges };
+    // Saltos de la ruta de ataque que no son una flecha del diagrama (rol IAM, credenciales robadas)
+    const extra = attack.virtual.map((v) => ({ id: v.id, source: v.source, target: v.target, type: 'floating', selectable: false, deletable: false, data: { virtual: true }, markerEnd: { type: MarkerType.ArrowClosed, width: 16, height: 16, color: '#c92a2a' } })) as unknown as AppEdge[];
+    return { nodes: nodes as Node[], edges: [...edges, ...extra] };
+  }, [view, nodes, edges, meta.name, meta.description, attack]);
 
   useEffect(() => {
     if (!focusRequest) return;

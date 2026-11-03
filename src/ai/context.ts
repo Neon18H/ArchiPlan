@@ -1,3 +1,5 @@
+import { buildPlan, DEFAULT_DR, DR_MAP, fmtDur, type DrConfig } from '../resilience/model';
+import { buildAttackPaths } from '../attack/paths';
 /**
  * Arma el contexto que «lee» el asistente: el diagrama, la red, el escalado, los problemas,
  * las amenazas y los últimos resultados de simulación, en texto compacto.
@@ -25,6 +27,8 @@ export interface AiContextInput {
   net: NetAnalysis;
   sim?: SimResult | null;
   trace?: TraceResult | null;
+  /** Estrategia de DR del proyecto. */
+  dr?: DrConfig;
   /** Variantes A/B del proyecto, si las hay. */
   variant?: { names: string[]; active: string } | null;
 }
@@ -108,6 +112,20 @@ export function buildContext(x: AiContextInput): string {
   const on = SECURITY_SETTINGS.filter((s) => x.security[s.key]).map((s) => s.label);
   L.push('', `## Seguridad del proyecto: ${on.length ? on.join('; ') : 'ningún guardrail ni práctica marcada'}`);
 
+  // Resiliencia y rutas de ataque
+  const dr = x.dr ?? DEFAULT_DR;
+  const plan = buildPlan(nodes, edges, { dr, security: x.security });
+  const t = plan.totals;
+  const lvl = (v: { rtoS: number; rpoS: number; worst: string | null }) => `RTO ${fmtDur(v.rtoS)}, RPO ${fmtDur(v.rpoS)}${v.worst && v.rtoS > 0 ? ` (lo más lento: ${v.worst})` : ''}`;
+  L.push('', `## Resiliencia (estrategia de DR: ${DR_MAP[dr.strategy].label}${dr.strategy !== 'none' ? ` hacia ${dr.secondaryRegion}` : ''}; objetivo RTO ${dr.rtoMin} min / RPO ${dr.rpoMin} min)`);
+  L.push(`- Falla de instancia: ${lvl(t.instance)} · caída de AZ: ${lvl(t.az)} · caída de región: ${lvl(t.region)} · datos dañados: ${lvl(t.data)} · ransomware: ${lvl(t.ransomware)}`);
+  for (const i of plan.issues.slice(0, 6)) L.push(`- [${i.severity}] ${i.text}`);
+  const atk = buildAttackPaths(nodes, edges, { security: x.security, securityGroups: x.securityGroups });
+  if (atk.paths.length) {
+    L.push('', `## Rutas de ataque más probables (MITRE ATT&CK)`);
+    for (const p of atk.paths.slice(0, 4)) L.push(`- [${p.risk}, ${(p.likelihood * 100).toFixed(1)} %] ${p.steps.map((st, k) => `${k === 0 ? `[[${label(st.from)}]]` : ''} → ${st.technique?.id ?? 'pasa'} → [[${label(st.to)}]]`).join(' ')}${p.bestCut ? ` · mejor corte: ${p.bestCut.control.label}` : ''}`);
+  }
+
   // Simulaciones
   if (x.sim) {
     const s = x.sim.summary;
@@ -149,6 +167,8 @@ export const QUICK_ACTIONS: { label: string; prompt: string; needsSelection?: bo
   { label: '¿Qué me falta para producción?', prompt: '¿Qué le falta a esta arquitectura para estar lista para producción? Agrúpalo en: disponibilidad, seguridad, observabilidad y operación.' },
   { label: 'Revisa la red y los SG', prompt: 'Revisa la red: Security Groups, puertos, listeners, conexiones bloqueadas y exposición a Internet. ¿Qué está mal configurado o demasiado abierto?' },
   { label: '¿Aguanta un pico?', prompt: '¿Cómo se comporta esta arquitectura ante un pico de 10x de tráfico? Revisa el escalado configurado de cada pieza y dime dónde está el cuello de botella y qué ajustar.' },
+  { label: '¿Sobrevive a la caída de la región?', prompt: 'Revisa la resiliencia: ¿qué pasa si cae una instancia, una AZ o la región completa? ¿A qué recurso falla cada pieza crítica, cuál es el RTO y el RPO y cómo llego a mis objetivos al menor costo?' },
+  { label: 'Rutas de ataque', prompt: 'Explícame las rutas de ataque más probables de este diseño (con las técnicas de MITRE ATT&CK) y qué 3 controles cortarían la mayoría de ellas.' },
   { label: 'Riesgos de seguridad', prompt: '¿Cuáles son los 5 riesgos de seguridad más importantes de este diseño y cómo los mitigo?' },
   { label: '¿Cómo bajo costos?', prompt: '¿Dónde puedo bajar costos sin perder disponibilidad ni seguridad?' },
   { label: 'Explícame la selección', prompt: 'Explícame la pieza o conexión seleccionada: para qué sirve en este diseño, si está bien configurada y qué mejorarías.', needsSelection: true },

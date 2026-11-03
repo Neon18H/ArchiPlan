@@ -1,11 +1,14 @@
 import { useEffect, useState } from 'react';
 import { DT, targetCandidates, pickDefaultTarget } from '../sim/engine';
 import { fmtRps } from '../sim/profiles';
-import { FIELD_LABEL, SCENARIO_MAP, SCENARIOS, type Scenario } from '../sim/scenarios';
+import { FIELD_LABEL, SCENARIO_GROUPS, SCENARIO_MAP, SCENARIOS, type Scenario } from '../sim/scenarios';
+import { drOf, DR_MAP, fmtDur } from '../resilience/model';
+import { openResilience } from './ResilienceInspector';
 import { useSim } from '../sim/store';
 import { useStore } from '../store';
 import { SimChart } from './SimChart';
 import { ModeSwitch, RequestPanel } from './RequestPanel';
+import { AttackPanel } from './AttackPanel';
 
 const SEV_LABEL = { error: 'Crítico', warn: 'Aviso', info: 'Nota', ok: 'Bien' } as const;
 
@@ -20,6 +23,7 @@ export function SimPanel() {
   const nodes = useStore((s) => s.nodes);
   const edges = useStore((s) => s.edges);
   const focus = useStore((s) => s.focus);
+  const dr = drOf(useStore((s) => s.meta));
   const [tab, setTab] = useState<'findings' | 'events'>('findings');
   const meta = SCENARIO_MAP[scenario.kind];
 
@@ -38,6 +42,7 @@ export function SimPanel() {
   }, [playing, speed, result]);
 
   if (mode === 'request') return <RequestPanel />;
+  if (mode === 'attack') return <AttackPanel />;
 
   const candidates = meta.target ? targetCandidates(nodes, scenario.kind) : [];
   const autoTarget = meta.target ? pickDefaultTarget(nodes, edges, scenario.kind) : null;
@@ -96,13 +101,27 @@ export function SimPanel() {
           </button>
         </div>
         <div className="sim-kinds">
-          {SCENARIOS.map((m) => (
-            <button key={m.kind} className={`sim-kind ${m.kind === scenario.kind ? 'on' : ''}`} onClick={() => setKind(m.kind)} title={m.description}>
-              {m.short}
-            </button>
+          {SCENARIO_GROUPS.map((g) => (
+            <div key={g.id} className="sim-kind-group" role="group" aria-label={g.label}>
+              <span className="sim-group-label">{g.label}</span>
+              {SCENARIOS.filter((m) => m.group === g.id).map((m) => (
+                <button key={m.kind} className={`sim-kind ${m.kind === scenario.kind ? 'on' : ''}`} onClick={() => setKind(m.kind)} title={m.description}>
+                  {m.short}
+                </button>
+              ))}
+            </div>
           ))}
         </div>
         <p className="sim-desc">{meta.description}</p>
+        {scenario.kind === 'region-failure' && (
+          <p className="sim-desc">
+            Estrategia: <b>{DR_MAP[dr.strategy].label}</b>
+            {dr.strategy !== 'none' ? ` hacia ${dr.secondaryRegion}` : ''} ·{' '}
+            <button className="linkish" onClick={openResilience}>
+              cambiar
+            </button>
+          </p>
+        )}
         <div className="sim-fields">{meta.fields.map(field)}</div>
         <p className="sim-disclaimer">Estimaciones con cuotas y límites por defecto de la nube y cargas típicas. Ajusta la capacidad de cada pieza en su panel de propiedades.</p>
       </div>
@@ -165,10 +184,17 @@ export function SimPanel() {
               <span>Latencia p95</span>
               <b>{s.p95Latency >= 1000 ? `${(s.p95Latency / 1000).toFixed(1)} s` : `${Math.round(s.p95Latency)} ms`}</b>
             </div>
-            <div className="kpi" title={s.bottleneck ? `${s.bottleneck.label}: ${Math.round(s.bottleneck.peakUtil * 100)}% de su capacidad en el pico` : ''}>
-              <span>Más exigido</span>
-              <b className="ellipsis">{s.bottleneck ? `${s.bottleneck.label}` : '—'}</b>
-            </div>
+            {s.dataLossS !== undefined ? (
+              <div className={`kpi ${s.dataLossS === null ? '' : !Number.isFinite(s.dataLossS) ? 'bad' : s.dataLossS > dr.rpoMin * 60 ? 'warn' : 'good'}`} title="Escrituras que se pierden (RPO)">
+                <span>Datos perdidos</span>
+                <b>{s.dataLossS === null ? '—' : Number.isFinite(s.dataLossS) ? fmtDur(s.dataLossS) : 'todos'}</b>
+              </div>
+            ) : (
+              <div className="kpi" title={s.bottleneck ? `${s.bottleneck.label}: ${Math.round(s.bottleneck.peakUtil * 100)}% de su capacidad en el pico` : ''}>
+                <span>Más exigido</span>
+                <b className="ellipsis">{s.bottleneck ? `${s.bottleneck.label}` : '—'}</b>
+              </div>
+            )}
           </div>
         )}
         <div className="sim-tabs">

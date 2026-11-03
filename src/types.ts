@@ -218,6 +218,8 @@ export interface ProjectMeta {
   environment: string;
   createdAt: string;
   updatedAt: string;
+  /** Estrategia de recuperación ante desastres (región secundaria, RTO/RPO objetivo). */
+  dr?: { strategy: 'none' | 'backup' | 'pilot' | 'warm' | 'active'; secondaryRegion: string; rtoMin: number; rpoMin: number };
 }
 
 export type ThreatStatusOverride = 'aceptada' | 'no-aplica' | 'mitigada';
