@@ -1,4 +1,5 @@
-import { getService, PLACEMENT_LABEL, ZONE_PARENT, ZONES } from '../catalog/catalog';
+import { coverage } from '../c3/model';
+import { cloudText, getService, lid, PLACEMENT_LABEL, primaryCloud, ZONE_PARENT, ZONES } from '../catalog/catalog';
 import { ancestors, byId, isService, isZone, placementOf } from '../lib/graph';
 import type { AppEdge, AppNode, Issue, ServiceNode, ZoneNode } from '../types';
 import { evaluateConnection } from './connections';
@@ -12,7 +13,7 @@ export function validate(nodes: AppNode[], edges: AppEdge[]): Issue[] {
   const zones = nodes.filter(isZone);
   const svc = (n: ServiceNode) => getService(n.data.serviceId);
   const hasRole = (role: string) => services.some((n) => svc(n).role === role);
-  const ofId = (id: string) => services.filter((n) => n.data.serviceId === id);
+  const ofId = (id: string) => services.filter((n) => lid(n) === id);
   const outgoing = (id: string) => edges.filter((e) => e.source === id);
   const incoming = (id: string) => edges.filter((e) => e.target === id);
   const push = (i: Omit<Issue, 'id'> & { id?: string }) => issues.push({ id: i.id ?? `${i.title}:${i.nodeIds.join(',')}:${(i.edgeIds ?? []).join(',')}`, ...i });
@@ -106,8 +107,8 @@ export function validate(nodes: AppNode[], edges: AppEdge[]): Issue[] {
     const vpc = ancestors(n, map).find((z) => z.data.zoneKind === 'vpc');
     if (!vpc) continue;
     const inVpc = (x: AppNode) => ancestors(x, map).some((z) => z.id === vpc.id);
-    const hasNat = services.some((x) => x.data.serviceId === 'natgw' && inVpc(x));
-    const hasVpce = services.some((x) => x.data.serviceId === 'vpce' && inVpc(x));
+    const hasNat = services.some((x) => lid(x) === 'natgw' && inVpc(x));
+    const hasVpce = services.some((x) => lid(x) === 'vpce' && inVpc(x));
     const targets = outgoing(n.id).map((e) => map.get(e.target)).filter(isService);
     const needsInternet = targets.some((t) => svc(t).role === 'external' || svc(t).id === 'bedrock');
     const needsAws = targets.some((t) => placementOf(t, map) === 'outside' || placementOf(t, map) === 'region');
@@ -134,7 +135,7 @@ export function validate(nodes: AppNode[], edges: AppEdge[]): Issue[] {
   // ── 7. Alta disponibilidad
   for (const n of services) {
     const p = n.data.props;
-    switch (n.data.serviceId) {
+    switch (lid(n)) {
       case 'ec2':
         if (Number(p.count) < 2 && !p.autoscaling)
           push({ severity: 'warn', title: `${name(n)} es un punto único de falla`, detail: 'Una sola instancia sin Auto Scaling. Usa ≥2 instancias en distintas AZ.', nodeIds: [n.id], fix: { label: 'Activar Auto Scaling (2+)', setProps: [{ nodeId: n.id, props: { count: 2, autoscaling: true } }] } });
@@ -172,8 +173,8 @@ export function validate(nodes: AppNode[], edges: AppEdge[]): Issue[] {
   const secretsNode = ofId('secrets')[0];
   for (const n of services) {
     if (svc(n).role !== 'compute') continue;
-    const usesSqlDb = outgoing(n.id).some((e) => ['rds', 'aurora', 'documentdb', 'redshift'].includes((map.get(e.target) as ServiceNode)?.data?.serviceId));
-    const readsSecrets = outgoing(n.id).some((e) => (map.get(e.target) as ServiceNode)?.data?.serviceId === 'secrets');
+    const usesSqlDb = outgoing(n.id).some((e) => ['rds', 'aurora', 'documentdb', 'redshift'].includes(lid(map.get(e.target) as ServiceNode)));
+    const readsSecrets = outgoing(n.id).some((e) => lid(map.get(e.target) as ServiceNode) === 'secrets');
     if (usesSqlDb && !readsSecrets)
       push({
         severity: 'info',
@@ -182,7 +183,7 @@ export function validate(nodes: AppNode[], edges: AppEdge[]): Issue[] {
         nodeIds: [n.id],
         fix: secretsNode ? { label: 'Conectar a Secrets Manager', connect: [{ source: n.id, target: secretsNode.id }] } : { label: 'Agregar Secrets Manager', add: [{ serviceId: 'secrets', near: n.id }], connect: [{ source: n.id, target: 'new:0' }] },
       });
-    if (n.data.serviceId === 'lambda' && outgoing(n.id).some((e) => ['rds', 'aurora'].includes((map.get(e.target) as ServiceNode)?.data?.serviceId)))
+    if (lid(n) === 'lambda' && outgoing(n.id).some((e) => ['rds', 'aurora'].includes(lid(map.get(e.target) as ServiceNode))))
       push({ severity: 'info', title: `${name(n)} → BD relacional`, detail: 'Lambda puede agotar las conexiones de la BD. Usa RDS Proxy o Aurora Data API.', nodeIds: [n.id] });
   }
 
@@ -213,13 +214,28 @@ export function validate(nodes: AppNode[], edges: AppEdge[]): Issue[] {
 
   // ── 11. Piezas sueltas y actores
   for (const n of services) {
-    if (['cloudtrail', 'guardduty', 'kms', 'igw', 'codepipeline', 'acm'].includes(n.data.serviceId)) continue;
+    if (['cloudtrail', 'guardduty', 'kms', 'igw', 'codepipeline', 'acm'].includes(lid(n))) continue;
     if (!edges.some((e) => e.source === n.id || e.target === n.id))
       push({ severity: 'info', title: `${name(n)} no está conectado`, detail: 'Conéctalo o elimínalo para que el diagrama cuente la historia completa.', nodeIds: [n.id] });
   }
   if (services.length > 0 && !actors.length && !hasRole('external'))
     push({ severity: 'info', title: 'No hay actores', detail: '¿Quién usa el sistema? Agrega usuarios o sistemas externos para dar contexto (nivel C1).', nodeIds: [], id: 'no-actors' });
 
+  // ── 12. Coherencia entre C2 y C3
+  for (const n of services) {
+    if (!n.data.c3?.components.length) continue;
+    const cov = coverage(n, nodes, edges);
+    if (cov.missing.length)
+      push({ severity: 'info', title: `${name(n)} (C3): dependencias sin componente`, detail: `En C2 se conecta con ${cov.missing.map((m) => m.node.data.label).join(', ')}, pero ningún componente interno las usa. Actualiza la vista de componentes.`, nodeIds: [n.id] });
+    if (cov.stale.length) push({ severity: 'info', title: `${name(n)} (C3): relaciones obsoletas`, detail: `${cov.stale.length} relación(es) de C3 apuntan a dependencias que ya no existen en C2.`, nodeIds: [n.id] });
+  }
+
+  const cloud = primaryCloud(nodes);
+  if (cloud === 'azure') for (const i of issues) {
+    i.title = cloudText(i.title, cloud);
+    i.detail = cloudText(i.detail, cloud);
+    if (i.fix) i.fix = { ...i.fix, label: cloudText(i.fix.label, cloud) };
+  }
   const order = { error: 0, warn: 1, info: 2 };
   return issues.sort((a, b) => order[a.severity] - order[b.severity]);
 }

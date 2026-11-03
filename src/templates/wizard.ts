@@ -3,6 +3,7 @@ import type { Spec, SpecService } from '../lib/layout';
 
 export interface WizardAnswers {
   name: string;
+  cloud?: 'aws' | 'azure';
   kind: 'web' | 'api' | 'eventos' | 'datos' | 'estatico';
   compute: 'serverless' | 'contenedores' | 'vms' | 'kubernetes';
   data: 'relacional' | 'nosql' | 'ambos' | 'ninguno';
@@ -19,6 +20,7 @@ export interface WizardAnswers {
 
 export const DEFAULT_ANSWERS: WizardAnswers = {
   name: 'Nueva solución',
+  cloud: 'aws',
   kind: 'web',
   compute: 'contenedores',
   data: 'relacional',

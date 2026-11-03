@@ -1,6 +1,6 @@
 # ArchiPlan — diseñador local de arquitecturas de soluciones
 
-Herramienta web que **corre en el PC del arquitecto** (sin nube, sin cuentas). Sirve para armar arquitecturas pieza por pieza, y unas reglas impiden que el diseño quede sin sentido.
+Herramienta web que **corre en el PC del arquitecto** (sin nube, sin cuentas). Sirve para armar arquitecturas en **AWS** o **Azure** pieza por pieza, y unas reglas impiden que el diseño quede sin sentido.
 
 ## Requisitos
 - Node.js 20 o superior
@@ -24,18 +24,39 @@ Los proyectos se guardan como archivos `*.archi.json` en la carpeta `projects/`.
 
 | Función | Detalle |
 |---|---|
-| **Lienzo** | Arrastra piezas desde la paleta (≈50 servicios AWS y actores genéricos). Haz doble clic para que la pieza quede en la zona correcta. Puedes deshacer y rehacer. |
+| **Lienzo** | Arrastra piezas desde la paleta: ≈50 servicios de AWS, ≈45 de Azure y actores genéricos. Haz doble clic para que la pieza quede en la zona correcta. Puedes deshacer y rehacer. |
 | **Zonas** | Región → VPC → subnets pública/privada/de datos, más grupos libres. Al soltar una pieza dentro de una zona, la zona la contiene, y la zona crece sola. |
 | **Reglas de conexión** | Cada pieza tiene un *rol*. Las conexiones sin sentido se bloquean y se explica por qué: usuario → BD, Internet → subnet privada, SQS → RDS, BD que inicia conexiones, WAF a algo que no sea CloudFront/ALB/API, etc. Las conexiones dudosas se permiten con un aviso. |
 | **Validación en vivo** | Revisa la ubicación por zona, los puntos de entrada sin WAF, los puntos únicos de falla, Multi‑AZ, el cifrado, una subnet privada sin NAT ni VPC Endpoint, si falta observabilidad o identidad, los secretos de BD y las piezas sueltas. Muchas reglas traen un **arreglo automático ⚡**. |
-| **Vistas C4** | C1 Contexto (actores, sistema y externos, calculada automáticamente) y C2 Contenedores (la que se edita). Con el filtro por **capas** resaltas borde, aplicación, datos, seguridad, etc. |
+| **Vistas C4** | C1 Contexto (actores, sistema y externos, calculada automáticamente), C2 Contenedores (la que se edita) y C3 Componentes (doble clic sobre un servicio). Con el filtro por **capas** resaltas borde, aplicación, datos, seguridad, etc. |
 | **Guía paso a paso** | Un checklist de 12 pasos (actores → entrada → borde → identidad → cómputo → datos → red → asíncrono → secretos → observabilidad → conexiones → ADR) que indica la siguiente pieza y la agrega con un clic. |
 | **Asistente** | Te hace unas 13 preguntas y genera la arquitectura inicial junto con sus ADR. |
 | **Plantillas** | Web en 3 capas, API serverless, microservicios en ECS, orientada a eventos, sitio estático y pipeline de datos. |
 | **Decisiones (ADR)** | Registro de decisiones con contexto, decisión y consecuencias. |
+| **Multinube** | Catálogos de AWS y Azure con las mismas reglas, simulación y modelo de amenazas. Convierte un diagrama completo de AWS a Azure (o al revés) con un clic. |
 | **Simulación** | Carga, picos, caída de instancias o AZ, falla de dependencias, DDoS L7 y L3/L4, y ataques web contra el WAF (ver abajo). |
 | **Modelo de amenazas (STRIDE)** | Genera las amenazas por pieza, por flujo que cruza un límite de confianza y de la cuenta. Calcula el riesgo, detecta controles en el diagrama y aplica mitigaciones con un clic; se conecta con la simulación (ver abajo). |
-| **Exportar** | PNG, SVG, PDF (A3), documento de arquitectura en HTML (imprimible a PDF) o Markdown, Mermaid, Terraform y JSON. |
+| **Exportar** | PNG, SVG, PDF (A3), documento de arquitectura en HTML (imprimible a PDF) o Markdown, Mermaid, Terraform (AWS y/o Azure) y JSON. |
+
+## Azure y multinube
+
+La paleta tiene pestañas **AWS / Azure**. Cada servicio de Azure declara su **equivalente lógico** en AWS: Front Door ≈ CloudFront, Application Gateway ≈ ALB, Functions ≈ Lambda, Cosmos DB ≈ DynamoDB, Entra External ID ≈ Cognito, Key Vault ≈ Secrets Manager, etc. Gracias a eso, las reglas de conexión, la validación, la simulación y el modelo de amenazas funcionan igual en ambas nubes.
+
+- **Textos en la nube del diagrama.** Hallazgos, amenazas, guía y simulación hablan de los servicios de Azure cuando el diagrama es de Azure.
+- **Límites propios de Azure en la simulación.** API Management por nivel, Functions Flex Consumption, RU/s de Cosmos DB, 4.000 transacciones / 10 s de Key Vault, Event Grid, Event Hubs por TU, TPM de Azure OpenAI, failover de Azure SQL y PostgreSQL con o sin redundancia de zona.
+- **Convertir AWS ⇄ Azure** (*Propiedades → Nube principal*). Reemplaza cada pieza por su equivalente y conserva conexiones, zonas, la configuración compatible y los protocolos personalizados. Se puede deshacer.
+- **Plantillas y asistente** en ambas nubes.
+- **Terraform azurerm.** Resource group, VNet y subnets (incluidas las delegadas para Container Apps y PostgreSQL), NSG derivados de las flechas, Front Door + WAF, Application Gateway, recursos por servicio y **RBAC de mínimo privilegio con identidades administradas**, también derivado de las flechas.
+
+## Componentes (C4 nivel 3)
+
+Doble clic sobre una pieza de cómputo, API o flujo (o el botón *Ver componentes*) abre sus **componentes internos**:
+
+- El servicio aparece como un contenedor. A los lados están sus **dependencias reales de C2**: quién lo llama y a qué llama.
+- **Generar componentes sugeridos** propone los módulos a partir de esas dependencias: API/controlador, autorización, servicio de dominio, un repositorio por base de datos, gestor de caché, publicadores, clientes de externos o LLM, configuración y telemetría. También propone sus relaciones.
+- Los componentes se editan como en C2: arrastrar desde la paleta, conectar e inspeccionar (tipo, tecnología, responsabilidad).
+- **Coherencia entre niveles.** Si en C2 hay una dependencia que ningún componente usa, o una relación de C3 que apunta a algo que ya no existe, se marca en la vista y en la pestaña Validación.
+- Los componentes se guardan con el proyecto y salen en el documento de arquitectura.
 
 ## Simulación
 
@@ -77,19 +98,20 @@ Es un **esqueleto** para el provider AWS 5.x. Incluye VPC, subnets por AZ, IGW/N
 
 ```
 server/            API local (guardar/abrir en disco) + servidor de producción
-src/catalog/       Catálogo de servicios, categorías, capas y zonas  ← agrega servicios aquí
+src/catalog/       Catálogos AWS (catalog.ts) y Azure (azure.ts), equivalencias, zonas  ← agrega servicios aquí
+src/c3/            Vista de componentes (C4 nivel 3): sugerencias y coherencia con C2
 src/rules/         connections.ts (matriz de reglas), validate.ts (hallazgos), guide.ts (checklist)
 src/templates/     Plantillas y lógica del asistente
-src/export/        Mermaid, Terraform, documento, imagen/PDF
+src/export/        Mermaid, Terraform AWS y Azure, documento, imagen/PDF
 src/sim/           Simulación: perfiles de capacidad, escenarios y motor
 src/threats/       Modelo de amenazas STRIDE: zonas de confianza, reglas y controles
 src/components/    Lienzo, paleta, panel lateral, modales
 ```
 
-### Agregar un proveedor (Azure / GCP)
-1. Agrega servicios en `src/catalog/catalog.ts` con `provider: 'azure'` y un `role` existente. Las reglas de conexión funcionan por rol, así que se aplican sin cambios.
-2. Si el proveedor tiene sus propias zonas (VNet, Resource Group), agrégalas en `ZONES` y `ZONE_PARENT`.
-3. Crea su exportador de IaC (por ejemplo `export/bicep.ts`) siguiendo el patrón de `terraform.ts`.
+### Agregar otra nube (p. ej. GCP)
+1. Crea `src/catalog/gcp.ts` siguiendo `azure.ts`. Cada servicio declara `equiv` (su equivalente de AWS) y usa las mismas claves de propiedades; así reglas, simulación y amenazas funcionan sin cambios.
+2. Agrega la nube a `Cloud`, a las etiquetas de zona (`zoneLabel`) y a la tabla de términos (`cloudText`).
+3. Crea su exportador de IaC siguiendo `export/terraform-azure.ts`.
 
 ## Atajos
 `Ctrl+Z` / `Ctrl+Y` deshacer y rehacer · `Ctrl+S` guardar · `Supr` eliminar · `Shift`+arrastrar para seleccionar varias piezas.

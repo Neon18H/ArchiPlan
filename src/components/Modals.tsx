@@ -1,10 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useReactFlow } from '@xyflow/react';
-import { getService } from '../catalog/catalog';
+import { cloudText, CLOUD_LABEL, getService, primaryCloud } from '../catalog/catalog';
+import { convertSpec } from '../lib/cloud';
+import { useCloud } from '../lib/useCloud';
+import type { Cloud } from '../types';
 import { download, captureDiagram, diagramToPdf, downloadDataUrl } from '../export/image';
 import { toMarkdown, toHtmlDoc } from '../export/doc';
 import { toMermaid } from '../export/mermaid';
 import { toTerraform } from '../export/terraform';
+import { toTerraformAzure } from '../export/terraform-azure';
 import { deleteProjectFile, isProject, listProjects, loadProjectFile, serverAvailable, slugify, type ProjectListItem } from '../lib/api';
 import { useStore } from '../store';
 import { TEMPLATES } from '../templates/templates';
@@ -41,11 +45,33 @@ const confirmReplace = () => {
 
 export function TemplatesModal({ onClose }: { onClose: () => void }) {
   const loadSpec = useStore((s) => s.loadSpec);
+  const diagramCloud = useCloud();
+  const [cloud, setCloud] = useState<Cloud>(diagramCloud);
+  const list = useMemo(
+    () =>
+      TEMPLATES.map((t) => ({
+        ...t,
+        spec: convertSpec(t.spec, cloud),
+        description: cloudText(t.description, cloud),
+        tags: t.tags.map((x) => cloudText(x, cloud)),
+        decisions: t.decisions.map((d) => ({ ...d, title: cloudText(d.title, cloud), context: cloudText(d.context, cloud), decision: cloudText(d.decision, cloud), consequences: cloudText(d.consequences, cloud) })),
+      })),
+    [cloud],
+  );
   return (
     <Modal title="Plantillas de patrones" onClose={onClose} wide>
-      <p className="muted">Arranca desde un patrón probado y adáptalo. Todas pasan las reglas de conexión.</p>
+      <div className="row gap" style={{ justifyContent: 'space-between', marginBottom: 6 }}>
+        <p className="muted" style={{ margin: 0 }}>Arranca desde un patrón probado y adáptalo. Todas pasan las reglas de conexión.</p>
+        <div className="cloud-tabs inline">
+          {(['aws', 'azure'] as Cloud[]).map((c) => (
+            <button key={c} className={`${cloud === c ? 'on' : ''} c-${c}`} onClick={() => setCloud(c)}>
+              {CLOUD_LABEL[c]}
+            </button>
+          ))}
+        </div>
+      </div>
       <div className="tpl-grid">
-        {TEMPLATES.map((t) => {
+        {list.map((t) => {
           const ids = [...new Set(t.spec.services.map((s) => s.serviceId))].filter((id) => !['user', 'admin'].includes(id)).slice(0, 8);
           return (
             <button
@@ -53,7 +79,7 @@ export function TemplatesModal({ onClose }: { onClose: () => void }) {
               className="tpl"
               onClick={() => {
                 if (!confirmReplace()) return;
-                loadSpec(t.spec, { name: t.name, description: t.description }, t.decisions);
+                loadSpec(t.spec, { name: t.name, description: t.description, provider: cloud }, t.decisions);
                 onClose();
               }}
             >
@@ -87,6 +113,15 @@ type Q =
 const QUESTIONS: Q[] = [
   { key: 'name', q: '¿Cómo se llama la solución?', type: 'text', placeholder: 'Ej.: Plataforma de pedidos' },
   {
+    key: 'cloud',
+    q: '¿En qué nube?',
+    type: 'choice',
+    options: [
+      { v: 'aws', label: 'AWS', desc: 'Amazon Web Services' },
+      { v: 'azure', label: 'Azure', desc: 'Microsoft Azure' },
+    ],
+  },
+  {
     key: 'kind',
     q: '¿Qué tipo de solución es?',
     type: 'choice',
@@ -110,20 +145,20 @@ const QUESTIONS: Q[] = [
     type: 'choice',
     options: [
       { v: 'relacional', label: 'Relacional', desc: 'Transacciones, joins, reportes (PostgreSQL/MySQL)' },
-      { v: 'nosql', label: 'NoSQL', desc: 'Acceso por clave, alto volumen (DynamoDB)' },
+      { v: 'nosql', label: 'NoSQL', desc: 'Acceso por clave, alto volumen (DynamoDB / Cosmos DB)' },
       { v: 'ambos', label: 'Ambos', desc: 'Relacional + NoSQL' },
       { v: 'ninguno', label: 'Ninguno', desc: 'Sin persistencia propia' },
     ],
   },
-  { key: 'auth', q: '¿Los usuarios inician sesión?', help: 'Agrega un proveedor de identidad (Cognito / OIDC).', type: 'bool' },
-  { key: 'cdn', q: '¿Tiene usuarios en varias regiones o mucho contenido estático?', help: 'Agrega CloudFront delante.', type: 'bool' },
+  { key: 'auth', q: '¿Los usuarios inician sesión?', help: 'Agrega un proveedor de identidad (Cognito / Entra External ID, OIDC).', type: 'bool' },
+  { key: 'cdn', q: '¿Tiene usuarios en varias regiones o mucho contenido estático?', help: 'Agrega una CDN delante (CloudFront / Front Door).', type: 'bool' },
   { key: 'async', q: '¿Hay tareas pesadas que no deban bloquear al usuario?', help: 'Correos, reportes, pagos, procesamiento de archivos…', type: 'bool' },
   { key: 'cache', q: '¿Necesita caché para lecturas frecuentes o sesiones?', type: 'bool' },
   { key: 'files', q: '¿Guarda archivos (imágenes, documentos, adjuntos)?', type: 'bool' },
   { key: 'external', q: '¿Se integra con sistemas externos (pagos, ERP, APIs de terceros)?', type: 'bool' },
   { key: 'ai', q: '¿Usa IA generativa (LLM)?', type: 'bool' },
-  { key: 'ha', q: '¿Requiere alta disponibilidad (Multi‑AZ)?', help: 'Producción crítica: sí. Prototipo o interno: puede ser no.', type: 'bool' },
-  { key: 'region', q: '¿En qué región de AWS?', type: 'text', placeholder: 'us-east-1' },
+  { key: 'ha', q: '¿Requiere alta disponibilidad (varias zonas)?', help: 'Producción crítica: sí. Prototipo o interno: puede ser no.', type: 'bool' },
+  { key: 'region', q: '¿En qué región?', type: 'text', placeholder: 'us-east-1 / eastus' },
 ];
 
 export function WizardModal({ onClose }: { onClose: () => void }) {
@@ -133,7 +168,11 @@ export function WizardModal({ onClose }: { onClose: () => void }) {
   const visible = QUESTIONS.filter((q) => !(a.kind === 'estatico' && ['compute', 'data', 'auth', 'cdn', 'async', 'cache', 'files', 'external', 'ai'].includes(q.key)));
   const q = visible[Math.min(i, visible.length - 1)];
   const last = i >= visible.length - 1;
-  const preview = useMemo(() => generateFromAnswers(a), [a]);
+  const preview = useMemo(() => {
+    const g = generateFromAnswers(a);
+    const c = a.cloud ?? 'aws';
+    return { spec: convertSpec(g.spec, c), decisions: g.decisions.map((d) => ({ ...d, title: cloudText(d.title, c), context: cloudText(d.context, c), decision: cloudText(d.decision, c), consequences: cloudText(d.consequences, c) })) };
+  }, [a]);
   const pieces = useMemo(() => {
     const ids = preview.spec.services.map((s) => s.serviceId);
     return [...new Set(ids)];
@@ -141,7 +180,7 @@ export function WizardModal({ onClose }: { onClose: () => void }) {
 
   const finish = () => {
     if (!confirmReplace()) return;
-    loadSpec(preview.spec, { name: a.name, description: '', region: a.region }, preview.decisions);
+    loadSpec(preview.spec, { name: a.name, description: '', provider: a.cloud ?? 'aws' }, preview.decisions);
     onClose();
   };
   const set = (k: keyof WizardAnswers, v: unknown) => setA({ ...a, [k]: v } as WizardAnswers);
@@ -212,7 +251,7 @@ export function WizardModal({ onClose }: { onClose: () => void }) {
             {pieces.map((id) => (
               <div key={id} className="wiz-piece">
                 <ServiceIcon def={getService(id)} size={22} />
-                <span>{getService(id).name.replace(/^(Amazon|AWS) /, '')}</span>
+                <span>{getService(id).name.replace(/^(Amazon|AWS|Azure|Microsoft) /, '')}</span>
               </div>
             ))}
           </div>
@@ -326,7 +365,7 @@ export function ProjectsModal({ onClose }: { onClose: () => void }) {
 
 /* ───────────────────────── Exportar */
 
-type CodeKind = 'mermaid' | 'terraform' | 'markdown' | 'json';
+type CodeKind = 'mermaid' | 'terraform' | 'terraform-azure' | 'markdown' | 'json';
 
 export function ExportModal({ onClose }: { onClose: () => void }) {
   const rf = useReactFlow();
@@ -336,6 +375,9 @@ export function ExportModal({ onClose }: { onClose: () => void }) {
   const project = st.toProject();
   const base = slugify(project.meta.name);
   const view = useStore((s) => s.view);
+  const provs = new Set(project.nodes.filter((n) => n.type === 'service').map((n) => getService((n.data as { serviceId: string }).serviceId).provider));
+  const hasAws = provs.has('aws');
+  const hasAzure = provs.has('azure');
 
   const bounds = () => rf.getNodesBounds(rf.getNodes());
   const run = async (key: string, fn: () => Promise<void>) => {
@@ -350,7 +392,8 @@ export function ExportModal({ onClose }: { onClose: () => void }) {
   };
   const texts: Record<CodeKind, { label: string; file: string; mime: string; text: () => string }> = {
     mermaid: { label: 'Mermaid', file: `${base}.mmd`, mime: 'text/plain', text: () => toMermaid(project.nodes, project.edges, project.meta.name) },
-    terraform: { label: 'Terraform', file: `main.tf`, mime: 'text/plain', text: () => toTerraform(project.nodes, project.edges, project.meta) },
+    terraform: { label: 'Terraform (AWS)', file: `main.tf`, mime: 'text/plain', text: () => toTerraform(project.nodes, project.edges, project.meta) },
+    'terraform-azure': { label: 'Terraform (Azure)', file: hasAws ? `azure.tf` : `main.tf`, mime: 'text/plain', text: () => toTerraformAzure(project.nodes, project.edges, project.meta) },
     markdown: { label: 'Documento (Markdown)', file: `${base}-arquitectura.md`, mime: 'text/markdown', text: () => toMarkdown(project, `${base}.png`) },
     json: { label: 'Proyecto JSON', file: `${base}.archi.json`, mime: 'application/json', text: () => JSON.stringify(project, null, 2) },
   };
@@ -384,6 +427,7 @@ export function ExportModal({ onClose }: { onClose: () => void }) {
           </p>
         )}
         {code === 'terraform' && <p className="muted small">Esqueleto con red, security groups derivados de las flechas, IAM de mínimo privilegio y TODOs. Revísalo antes de aplicar.</p>}
+        {code === 'terraform-azure' && <p className="muted small">Esqueleto azurerm con VNet, NSG derivados de las flechas, RBAC con identidades administradas y TODOs. Revísalo antes de aplicar.</p>}
         <pre className="code">{text}</pre>
       </Modal>
     );
@@ -409,7 +453,7 @@ export function ExportModal({ onClose }: { onClose: () => void }) {
       act: () =>
         run('pdf', async () => {
           const png = await captureDiagram(bounds(), 'png');
-          const blob = await diagramToPdf(png, project.meta.name, `${project.meta.environment} · AWS ${project.meta.region} · ${new Date().toLocaleDateString('es-CO')}`);
+          const blob = await diagramToPdf(png, project.meta.name, `${project.meta.environment} · ${CLOUD_LABEL[primaryCloud(project.nodes, project.meta.provider ?? 'aws')]} ${project.meta.region} · ${new Date().toLocaleDateString('es-CO')}`);
           download(`${base}.pdf`, blob);
         }),
     },
@@ -426,7 +470,8 @@ export function ExportModal({ onClose }: { onClose: () => void }) {
     },
     { key: 'markdown', title: 'Documento en Markdown', desc: 'Para el repositorio o la wiki (Confluence, GitHub).', act: () => setCode('markdown') },
     { key: 'mermaid', title: 'Mermaid', desc: 'Diagrama como código, versionable en git.', act: () => setCode('mermaid') },
-    { key: 'terraform', title: 'Terraform', desc: 'Esqueleto de infraestructura AWS.', act: () => setCode('terraform') },
+    ...(hasAws || !hasAzure ? [{ key: 'terraform', title: hasAzure ? 'Terraform (AWS)' : 'Terraform', desc: 'Esqueleto de infraestructura AWS (provider aws).', act: () => setCode('terraform') }] : []),
+    ...(hasAzure ? [{ key: 'terraform-azure', title: hasAws ? 'Terraform (Azure)' : 'Terraform', desc: 'Esqueleto de infraestructura Azure (provider azurerm).', act: () => setCode('terraform-azure') }] : []),
     { key: 'json', title: 'Proyecto JSON', desc: 'Archivo para compartir, versionar o reabrir.', act: () => setCode('json') },
   ];
   return (

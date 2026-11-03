@@ -54,9 +54,13 @@ export type PropDef =
 
 export type PropValue = string | number | boolean;
 
+export type Cloud = 'aws' | 'azure';
+
 export interface ServiceDef {
   id: string;
-  provider: 'aws' | 'generic';
+  provider: Cloud | 'generic';
+  /** Servicio de AWS equivalente: la lógica (reglas, simulación, amenazas) usa este id. */
+  equiv?: string;
   name: string;
   short: string;
   category: CategoryId;
@@ -87,11 +91,37 @@ export type CategoryId =
   | 'ai'
   | 'devops';
 
+export type ComponentKind = 'controller' | 'consumer' | 'auth' | 'service' | 'repository' | 'cache' | 'client' | 'publisher' | 'config' | 'telemetry' | 'scheduler' | 'validator' | 'other';
+
+/** Componente interno de un servicio (C4 nivel 3). */
+export interface C3Component {
+  id: string;
+  kind: ComponentKind;
+  label: string;
+  tech?: string;
+  description?: string;
+  position: { x: number; y: number };
+}
+
+/** Relación en C3. source/target: id de componente o `ext:<id de la pieza de C2>`. */
+export interface C3Link {
+  id: string;
+  source: string;
+  target: string;
+  label?: string;
+}
+
+export interface C3Model {
+  components: C3Component[];
+  links: C3Link[];
+}
+
 export interface ServiceData extends Record<string, unknown> {
   serviceId: string;
   label: string;
   props: Record<string, PropValue>;
   notes?: string;
+  c3?: C3Model;
   /** Estado de validación, calculado (no se persiste). */
   issue?: 'error' | 'warn' | 'info';
   dimmed?: boolean;
@@ -131,7 +161,7 @@ export interface ProjectMeta {
   name: string;
   description: string;
   author: string;
-  provider: 'aws';
+  provider: Cloud;
   region: string;
   environment: string;
   createdAt: string;

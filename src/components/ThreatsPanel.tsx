@@ -165,7 +165,7 @@ export function ThreatsPanel({ threats }: { threats: Threat[] }) {
   const groups = useMemo(() => {
     const g = new Map<string, Threat[]>();
     for (const t of list) {
-      const k = t.kind === 'account' ? 'Cuenta AWS' : t.kind === 'flow' ? 'Flujos que cruzan límites de confianza' : t.element;
+      const k = t.kind === 'account' ? t.element : t.kind === 'flow' ? 'Flujos que cruzan límites de confianza' : t.element;
       if (!g.has(k)) g.set(k, []);
       g.get(k)!.push(t);
     }

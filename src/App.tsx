@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ReactFlowProvider } from '@xyflow/react';
 import { getService, LAYERS } from './catalog/catalog';
 import { Canvas } from './components/Canvas';
+import { C3Canvas } from './components/C3Canvas';
+import { c3Eligible } from './c3/model';
 import { CanvasContext } from './components/context';
 import { ExportModal, ProjectsModal, TemplatesModal, WizardModal } from './components/Modals';
 import { Palette } from './components/Palette';
@@ -10,6 +12,7 @@ import { SimPanel } from './components/SimPanel';
 import { useSim } from './sim/store';
 import { buildThreats } from './threats/model';
 import { useThreatsUi } from './threats/ui';
+import { useCloud } from './lib/useCloud';
 import { download } from './export/image';
 import { isService } from './lib/graph';
 import { saveProjectFile, serverAvailable, slugify } from './lib/api';
@@ -47,6 +50,7 @@ function Toolbar({ openModal, onSave, issuesCount }: { openModal: (m: ModalKind)
   const past = useStore((s) => s.past.length);
   const future = useStore((s) => s.future.length);
   const { setMeta, undo, redo, setView, toggleLayer, clearLayers, autoLayout, newEmpty } = useStore.getState();
+  const c3Ready = useStore((s) => !!s.c3Id || s.nodes.some((n) => n.selected && c3Eligible(n)));
 
   return (
     <header className="toolbar">
@@ -120,6 +124,9 @@ function Toolbar({ openModal, onSave, issuesCount }: { openModal: (m: ModalKind)
           </button>
           <button className={view === 'c2' ? 'on' : ''} onClick={() => setView('c2')} title="C4 nivel 2: contenedores / servicios">
             C2 Contenedores
+          </button>
+          <button className={view === 'c3' ? 'on' : ''} disabled={!c3Ready} onClick={() => setView('c3')} title={c3Ready ? 'C4 nivel 3: componentes del servicio' : 'Selecciona una pieza de cómputo o haz doble clic sobre ella'}>
+            C3 Componentes
           </button>
         </div>
         <Menu label={layers.length ? `Capas (${layers.length})` : 'Capas'}>
@@ -198,6 +205,7 @@ export default function App() {
   const simPlaying = useSim((s) => s.playing);
   const threatState = useStore((s) => s.threats);
   const strideOverlay = useThreatsUi((s) => s.overlay);
+  const cloud = useCloud();
 
   // Validación en vivo (solo depende de la estructura, no de la selección)
   const structKey = useMemo(
@@ -238,11 +246,11 @@ export default function App() {
           nm.set(id, cur);
         }
       }
-      const short: Record<string, string> = { 'Borde AWS': 'Borde', 'Servicios AWS': 'AWS', 'Subnet pública': 'Pública', 'Subnet privada': 'Privada', 'Subnet de datos': 'Datos', 'Red corporativa': 'Corp.' };
+      const short: Record<string, string> = { 'Borde AWS': 'Borde', 'Servicios AWS': cloud === 'azure' ? 'PaaS' : 'AWS', 'Borde Azure': 'Borde', 'Servicios Azure': 'PaaS', 'Subnet pública': 'Pública', 'Subnet privada': 'Privada', 'Subnet de datos': 'Datos', 'Red corporativa': 'Corp.' };
       stride = { nodes: nm, boundaries: new Map(threatModel.boundaries.filter((b) => b.inbound).map((b) => [b.edgeId, `${short[b.from] ?? b.from}→${short[b.to] ?? b.to}`])) };
     }
-    return { nodeIssues, edgeIssues, dimmed, readOnly: view !== 'c2', sim, stride };
-  }, [issues, layers, nodes, view, simOpen, simResult, simIdx, simPlaying, strideOverlay, threatModel]);
+    return { nodeIssues, edgeIssues, dimmed, readOnly: view !== 'c2', sim, stride, cloud };
+  }, [issues, layers, nodes, view, simOpen, simResult, simIdx, simPlaying, strideOverlay, threatModel, cloud]);
 
   const counts = { error: issues.filter((i) => i.severity === 'error').length, warn: issues.filter((i) => i.severity === 'warn').length, info: issues.filter((i) => i.severity === 'info').length };
 
@@ -304,8 +312,8 @@ export default function App() {
           <div className="main">
             <Palette />
             <div className={`center ${simOpen ? 'with-sim' : ''}`}>
-              <Canvas />
-              {simOpen && <SimPanel />}
+              {view === 'c3' ? <C3Canvas /> : <Canvas />}
+              {simOpen && view !== 'c3' && <SimPanel />}
             </div>
             <Sidebar issues={issues} guide={guide} threats={threatModel.threats} />
           </div>

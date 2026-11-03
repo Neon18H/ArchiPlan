@@ -1,10 +1,11 @@
 import { memo } from 'react';
 import { Handle, NodeResizer, Position, type NodeProps } from '@xyflow/react';
-import { CATEGORIES, getService, ZONES } from '../catalog/catalog';
+import { CATEGORIES, getService, zoneLabel, ZONES } from '../catalog/catalog';
 import type { ServiceNode, ZoneNode } from '../types';
 import { useCanvasCtx } from './context';
 import { fmtRps } from '../sim/profiles';
 import type { NodeFrame } from '../sim/engine';
+import { COMPONENT_KINDS } from '../c3/model';
 import { ServiceIcon } from './ServiceIcon';
 
 const SIDES = [
@@ -83,6 +84,11 @@ export const ServiceNodeView = memo(function ServiceNodeView({ id, data, selecte
       )}
       {issue && <span className={`svc-badge ${issue}`}>{issue === 'error' ? '!' : issue === 'warn' ? '!' : 'i'}</span>}
       {data.notes ? <span className="svc-note" title={data.notes}>✎</span> : null}
+      {data.c3?.components.length && !simF ? (
+        <span className="svc-c3" title="Tiene componentes (C3): doble clic para verlos">
+          ⧉ {data.c3.components.length}
+        </span>
+      ) : null}
       {!readOnly &&
         SIDES.map(([pos, key]) => <Handle key={key} id={key} type="source" position={pos} className="h" />)}
     </div>
@@ -91,8 +97,9 @@ export const ServiceNodeView = memo(function ServiceNodeView({ id, data, selecte
 
 export const ZoneNodeView = memo(function ZoneNodeView({ id, data, selected }: NodeProps<ZoneNode>) {
   const z = ZONES[data.zoneKind];
-  const { nodeIssues, dimmed, readOnly } = useCanvasCtx();
+  const { nodeIssues, dimmed, readOnly, cloud } = useCanvasCtx();
   const issue = nodeIssues.get(id);
+  const kindLabel = zoneLabel(data.zoneKind, cloud);
   const extra = data.props.cidr ? String(data.props.cidr) : data.props.region ? String(data.props.region) : '';
   return (
     <div
@@ -101,8 +108,8 @@ export const ZoneNodeView = memo(function ZoneNodeView({ id, data, selected }: N
     >
       {!readOnly && <NodeResizer isVisible={selected} minWidth={200} minHeight={120} color={z.color} />}
       <div className="zone-tab">
-        <span className="zone-kind">{z.label}</span>
-        {data.label !== z.label && <span className="zone-label">{data.label}</span>}
+        <span className="zone-kind">{kindLabel}</span>
+        {data.label !== kindLabel && data.label !== z.label && <span className="zone-label">{data.label}</span>}
         {extra && <span className="zone-extra">{extra}</span>}
       </div>
     </div>
@@ -121,6 +128,63 @@ export const SystemNodeView = memo(function SystemNodeView({ data }: NodeProps) 
       <Handle id="l" type="source" position={Position.Left} className="h" />
       <Handle id="r" type="source" position={Position.Right} className="h" />
       <Handle id="b" type="source" position={Position.Bottom} className="h" />
+    </div>
+  );
+});
+
+/* ───────────────────────── C3: componentes */
+
+const C3_SIDES = [
+  [Position.Top, 't'],
+  [Position.Right, 'r'],
+  [Position.Bottom, 'b'],
+  [Position.Left, 'l'],
+] as const;
+
+export const C3ComponentView = memo(function C3ComponentView({ data, selected }: NodeProps) {
+  const c = (data as { comp: import('../types').C3Component }).comp;
+  const k = COMPONENT_KINDS[c.kind];
+  return (
+    <div className={`c3c ${selected ? 'is-selected' : ''}`} style={{ ['--kc' as string]: k.color }} title={c.description || k.help}>
+      <div className="c3c-badge">{k.short}</div>
+      <div className="c3c-text">
+        <div className="c3c-label">{c.label}</div>
+        <div className="c3c-kind">
+          [{k.label}
+          {c.tech ? `: ${c.tech}` : ''}]
+        </div>
+      </div>
+      {C3_SIDES.map(([pos, key]) => (
+        <Handle key={key} id={key} type="source" position={pos} className="h" />
+      ))}
+    </div>
+  );
+});
+
+export const C3ExtView = memo(function C3ExtView({ data }: NodeProps) {
+  const d = data as { label: string; serviceId: string; dir: 'in' | 'out'; missing: boolean };
+  const def = getService(d.serviceId);
+  return (
+    <div className={`c3ext ${d.missing ? 'is-missing' : ''}`} title={d.missing ? 'Esta dependencia existe en C2 pero ningún componente la usa' : `${d.dir === 'in' ? 'Llama a este servicio' : 'Dependencia'} en C2`}>
+      <ServiceIcon def={def} size={28} />
+      <div className="c3ext-text">
+        <div className="c3ext-label">{d.label}</div>
+        <div className="c3ext-kind">{d.dir === 'in' ? 'Llama al servicio' : 'Dependencia'} · {def.name}</div>
+      </div>
+      {C3_SIDES.map(([pos, key]) => (
+        <Handle key={key} id={key} type="source" position={pos} className="h" />
+      ))}
+    </div>
+  );
+});
+
+export const C3BoundaryView = memo(function C3BoundaryView({ data }: NodeProps) {
+  const d = data as { label: string; service: string; empty: boolean };
+  return (
+    <div className="c3b">
+      <div className="c3b-tab">
+        <b>{d.label}</b> <span>[Contenedor: {d.service}]</span>
+      </div>
     </div>
   );
 });

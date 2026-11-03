@@ -9,7 +9,7 @@ import type { AppEdge, AppNode, ConnData, ProjectMeta, ServiceNode } from '../ty
  */
 export function toTerraform(nodes: AppNode[], edges: AppEdge[], meta: ProjectMeta): string {
   const map = byId(nodes);
-  const services = nodes.filter(isService);
+  const services = nodes.filter(isService).filter((n) => getService(n.data.serviceId).provider !== 'azure');
   const zones = nodes.filter(isZone);
   const used = new Set<string>();
   const names = new Map<string, string>();

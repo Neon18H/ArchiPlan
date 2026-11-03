@@ -7,7 +7,7 @@ export function ServiceIcon({ def, size = 32 }: { def: ServiceDef; size?: number
   const glyph = GLYPHS[def.role] ?? GLYPHS.compute;
   const isPerson = def.role === 'actor';
   return (
-    <div className="svc-icon" style={{ width: size, height: size, background: isPerson ? '#eef0f3' : color, color: isPerson ? color : '#fff' }}>
+    <div className={`svc-icon ${def.provider === 'azure' ? 'is-azure' : ''}`} style={{ width: size, height: size, background: isPerson ? '#eef0f3' : color, color: isPerson ? color : '#fff' }}>
       <svg viewBox="0 0 24 24" width={size * 0.5} height={size * 0.5} fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
         {glyph}
       </svg>

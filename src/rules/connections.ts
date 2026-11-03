@@ -136,7 +136,10 @@ const M: Partial<Record<Role, Partial<Record<Role | '*', Rule>>>> = {
 };
 
 /** Excepciones por servicio (más específicas que la matriz de roles). */
-function serviceOverride(src: ServiceDef, tgt: ServiceDef): Rule | null {
+function serviceOverride(srcDef: ServiceDef, tgtDef: ServiceDef): Rule | null {
+  // Se razona con el equivalente lógico (AWS) para que las reglas valgan en todas las nubes
+  const src = { ...srcDef, id: srcDef.equiv ?? srcDef.id };
+  const tgt = { ...tgtDef, id: tgtDef.equiv ?? tgtDef.id };
   if (src.emitsEvents && ['compute', 'queue', 'topic', 'eventbus', 'stream', 'workflow'].includes(tgt.role)) {
     return ['ok', ''];
   }
@@ -178,7 +181,8 @@ export function evaluateConnection(source: AppNode, target: AppNode, map: Map<st
   const src = getService(source.data.serviceId);
   const tgt = getService(target.data.serviceId);
   let { protocol, async } = suggestProtocol(src, tgt);
-  if (tgt.id === 'rds' || tgt.id === 'aurora') protocol = sqlPortFor(target.data.props.engine ?? (tgt.id === 'aurora' ? 'aurora-postgresql' : 'postgres'));
+  const tl = tgt.equiv ?? tgt.id;
+  if (tl === 'rds' || tl === 'aurora') protocol = sqlPortFor(target.data.props.engine ?? (tl === 'aurora' ? 'aurora-postgresql' : 'postgres'));
 
   // Reglas por zona: desde afuera no hay ruta a subnets privadas.
   const fromOutside = src.role === 'actor' || src.role === 'external' || src.role === 'dns' || src.role === 'cdn';

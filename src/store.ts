@@ -1,12 +1,13 @@
 import { create } from 'zustand';
 import { applyEdgeChanges, applyNodeChanges, type Connection, type EdgeChange, type NodeChange } from '@xyflow/react';
-import { defaultProps, getService, ZONE_PARENT, ZONES } from './catalog/catalog';
+import { defaultProps, forCloud, getService, primaryCloud, zoneLabel, ZONE_PARENT, ZONES } from './catalog/catalog';
+import { convertRegion, convertService, convertZoneLabel } from './lib/cloud';
 import { absolutePosition, ancestors, byId, isService, isZone, nodeSize, placementOf, sortNodes, uid, ZONE_DEPTH } from './lib/graph';
 import { buildFromSpec, NODE_H, NODE_W, type Spec } from './lib/layout';
 import { evaluateConnection } from './rules/connections';
-import type { AppEdge, AppNode, ConnData, Decision, Fix, Layer, Placement, Project, ProjectMeta, PropValue, ServiceNode, ThreatState, ZoneKind, ZoneNode } from './types';
+import type { AppEdge, AppNode, C3Model, Cloud, ConnData, Decision, Fix, Layer, Placement, Project, ProjectMeta, PropValue, ServiceNode, ThreatState, ZoneKind, ZoneNode } from './types';
 
-export type ViewMode = 'c2' | 'c1';
+export type ViewMode = 'c2' | 'c1' | 'c3';
 
 interface Snapshot {
   nodes: AppNode[];
@@ -26,6 +27,9 @@ interface State extends Snapshot {
   projectId: string | null;
   dirty: boolean;
   view: ViewMode;
+  /** Pieza abierta en la vista de componentes (C3). */
+  c3Id: string | null;
+  c3Selection: string[];
   layers: Layer[];
   past: Snapshot[];
   future: Snapshot[];
@@ -66,8 +70,13 @@ interface State extends Snapshot {
   setProjectId: (id: string | null) => void;
   markSaved: () => void;
   autoLayout: () => void;
+  convertCloud: (to: Cloud) => void;
+  cloud: () => Cloud;
 
   setView: (v: ViewMode) => void;
+  openC3: (id: string) => void;
+  setC3: (id: string, model: C3Model, coalesceKey?: string) => void;
+  setC3Selection: (ids: string[]) => void;
   toggleLayer: (l: Layer) => void;
   clearLayers: () => void;
   toast: (kind: Toast['kind'], text: string) => void;
@@ -220,6 +229,8 @@ export const useStore = create<State>((set, get) => ({
   projectId: init?.projectId ?? null,
   dirty: false,
   view: 'c2',
+  c3Id: null,
+  c3Selection: [],
   layers: [],
   past: [],
   future: [],
@@ -383,7 +394,11 @@ export const useStore = create<State>((set, get) => ({
       width: size[0],
       height: size[1],
       style: { width: size[0], height: size[1] },
-      data: { zoneKind: kind, label: z.label, props: Object.fromEntries(z.props.map((p) => [p.key, p.default])) },
+      data: {
+        zoneKind: kind,
+        label: zoneLabel(kind, get().cloud()),
+        props: Object.fromEntries(z.props.map((p) => [p.key, kind === 'region' && p.key === 'region' && get().cloud() === 'azure' ? 'eastus' : p.default])),
+      },
     };
     nodes = [...nodes, node];
     if (parentId) nodes = growToFit(nodes, parentId);
@@ -448,8 +463,9 @@ export const useStore = create<State>((set, get) => ({
     // Evitar que cada addService cree su propio punto de undo
     set({ commit: () => {} } as Partial<State>);
     try {
+      const cloud = get().cloud();
       for (const a of fix.add ?? []) {
-        const id = get().addService(a.serviceId, undefined, a.parent === undefined ? undefined : a.parent);
+        const id = get().addService(forCloud(a.serviceId, cloud), undefined, a.parent === undefined ? undefined : a.parent);
         if (a.label || a.props) get().updateNode(id, { label: a.label, props: a.props });
         created.push(id);
       }
@@ -525,6 +541,8 @@ export const useStore = create<State>((set, get) => ({
       projectId,
       dirty: false,
       view: 'c2',
+      c3Id: null,
+      c3Selection: [],
       focusRequest: { ids: [], t: Date.now() },
     });
   },
@@ -534,7 +552,7 @@ export const useStore = create<State>((set, get) => ({
       {
         format: 'archiplan',
         version: 1,
-        meta: { ...emptyMeta(), ...meta, region: spec.region ?? 'us-east-1' },
+        meta: { ...emptyMeta(), ...meta, provider: spec.cloud ?? meta.provider ?? 'aws', region: spec.region ?? (spec.cloud === 'azure' ? 'eastus' : 'us-east-1') },
         nodes,
         edges,
         decisions: decisions.map((d) => ({ ...d, id: uid('adr') })),
@@ -601,7 +619,63 @@ export const useStore = create<State>((set, get) => ({
     set({ nodes: sortNodes([...fixed, ...keptZones] as AppNode[]), edges, focusRequest: { ids: [], t: Date.now() } });
   },
 
-  setView: (v) => set({ view: v, focusRequest: { ids: [], t: Date.now() } }),
+  cloud: () => primaryCloud(get().nodes, get().meta.provider ?? 'aws'),
+  convertCloud: (to) => {
+    const { nodes, edges, meta } = get();
+    const oldMap = byId(nodes);
+    const kept: string[] = [];
+    let changed = 0;
+    const next = nodes.map((n) => {
+      if (isZone(n)) {
+        const label = convertZoneLabel(n.data.zoneKind, n.data.label, to);
+        const props = n.data.zoneKind === 'region' && n.data.props.region ? { ...n.data.props, region: convertRegion(String(n.data.props.region), to) } : n.data.props;
+        return { ...n, data: { ...n.data, label, props } } as AppNode;
+      }
+      if (!isService(n)) return n;
+      const c = convertService(n.data.serviceId, n.data.props, n.data.label, to);
+      if (!c) {
+        kept.push(n.data.label);
+        return n;
+      }
+      if (c.serviceId !== n.data.serviceId) changed++;
+      return { ...n, data: { ...n.data, serviceId: c.serviceId, label: c.label, props: c.props } } as AppNode;
+    });
+    const newMap = byId(next);
+    const nextEdges = edges.map((e) => {
+      const os = oldMap.get(e.source);
+      const ot = oldMap.get(e.target);
+      const ns = newMap.get(e.source);
+      const nt = newMap.get(e.target);
+      if (!os || !ot || !ns || !nt) return e;
+      const d = (e.data ?? {}) as ConnData;
+      const oldSug = evaluateConnection(os, ot, oldMap).protocol;
+      if (d.protocol && d.protocol !== oldSug) return e; // protocolo personalizado: se respeta
+      const v = evaluateConnection(ns, nt, newMap);
+      return { ...e, data: { ...d, protocol: v.protocol, async: v.async } };
+    });
+    if (!changed) {
+      get().toast('info', `El diagrama ya está en ${to === 'azure' ? 'Azure' : 'AWS'}.`);
+      return;
+    }
+    get().commit();
+    set({ nodes: next, edges: nextEdges, meta: { ...meta, provider: to, region: convertRegion(meta.region, to) } });
+    get().toast('ok', `${changed} piezas convertidas a ${to === 'azure' ? 'Azure' : 'AWS'}.${kept.length ? ` Sin equivalente (se conservaron): ${kept.join(', ')}.` : ''}`);
+  },
+
+  setView: (v) => {
+    if (v === 'c3' && !get().c3Id) {
+      const sel = get().nodes.find((n) => n.selected && n.type === 'service');
+      if (!sel) return;
+      set({ c3Id: sel.id });
+    }
+    set({ view: v, c3Selection: [], focusRequest: { ids: [], t: Date.now() } });
+  },
+  openC3: (id) => set({ view: 'c3', c3Id: id, c3Selection: [], focusRequest: { ids: [], t: Date.now() } }),
+  setC3: (id, model, coalesceKey) => {
+    get().commit(coalesceKey ? `c3:${id}:${coalesceKey}` : undefined);
+    set({ nodes: get().nodes.map((n) => (n.id === id && n.type === 'service' ? ({ ...n, data: { ...n.data, c3: model } } as AppNode) : n)) });
+  },
+  setC3Selection: (ids) => set({ c3Selection: ids }),
   toggleLayer: (l) => {
     const cur = get().layers;
     set({ layers: cur.includes(l) ? cur.filter((x) => x !== l) : [...cur, l] });
