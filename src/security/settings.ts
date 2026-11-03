@@ -83,6 +83,7 @@ export const CONTROL_SETTING: Record<string, string[]> = {
   minimize: ['dataMin'],
   nosecrets: ['logHygiene'],
   offsite: ['offsiteBackup'],
+  patch: ['patching'],
   pii: ['llmPii'],
   policy: ['resourcePolicies'],
   replay: ['antiReplay'],

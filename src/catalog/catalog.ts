@@ -226,6 +226,26 @@ export const SERVICES: ServiceDef[] = [
   S({ id: 'transitgw', name: 'AWS Transit Gateway', short: 'TGW', category: 'networking', role: 'netgw', layer: 'red', zones: ['region', 'outside'], description: 'Hub que interconecta VPCs, VPNs y Direct Connect.' }),
   S({ id: 'directconnect', name: 'AWS Direct Connect', short: 'DX', category: 'networking', role: 'netgw', layer: 'red', zones: ['outside', 'region'], description: 'Enlace dedicado y privado hacia on‑premise (1‑100 Gbps).' }),
   S({ id: 'networkfirewall', name: 'AWS Network Firewall', short: 'NFW', category: 'security', role: 'netgw', layer: 'seguridad', zones: ['subnet-public', 'subnet-private'], vpcBound: true, description: 'Firewall administrado de la VPC: inspección, IPS y allowlist de dominios de salida.', props: [{ key: 'domainAllowlist', label: 'Allowlist de dominios de salida', type: 'bool', default: true }, { key: 'ips', label: 'IPS (reglas de amenazas administradas)', type: 'bool', default: true }] }),
+  S({ id: 'gwlb', name: 'Gateway Load Balancer', short: 'GWLB', category: 'networking', role: 'inspection', layer: 'seguridad', zones: ['subnet-private', 'subnet-public'], vpcBound: true, description: 'Balanceador de capa 3 que reparte el tráfico, de forma transparente (GENEVE, UDP 6081), entre una flota de firewalls, IDS/IPS u otros appliances virtuales.', inboundProtocol: 'GENEVE 6081', props: [
+    { key: 'crossZone', label: 'Balanceo entre zonas', type: 'bool', default: false, help: 'Si una AZ se queda sin firewalls sanos, los flujos van a los de otra AZ (cobra la transferencia entre AZ).' },
+    { key: 'targetFailover', label: 'Si un firewall cae, mover sus flujos', type: 'bool', default: true, help: 'target_failover = rebalance: los flujos ya abiertos pasan a otro firewall en vez de cortarse.' },
+    { key: 'stickiness', label: 'Afinidad de flujos', type: 'select', default: '5-tupla', options: ['5-tupla', '3-tupla', '2-tupla'] },
+  ] }),
+  S({ id: 'gwlbe', name: 'Gateway Load Balancer Endpoint', short: 'GWLBE', category: 'networking', role: 'inspection', layer: 'seguridad', zones: ['subnet-public', 'subnet-private'], vpcBound: true, description: 'Punto de inspección en la tabla de rutas: desvía el tráfico al Gateway Load Balancer y lo devuelve inspeccionado ("bump in the wire").', props: [
+    { key: 'perAz', label: 'Un endpoint por AZ', type: 'bool', default: true, help: 'El endpoint es zonal: si cae su AZ, el tráfico que lo usa queda sin inspección ni camino.' },
+  ] }),
+  S({ id: 'ngfw', name: 'Firewall virtual de terceros (NGFW / IDS‑IPS)', short: 'NGFW', category: 'security', role: 'appliance', layer: 'seguridad', zones: ['subnet-private'], vpcBound: true, description: 'Flota de appliances virtuales (Palo Alto VM‑Series, FortiGate, Check Point, Cisco…) detrás de un Gateway Load Balancer.', inboundProtocol: 'GENEVE 6081', props: [
+    { key: 'vendor', label: 'Fabricante', type: 'select', default: 'Palo Alto VM-Series', options: ['Palo Alto VM-Series', 'Fortinet FortiGate-VM', 'Check Point CloudGuard', 'Cisco Secure Firewall (FTDv)', 'Suricata propio (IDS/IPS)'] },
+    { key: 'mode', label: 'Modo', type: 'select', default: 'IPS (bloquea)', options: ['IPS (bloquea)', 'IDS (solo alerta)'] },
+    { key: 'threatPrevention', label: 'Prevención de amenazas (firmas de vulnerabilidades y exploits)', type: 'bool', default: true },
+    { key: 'tlsDecryption', label: 'Descifrado TLS (inspecciona HTTPS)', type: 'bool', default: false, help: 'Sin descifrado, el IPS solo ve IPs, puertos y el nombre del sitio (SNI): no ve el contenido de HTTPS.' },
+    { key: 'urlFiltering', label: 'Filtrado de URL y dominios de salida', type: 'bool', default: true },
+    { key: 'instanceType', label: 'Tipo de instancia', type: 'text', default: 'c5n.xlarge' },
+    { key: 'count', label: 'Instancias', type: 'number', default: 2, min: 1, max: 40 },
+    { key: 'autoscaling', label: 'Auto Scaling Group', type: 'bool', default: true },
+    { key: 'license', label: 'Licencia', type: 'select', default: 'PAYG', options: ['PAYG', 'BYOL'] },
+    { key: 'mgmtPublic', label: 'Interfaz de administración con IP pública', type: 'bool', default: false },
+  ] }),
   S({ id: 'privatelink', name: 'AWS PrivateLink (servicio propio)', short: 'PL', category: 'networking', role: 'netgw', layer: 'red', zones: ['subnet-private'], vpcBound: true, description: 'Expone un servicio propio (detrás de un NLB) a otras VPCs o cuentas sin pasar por Internet.' }),
   S({ id: 'cloudmap', name: 'AWS Cloud Map', short: 'MAP', category: 'networking', role: 'dns', layer: 'red', zones: ['region'], description: 'Descubrimiento de servicios (DNS/API) para microservicios.' }),
   // Cómputo

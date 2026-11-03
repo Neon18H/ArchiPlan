@@ -48,7 +48,7 @@ export function drOf(meta: { dr?: Partial<DrConfig> } | undefined): DrConfig {
 export type ResKind = 'fleet' | 'single-vm' | 'serverless' | 'relational' | 'nosql' | 'cache' | 'object' | 'files' | 'search' | 'broker' | 'lb' | 'nat' | 'dns' | 'global' | 'managed' | 'identity' | 'actor';
 
 const GLOBAL = new Set(['cloudfront', 'route53', 'waf', 'shield', 'iam', 'globalaccelerator', 'organizations']);
-const FLEET = new Set(['ec2', 'ecs', 'eks', 'beanstalk', 'batch', 'apprunner']);
+const FLEET = new Set(['ec2', 'ecs', 'eks', 'beanstalk', 'batch', 'apprunner', 'ngfw']);
 const RELATIONAL = new Set(['rds', 'aurora', 'documentdb', 'neptune', 'redshift']);
 
 export function resKind(n: ServiceNode): ResKind {
@@ -66,7 +66,7 @@ export function resKind(n: ServiceNode): ResKind {
   if (id === 'efs' || id === 'fsx') return 'files';
   if (id === 'opensearch') return 'search';
   if (id === 'msk' || id === 'mq') return 'broker';
-  if (id === 'alb' || id === 'nlb') return 'lb';
+  if (id === 'alb' || id === 'nlb' || id === 'gwlb' || id === 'gwlbe') return 'lb';
   if (id === 'natgw') return 'nat';
   if (id === 'cognito') return 'identity';
   return 'managed';
@@ -117,7 +117,7 @@ const bool = (p: Record<string, PropValue>, k: string, d: boolean) => (p[k] === 
 function desiredOf(n: ServiceNode): number {
   const p = n.data.props;
   const id = lid(n);
-  if (id === 'ec2') return Math.max(1, num(p, 'count', 2));
+  if (id === 'ec2' || id === 'ngfw') return Math.max(1, num(p, 'count', 2));
   if (id === 'ecs') return Math.max(0, num(p, 'desired', 2));
   if (id === 'eks') return Math.max(1, num(p, 'nodes', 3));
   if (id === 'apprunner' || id === 'beanstalk') return Math.max(1, num(p, 'instances', 1));
@@ -550,15 +550,15 @@ export function buildPlan(nodes: AppNode[], edges: AppEdge[], opts: { dr: DrConf
         const asg = id === 'ec2' ? p.autoscaling !== false && p.scalePolicy !== 'manual' : true;
         inst.target = desired >= 2 ? 'las demás instancias' : undefined;
         if (desired >= 2) {
-          inst.text = `${lb ? 'El balanceador' : 'El servicio'} deja de enviarle tráfico en ~${r.detectS} s (health check cada ${num(p, 'hcInterval', 10)} s × ${num(p, 'hcThreshold', 3)} fallos) y lo reparte entre las otras ${desired - 1}. ${asg ? 'Auto Scaling la reemplaza (~4 min).' : 'Nadie la reemplaza: queda con menos capacidad.'}`;
+          inst.text = `${lb ? 'El balanceador' : 'El servicio'} deja de enviarle tráfico en ~${r.detectS} s (health check cada ${num(p, 'hcInterval', 10)} s × ${num(p, 'hcThreshold', 3)} fallos) y lo reparte entre las otras ${desired - 1}. ${asg ? `Auto Scaling la reemplaza (~${id === 'ngfw' ? '10' : '4'} min).` : 'Nadie la reemplaza: queda con menos capacidad.'}`;
           inst.rtoS = r.detectS;
           inst.status = asg ? 'ok' : 'warn';
           if (!lb && id !== 'ecs') inst.status = 'warn';
         } else {
-          inst.text = asg ? `Es la única: el servicio cae hasta que Auto Scaling cree otra (~4 min).` : 'Es la única y no hay Auto Scaling: queda caída hasta que alguien la reemplace.';
+          inst.text = asg ? `Es la única: el servicio cae hasta que Auto Scaling cree otra (~${id === 'ngfw' ? '10' : '4'} min).` : 'Es la única y no hay Auto Scaling: queda caída hasta que alguien la reemplace.';
           inst.rtoS = asg ? 240 : Infinity;
           inst.status = 'bad';
-          inst.fix = { label: 'Correr 2 instancias en 2 AZ', nodeId: n.id, props: { [id === 'ec2' ? 'count' : id === 'ecs' ? 'desired' : id === 'eks' ? 'nodes' : 'instances']: 2, azSpread: 2 } };
+          inst.fix = { label: 'Correr 2 instancias en 2 AZ', nodeId: n.id, props: { [id === 'ec2' || id === 'ngfw' ? 'count' : id === 'ecs' ? 'desired' : id === 'eks' ? 'nodes' : 'instances']: 2, azSpread: 2 } };
         }
         if (r.azs >= 2) {
           const lose = Math.ceil(desired / r.azs);
@@ -570,7 +570,7 @@ export function buildPlan(nodes: AppNode[], edges: AppEdge[], opts: { dr: DrConf
           az.text = vAzs < 2 ? 'La VPC usa una sola AZ: si esa AZ cae, no hay a dónde ir.' : 'Todas las instancias están en una sola AZ: si cae, se pierde todo hasta que Auto Scaling cree instancias en otra AZ (~4 min).';
           az.rtoS = vAzs < 2 ? Infinity : 240;
           az.status = 'bad';
-          az.fix = vAzs < 2 ? undefined : { label: 'Repartir en 2 AZ', nodeId: n.id, props: { azSpread: 2, ...(desired < 2 ? { [id === 'ec2' ? 'count' : id === 'ecs' ? 'desired' : id === 'eks' ? 'nodes' : 'instances']: 2 } : {}) } };
+          az.fix = vAzs < 2 ? undefined : { label: 'Repartir en 2 AZ', nodeId: n.id, props: { azSpread: 2, ...(desired < 2 ? { [id === 'ec2' || id === 'ngfw' ? 'count' : id === 'ecs' ? 'desired' : id === 'eks' ? 'nodes' : 'instances']: 2 } : {}) } };
         }
         break;
       }

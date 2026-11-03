@@ -246,6 +246,26 @@ export function validate(nodes: AppNode[], edges: AppEdge[]): Issue[] {
     if (cov.stale.length) push({ severity: 'info', title: `${name(n)} (C3): relaciones obsoletas`, detail: `${cov.stale.length} relación(es) de C3 apuntan a dependencias que ya no existen en C2.`, nodeIds: [n.id] });
   }
 
+  // ── Inspección con Gateway Load Balancer y firewalls virtuales
+  const role = (n: ServiceNode) => svc(n).role;
+  const insp = services.filter((n) => role(n) === 'inspection');
+  for (const g of insp) {
+    const fwBehind = (id: string, seen = new Set<string>()): boolean =>
+      outgoing(id).some((e) => {
+        const t = map.get(e.target) as ServiceNode | undefined;
+        if (!t || seen.has(t.id)) return false;
+        seen.add(t.id);
+        return role(t) === 'appliance' || (role(t) === 'inspection' && fwBehind(t.id, seen));
+      });
+    if (!fwBehind(g.id)) push({ severity: 'warn', title: `${name(g)} no tiene firewalls detrás`, detail: lid(g) === 'gwlbe' ? 'El endpoint debe apuntar a un Gateway Load Balancer y este a una flota de firewalls virtuales.' : 'Conéctalo a la flota de firewalls virtuales (NGFW / IDS‑IPS) que reciben el tráfico por GENEVE.', nodeIds: [g.id] });
+    if (lid(g) === 'gwlbe' && !outgoing(g.id).some((e) => lid(map.get(e.target) as ServiceNode) === 'gwlb')) push({ severity: 'warn', title: `${name(g)} no está conectado a un Gateway Load Balancer`, detail: 'Cada endpoint consume el servicio de endpoint de un GWLB: dibuja la flecha endpoint → GWLB.', nodeIds: [g.id] });
+  }
+  for (const fw of services.filter((n) => role(n) === 'appliance')) {
+    if (!incoming(fw.id).some((e) => role(map.get(e.source) as ServiceNode) === 'inspection')) push({ severity: 'warn', title: `${name(fw)} no recibe tráfico`, detail: 'Los firewalls virtuales reciben el tráfico de un Gateway Load Balancer: dibuja la flecha GWLB → firewall.', nodeIds: [fw.id] });
+    if (fw.data.props.mgmtPublic) push({ severity: 'error', title: `La administración de ${name(fw)} está expuesta a Internet`, detail: 'Las interfaces de administración de firewalls expuestas han sido explotadas en masa (p. ej. CVE-2024-0012 en PAN-OS). Adminístralo por una subnet privada, VPN o SSM.', nodeIds: [fw.id], fix: { label: 'Quitar la IP pública de administración', setProps: [{ nodeId: fw.id, props: { mgmtPublic: false } }] } });
+    if (String(fw.data.props.mode ?? '').startsWith('IDS')) push({ severity: 'info', title: `${name(fw)} está en modo IDS`, detail: 'Detecta y alerta pero no bloquea. Es un buen primer paso para afinar firmas; define quién responde las alertas.', nodeIds: [fw.id] });
+  }
+
   const cloud = primaryCloud(nodes);
   if (cloud === 'azure') for (const i of issues) {
     i.title = cloudText(i.title, cloud);

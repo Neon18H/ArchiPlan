@@ -26,6 +26,10 @@ export type Role =
   | 'cert'
   | 'observability'
   | 'netgw'
+  /** Inspección transparente en línea (Gateway Load Balancer y sus endpoints). */
+  | 'inspection'
+  /** Appliance virtual de seguridad de terceros (NGFW, IDS/IPS) detrás de un GWLB. */
+  | 'appliance'
   | 'analytics'
   | 'ai'
   | 'devops';

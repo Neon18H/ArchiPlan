@@ -17,6 +17,7 @@ import {
   listenPort,
   needsSg,
   originProtocol,
+  registerEdges,
   peerIs,
   ruleCovers,
   ruleText,
@@ -75,6 +76,7 @@ const ENDPOINT_FOR: Record<string, string[]> = {
 
 export function analyzeNetwork(nodes: AppNode[], edges: AppEdge[], groups?: SecurityGroup[]): NetAnalysis {
   const map = byId(nodes);
+  registerEdges(map, edges);
   const net = effectiveNet(nodes, edges, groups);
   const services = nodes.filter(isService);
   const azure = primaryCloud(nodes) === 'azure';
@@ -111,6 +113,22 @@ export function analyzeNetwork(nodes: AppNode[], edges: AppEdge[], groups?: Secu
     const sem = semantics(e, map);
     if (!sem || sem.kind === 'none' || sem.kind === 'managed') {
       if (sem) verdicts.set(e.id, { edgeId: e.id, kind: sem.kind, fromId: sem.from.id, toId: sem.to.id, port: 0, ok: true, checks: [], summary: sem.kind === 'managed' ? 'Lo gestiona la nube (sin chequeo de red)' : 'Plano de control' });
+      continue;
+    }
+    if (sem.kind === 'geneve') {
+      const gs = sgsOf(sem.to);
+      const ok = !manual || gs.some((g) => g.inbound.some((r) => (r.protocol === 'udp' || r.protocol === 'all') && r.from <= 6081 && r.to >= 6081));
+      verdicts.set(e.id, {
+        edgeId: e.id,
+        kind: 'geneve',
+        fromId: sem.from.id,
+        toId: sem.to.id,
+        port: 6081,
+        ok,
+        checks: ok ? [{ id: 'geneve', ok: true, severity: 'error', title: 'GENEVE (UDP 6081) permitido', detail: 'El firewall recibe el túnel del Gateway Load Balancer.' }] : [{ id: 'geneve', ok: false, severity: 'error', title: `${sem.to.data.label} no acepta GENEVE (UDP 6081)`, detail: `El ${SG} del firewall debe permitir UDP 6081 (y el puerto del health check) desde la subnet del Gateway Load Balancer. Reglas actuales: ${describeRules(gs, 'inbound')}.` }],
+        summary: ok ? 'Túnel GENEVE UDP 6081' : 'El firewall no acepta UDP 6081',
+        ...(ok ? {} : { failure: 'Los paquetes se descartan en el firewall', short: 'SG bloquea UDP 6081' }),
+      });
       continue;
     }
     const { from: s, to: t } = sem;

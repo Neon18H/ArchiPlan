@@ -28,6 +28,8 @@ const M: Partial<Record<Role, Partial<Record<Role | '*', Rule>>>> = {
     kms: ['error', 'Los usuarios no acceden a KMS.'],
     observability: ['error', 'Los usuarios no se conectan a la observabilidad.'],
     netgw: ['warn', 'Normalmente no se dibuja al usuario conectándose a un gateway de red.'],
+    inspection: ['ok', ''],
+    appliance: ['error', 'Nadie se conecta directo al firewall: el tráfico llega por el Gateway Load Balancer.'],
     external: ['warn', 'Conexión entre actores externos: queda fuera del sistema.'],
     actor: ['error', 'Conexión entre actores: no pertenece a la arquitectura.'],
   },
@@ -44,7 +46,7 @@ const M: Partial<Record<Role, Partial<Record<Role | '*', Rule>>>> = {
     '*': ['error', 'Route 53 solo resuelve nombres hacia puntos de entrada (CDN, balanceador, API).'],
   },
   cdn: {
-    lb: 'ok', api: 'ok', storage: 'ok', observability: 'ok', compute: ['warn', 'Mejor pon un balanceador como origen.'], waf: ['warn', 'El WAF se asocia al CDN, no al revés: conecta WAF → CloudFront.'],
+    lb: 'ok', api: 'ok', storage: 'ok', observability: 'ok', inspection: ['ok', ''], compute: ['warn', 'Mejor pon un balanceador como origen.'], waf: ['warn', 'El WAF se asocia al CDN, no al revés: conecta WAF → CloudFront.'],
     datastore: ['error', 'Un CDN nunca debe tener una base de datos como origen.'],
     cache: ['error', 'Un CDN no usa ElastiCache como origen.'],
     '*': ['error', 'CloudFront solo usa como origen S3, un balanceador, API Gateway o un servidor web.'],
@@ -54,7 +56,7 @@ const M: Partial<Record<Role, Partial<Record<Role | '*', Rule>>>> = {
     '*': ['error', 'WAF solo se asocia a CloudFront, ALB o API Gateway.'],
   },
   lb: {
-    compute: 'ok', identity: ['ok', ''], lb: ['warn', 'Encadenar balanceadores rara vez es necesario.'],
+    compute: 'ok', identity: ['ok', ''], inspection: ['ok', ''], lb: ['warn', 'Encadenar balanceadores rara vez es necesario.'],
     datastore: ['error', 'Un balanceador solo distribuye tráfico hacia cómputo, no hacia bases de datos.'],
     cache: ['error', 'Un balanceador no apunta a la caché.'],
     queue: ['error', 'Un balanceador no envía tráfico a una cola. Usa API Gateway o un servicio.'],
@@ -63,7 +65,7 @@ const M: Partial<Record<Role, Partial<Record<Role | '*', Rule>>>> = {
     '*': ['warn', 'Normalmente un balanceador solo apunta a cómputo.'],
   },
   api: {
-    compute: 'ok', queue: 'ok', topic: 'ok', eventbus: 'ok', workflow: 'ok', stream: 'ok', identity: 'ok', lb: 'ok', observability: 'ok',
+    compute: 'ok', queue: 'ok', topic: 'ok', eventbus: 'ok', workflow: 'ok', stream: 'ok', identity: 'ok', lb: 'ok', observability: 'ok', inspection: ['ok', ''],
     storage: ['warn', 'Integración directa con S3: útil para cargas; valida tamaños y permisos.'],
     datastore: ['error', 'API Gateway no se conecta a bases de datos relacionales: pon una Lambda o servicio en medio.'],
     cache: ['error', 'API Gateway no se conecta a ElastiCache: pon un servicio en medio.'],
@@ -130,6 +132,12 @@ const M: Partial<Record<Role, Partial<Record<Role | '*', Rule>>>> = {
     '*': ['warn', 'La telemetría normalmente fluye HACIA CloudWatch; revisa la dirección.'],
   },
   netgw: { '*': 'ok' },
+  inspection: {
+    inspection: ['ok', ''], appliance: ['ok', ''], lb: ['ok', ''], compute: ['ok', ''], api: ['ok', ''], netgw: ['ok', ''], observability: 'ok',
+    datastore: ['error', 'Pon la aplicación entre la inspección y la base de datos.'],
+    '*': ['warn', 'La inspección normalmente va delante de un balanceador, del cómputo o de la salida a Internet.'],
+  },
+  appliance: { observability: 'ok', '*': ['warn', 'El firewall devuelve el tráfico al Gateway Load Balancer; no se conecta a otras piezas.'] },
   analytics: { storage: 'ok', datastore: 'ok', analytics: 'ok', observability: 'ok', '*': ['warn', 'Conexión poco común para un servicio analítico.'] },
   ai: { storage: 'ok', datastore: ['ok', ''], search: 'ok', observability: 'ok', '*': ['warn', 'Conexión poco común para un servicio de IA.'] },
   devops: { compute: 'ok', registry: 'ok', storage: 'ok', '*': ['warn', 'Conexión poco común para CI/CD.'] },

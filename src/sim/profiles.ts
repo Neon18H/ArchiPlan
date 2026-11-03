@@ -71,6 +71,17 @@ function rdsCapacity(cls: string): number {
   return bySize[size] ?? 1500;
 }
 
+/** Capacidad aproximada de un firewall virtual con inspección de amenazas (req/s de ~20 KB). Supuesto de orden de magnitud. */
+function applianceCapacity(type: string, decrypt: boolean, threats: boolean): number {
+  const az = type.match(/^standard_[a-z]+(\d+)/i);
+  const sizes: Record<string, number> = { large: 2, xlarge: 4, '2xlarge': 8, '4xlarge': 16, '8xlarge': 32, '9xlarge': 36 };
+  const vcpu = az ? Number(az[1]) : sizes[type.toLowerCase().split('.').pop() ?? 'xlarge'] ?? 4;
+  let per = vcpu * 1500;
+  if (threats) per *= 0.6;
+  if (decrypt) per *= 0.5;
+  return Math.round(per);
+}
+
 /** Capacidad aproximada de EC2 por tipo (req/s de una app web típica). */
 function ec2Capacity(type: string): number {
   // Azure: Standard_D2s_v5 → 2 vCPU ≈ 150 req/s por vCPU
@@ -119,6 +130,27 @@ export function profileFor(node: ServiceNode): SimProfile {
     case 'apigw':
       prof = base({ perInstance: 10000, latency: 10, basis: 'Throttling por cuenta y región: 10.000 req/s (ráfaga 5.000). El exceso recibe HTTP 429.', quota: '10.000 req/s por cuenta/región' });
       break;
+    case 'gwlb':
+    case 'gwlbe':
+      prof = base({ perInstance: INF, latency: 1, basis: 'Transparente: la capacidad la pone la flota de firewalls que tiene detrás.' });
+      break;
+    case 'ngfw': {
+      const count = Math.max(1, num('count', 2));
+      const asg = p.autoscaling !== false;
+      const per = applianceCapacity(String(p.instanceType ?? 'c5n.xlarge'), !!p.tlsDecryption, p.threatPrevention !== false);
+      prof = base({
+        perInstance: per,
+        instances: count,
+        maxInstances: asg ? count * 3 : count,
+        scale: asg ? 'asg' : 'none',
+        scaleDelay: 600,
+        latency: p.tlsDecryption ? 6 : 2,
+        replaceTime: asg ? 600 : INF,
+        multiAz: count >= 2,
+        basis: `${p.vendor ?? 'Firewall virtual'} en ${p.instanceType ?? 'c5n.xlarge'}: ~${per.toLocaleString('es-CO')} req/s por instancia${p.tlsDecryption ? ' con descifrado TLS (cuesta mucha CPU)' : ''} (supuesto). Una instancia nueva tarda ~10 min (arranque + bootstrap + licencia).`,
+      });
+      break;
+    }
     case 'natgw':
     case 'igw':
     case 'vpce':

@@ -123,6 +123,24 @@ export function estimateCost(n: ServiceNode, rps: number, opts: { respKb?: numbe
       const lcu = Math.max(1, rps / 100);
       return item(P.albMonth + lcu * P.lcuMonth, `Balanceador + ~${lcu.toFixed(1)} LCU${azure}`);
     }
+    case 'gwlb': {
+      const glcu = Math.max(0.1, (rps * 20 * 3600) / 1e6 / 1); // 1 GLCU ≈ 1 GB/h procesado
+      return item(0.0125 * H + glcu * 0.004 * H, `Gateway Load Balancer (0,0125 US$/h) + ~${glcu.toFixed(1)} GLCU (0,004 US$/GLCU‑h)${azure}`);
+    }
+    case 'gwlbe': {
+      const azs = p.perAz === false ? 1 : 2;
+      const gb = (req * 20) / 1e6;
+      return item(azs * 0.01 * H + gb * 0.0035, `${azs} endpoint(s) (0,01 US$/h por AZ) + ~${fmt(gb)} GB (0,0035 US$/GB)`);
+    }
+    case 'ngfw': {
+      const type = String(p.instanceType ?? 'c5n.xlarge');
+      const az = type.match(/^standard_[a-z]+(\d+)/i);
+      const hour = az ? Number(az[1]) * 0.048 : (P.ec2Hour[sizeOf(type)] ?? 0.1664) * (/^(m\d)/i.test(type) ? 2.3 : /^(c\d)/i.test(type) ? 2.05 : 1);
+      const own = String(p.vendor ?? '').startsWith('Suricata');
+      const lic = own || p.license === 'BYOL' ? 0 : 1.71;
+      const k = sc?.desired ?? Math.max(1, Number(p.count ?? 2));
+      return item(k * (hour + lic) * H, `${k} × ${type} (${hour.toFixed(3)} US$/h)${lic ? ` + licencia PAYG ~${lic} US$/h por instancia (referencia Palo Alto VM‑Series; varía por fabricante y bundle)` : p.license === 'BYOL' && !own ? ' · licencia BYOL comprada aparte' : ''}${azure}`);
+    }
     case 'natgw': {
       const gb = (req * 2) / 1e6;
       return item(P.natMonth + gb * P.natGb, `Hora del NAT + ~${fmt(gb)} GB procesados`);

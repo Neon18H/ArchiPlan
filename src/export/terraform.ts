@@ -560,6 +560,131 @@ resource "aws_wafv2_web_acl_association" "${name}_${tfName(t)}" {
   .join('')}`);
         break;
       }
+      case 'gwlb': {
+        const fws = outs(n).filter(({ t }) => t.data.serviceId === 'ngfw');
+        const stick = p.stickiness === '2-tupla' ? 'source_ip_dest_ip' : p.stickiness === '3-tupla' ? 'source_ip_dest_ip_proto' : null;
+        const fo = p.targetFailover === false ? 'no_rebalance' : 'rebalance';
+        block(`
+${header}
+resource "aws_lb" "${name}" {
+  name                             = substr("\${local.name}-${name.replace(/_/g, '-')}", 0, 32)
+  load_balancer_type               = "gateway"
+  subnets                          = ${subnets ?? '[] # TODO: subnets de la VPC de inspección'}
+  enable_cross_zone_load_balancing = ${!!p.crossZone}
+}
+
+resource "aws_lb_target_group" "${name}_fw" {
+  name        = substr("\${local.name}-${name.replace(/_/g, '-')}-fw", 0, 32)
+  port        = 6081
+  protocol    = "GENEVE"
+  vpc_id      = aws_vpc.main.id
+  target_type = "instance"
+  health_check {
+    port     = 80
+    protocol = "TCP"
+  }
+  target_failover {
+    on_deregistration = "${fo}"
+    on_unhealthy      = "${fo}"
+  }${stick ? `
+  stickiness {
+    enabled = true
+    type    = "${stick}"
+  }` : ''}
+}
+
+resource "aws_lb_listener" "${name}" {
+  load_balancer_arn = aws_lb.${name}.arn
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.${name}_fw.arn
+  }
+}
+
+# Servicio de endpoint: lo consumen los Gateway Load Balancer Endpoints de cada VPC inspeccionada
+resource "aws_vpc_endpoint_service" "${name}" {
+  acceptance_required        = false
+  gateway_load_balancer_arns = [aws_lb.${name}.arn]
+}
+
+# Si todos los firewalls fallan el health check, el GWLB les sigue enviando tráfico (fail-open): alarma
+resource "aws_cloudwatch_metric_alarm" "${name}_unhealthy" {
+  alarm_name          = "\${local.name}-${name.replace(/_/g, '-')}-firewalls-unhealthy"
+  namespace           = "AWS/GatewayELB"
+  metric_name         = "UnHealthyHostCount"
+  statistic           = "Maximum"
+  period              = 60
+  evaluation_periods  = 1
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  dimensions = {
+    LoadBalancer = aws_lb.${name}.arn_suffix
+    TargetGroup  = aws_lb_target_group.${name}_fw.arn_suffix
+  }
+}
+${fws.length ? '' : `# TODO: conecta ${n.data.label} a la flota de firewalls (NGFW) para registrar sus instancias
+`}`);
+        break;
+      }
+      case 'gwlbe': {
+        const gw = outs(n).find(({ t }) => t.data.serviceId === 'gwlb')?.t;
+        block(`
+${header}
+resource "aws_vpc_endpoint" "${name}" {
+  vpc_id            = aws_vpc.main.id
+  vpc_endpoint_type = "GatewayLoadBalancer"
+  service_name      = ${gw ? `aws_vpc_endpoint_service.${tfName(gw)}.service_name` : '"" # TODO: conecta este endpoint a un Gateway Load Balancer'}
+  subnet_ids        = ${subnets ? `[${subnets}[0]]` : '[] # TODO'}${p.perAz === false ? '' : ' # TODO: crea un endpoint por AZ (uno por subnet)'}
+}
+
+# TODO (rutas): para inspeccionar la entrada, asocia una tabla de rutas al Internet Gateway (edge association)
+# que envíe hacia la subnet del balanceador vía este endpoint, y la tabla de esa subnet devuelva 0.0.0.0/0 al mismo
+# endpoint. Las dos direcciones deben pasar por el MISMO endpoint (simetría) o el firewall descarta la respuesta.
+`);
+        break;
+      }
+      case 'ngfw': {
+        const gw = services.find((g) => g.data.serviceId === 'gwlb' && outs(g).some(({ t }) => t.id === n.id));
+        const sc = scalingOf(n);
+        const k = sc?.desired ?? Math.max(1, Number(p.count ?? 2));
+        const max = sc && ['cpu', 'requests', 'step'].includes(sc.policy) ? sc.max : k;
+        block(`
+${header}
+variable "${name}_ami_id" {
+  type        = string
+  description = "AMI del Marketplace de ${String(p.vendor ?? 'firewall')} (${p.license === 'BYOL' ? 'BYOL' : 'PAYG'}) en la región"
+}
+
+resource "aws_launch_template" "${name}" {
+  name_prefix   = "\${local.name}-${name.replace(/_/g, '-')}-"
+  image_id      = var.${name}_ami_id
+  instance_type = ${q(p.instanceType || 'c5n.xlarge')}${sg ? `
+  vpc_security_group_ids = [${sg}]` : ''}
+  metadata_options {
+    http_tokens = "required" # IMDSv2
+  }
+  # TODO: bootstrap del fabricante (p. ej. Palo Alto: init-cfg con plugin-op-commands=aws-gwlb-inspect:enable)
+  user_data = base64encode("")
+}
+
+resource "aws_autoscaling_group" "${name}" {
+  name                = "\${local.name}-${name.replace(/_/g, '-')}"
+  min_size            = ${k}
+  max_size            = ${Math.max(k, max)}
+  desired_capacity    = ${k}
+  vpc_zone_identifier = ${subnets ?? '[] # TODO'}
+  health_check_type   = "ELB"
+  launch_template {
+    id      = aws_launch_template.${name}.id
+    version = "$Latest"
+  }${gw ? `
+  target_group_arns   = [aws_lb_target_group.${tfName(gw)}_fw.arn]` : `
+  # TODO: conecta un Gateway Load Balancer a ${n.data.label}`}
+}
+${p.mgmtPublic ? `# ⚠ En ArchiPlan la interfaz de administración tiene IP pública: no la expongas; usa una subnet de gestión privada.
+` : ''}`);
+        break;
+      }
       case 'alb':
       case 'nlb': {
         const isAlb = n.data.serviceId === 'alb';
