@@ -19,6 +19,8 @@ interface Snapshot {
   threats: Record<string, ThreatState>;
   /** Security Groups definidos por el arquitecto. Vacío = modo automático (derivados de las flechas). */
   securityGroups: SecurityGroup[];
+  /** Seguridad del proyecto (prácticas y guardrails). */
+  security: Record<string, boolean>;
 }
 
 export interface Toast {
@@ -83,6 +85,7 @@ interface State extends Snapshot {
   allowInto: (nodeId: string, from: AccessSource, port: number) => void;
   removeRule: (sgId: string, dir: 'inbound' | 'outbound', ruleId: string) => void;
   /** Edita los grupos; si la red estaba automática, primero la vuelve personalizada. */
+  setSecurity: (patch: Record<string, boolean>) => void;
   editSecurityGroups: (fn: (groups: SecurityGroup[]) => SecurityGroup[], coalesceKey?: string) => void;
 
   loadProject: (p: Project, projectId?: string | null) => void;
@@ -126,7 +129,7 @@ function loadAutosave(): Partial<State> | null {
     if (!raw) return null;
     const p = JSON.parse(raw) as Project & { projectId?: string | null };
     if (p.format !== 'archiplan') return null;
-    return { nodes: sortNodes(p.nodes), edges: p.edges, decisions: p.decisions ?? [], threats: p.threats ?? {}, securityGroups: p.securityGroups ?? [], meta: { ...emptyMeta(), ...p.meta }, projectId: p.projectId ?? null };
+    return { nodes: sortNodes(p.nodes), edges: p.edges, decisions: p.decisions ?? [], threats: p.threats ?? {}, securityGroups: p.securityGroups ?? [], security: p.security ?? {}, meta: { ...emptyMeta(), ...p.meta }, projectId: p.projectId ?? null };
   } catch {
     return null;
   }
@@ -253,7 +256,7 @@ function batched(get: () => State, set: (p: Partial<State>) => void, fn: () => v
     set({ commit });
   }
 }
-const snap = (s: Snapshot): Snapshot => ({ nodes: s.nodes, edges: s.edges, decisions: s.decisions, meta: s.meta, threats: s.threats, securityGroups: s.securityGroups });
+const snap = (s: Snapshot): Snapshot => ({ nodes: s.nodes, edges: s.edges, decisions: s.decisions, meta: s.meta, threats: s.threats, securityGroups: s.securityGroups, security: s.security });
 
 /** Al cambiar el puerto de una pieza, actualiza las etiquetas de las flechas que lo mencionan. */
 function relabelPort(edges: AppEdge[], nodes: AppNode[], id: string, oldPort: number, newPort: number): AppEdge[] {
@@ -277,6 +280,7 @@ export const useStore = create<State>((set, get) => ({
   decisions: init?.decisions ?? [],
   threats: init?.threats ?? {},
   securityGroups: init?.securityGroups ?? [],
+  security: init?.security ?? {},
   meta: init?.meta ?? emptyMeta(),
   projectId: init?.projectId ?? null,
   dirty: false,
@@ -537,7 +541,7 @@ export const useStore = create<State>((set, get) => ({
     for (const sp of fix.setProps ?? []) {
       nodes = nodes.map((n) => (n.id === sp.nodeId ? ({ ...n, data: { ...n.data, props: { ...n.data.props, ...sp.props } } } as AppNode) : n));
     }
-    set({ nodes, edges, dirty: true });
+    set({ nodes, edges, dirty: true, ...(fix.security ? { security: { ...get().security, ...fix.security } } : {}) });
     get().toast('ok', `Aplicado: ${fix.label}`);
     if (created.length) get().focus(created);
   },
@@ -728,6 +732,10 @@ export const useStore = create<State>((set, get) => ({
     if (g.inbound.some((r) => ruleCovers(r, port) && JSON.stringify(r.peer) === JSON.stringify(peer))) return;
     get().setSecurityGroups(get().securityGroups.map((x) => (x.id === sgId ? { ...x, inbound: [...x.inbound, { id: uid('r'), protocol: 'tcp', from: port, to: port, peer, description: `Desde ${who}` }] } : x)));
   }),
+  setSecurity: (patch) => {
+    get().commit('security');
+    set({ security: { ...get().security, ...patch } });
+  },
   removeRule: (sgId, dir, ruleId) => get().editSecurityGroups((gs) => gs.map((g) => (g.id === sgId ? { ...g, [dir]: g[dir].filter((r) => r.id !== ruleId) } : g))),
   editSecurityGroups: (fn, coalesceKey) => {
     if (!get().securityGroups.length) {
@@ -818,6 +826,7 @@ export const useStore = create<State>((set, get) => ({
       decisions: p.decisions ?? [],
       threats: p.threats ?? {},
       securityGroups: p.securityGroups ?? [],
+      security: p.security ?? {},
       meta: { ...emptyMeta(), ...p.meta },
       projectId,
       dirty: false,
@@ -846,7 +855,7 @@ export const useStore = create<State>((set, get) => ({
     get().loadProject({ format: 'archiplan', version: 1, meta: emptyMeta(), nodes: [], edges: [], decisions: [], threats: {} }, null);
   },
   toProject: () => {
-    const { nodes, edges, decisions, meta, threats, securityGroups } = get();
+    const { nodes, edges, decisions, meta, threats, securityGroups, security } = get();
     return {
       format: 'archiplan',
       version: 1,
@@ -864,6 +873,7 @@ export const useStore = create<State>((set, get) => ({
       decisions,
       threats,
       ...(securityGroups.length ? { securityGroups } : {}),
+      ...(Object.keys(security).length ? { security } : {}),
     };
   },
   setProjectId: (id) => set({ projectId: id }),
@@ -975,7 +985,7 @@ export const useStore = create<State>((set, get) => ({
 // Autoguardado local (por si se cierra el navegador)
 let t: ReturnType<typeof setTimeout> | undefined;
 useStore.subscribe((s, prev) => {
-  if (s.nodes === prev.nodes && s.edges === prev.edges && s.decisions === prev.decisions && s.meta === prev.meta && s.threats === prev.threats && s.securityGroups === prev.securityGroups && s.projectId === prev.projectId) return;
+  if (s.nodes === prev.nodes && s.edges === prev.edges && s.decisions === prev.decisions && s.meta === prev.meta && s.threats === prev.threats && s.securityGroups === prev.securityGroups && s.security === prev.security && s.projectId === prev.projectId) return;
   clearTimeout(t);
   t = setTimeout(() => {
     try {

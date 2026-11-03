@@ -40,9 +40,6 @@ export const AZURE_SERVICES: ServiceDef[] = [
     { key: 'instanceType', label: 'Tamaño de VM', type: 'text', default: 'Standard_D2s_v5' },
     { key: 'count', label: 'Instancias', type: 'number', default: 2, min: 1, max: 1000 },
     { key: 'autoscaling', label: 'Autoescalado', type: 'bool', default: true },
-    { key: 'minSize', label: 'Autoescalado · mínimo', type: 'number', default: 2, min: 0, max: 1000, help: 'Instancias mínimas del scale set.' },
-    { key: 'maxSize', label: 'Autoescalado · máximo', type: 'number', default: 6, min: 1, max: 1000, help: 'Tope de instancias al escalar.' },
-    { key: 'targetCpu', label: 'Autoescalado · CPU objetivo (%)', type: 'number', default: 60, min: 10, max: 95, help: 'Target tracking: escala cuando la utilización supera este valor.' },
   ] }),
   A({ id: 'az-functions', equiv: 'lambda', name: 'Azure Functions', short: 'FN', category: 'compute', role: 'compute', layer: 'aplicacion', zones: ['outside', 'region', 'subnet-private'], description: 'Funciones serverless por eventos (Flex Consumption).', inboundProtocol: 'Invoke', props: [
     { key: 'runtime', label: 'Runtime', type: 'select', default: 'node 20', options: ['node 20', 'python 3.11', 'dotnet 8 isolated', 'java 17'] },
@@ -54,8 +51,6 @@ export const AZURE_SERVICES: ServiceDef[] = [
     { key: 'cpu', label: 'CPU (1024 = 1 vCPU)', type: 'number', default: 512 },
     { key: 'memory', label: 'Memoria (MB)', type: 'number', default: 1024 },
     { key: 'desired', label: 'Réplicas mínimas', type: 'number', default: 2, min: 0 },
-    { key: 'maxTasks', label: 'Réplicas máximas', type: 'number', default: 10, min: 1, max: 300 },
-    { key: 'targetCpu', label: 'Escalado · CPU objetivo (%)', type: 'number', default: 60, min: 10, max: 95 },
     { key: 'image', label: 'Imagen', type: 'text', default: 'app:latest' },
   ] }),
   A({ id: 'az-aks', equiv: 'eks', name: 'Azure Kubernetes Service', short: 'AKS', category: 'containers', role: 'compute', layer: 'aplicacion', zones: [...VNET_APP], vpcBound: true, description: 'Kubernetes administrado.', inboundProtocol: 'HTTP', props: [{ key: 'version', label: 'Versión K8s', type: 'text', default: '1.30' }, { key: 'nodes', label: 'Nodos', type: 'number', default: 3, min: 1 }] }),

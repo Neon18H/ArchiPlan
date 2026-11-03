@@ -145,6 +145,13 @@ function serviceOverride(srcDef: ServiceDef, tgtDef: ServiceDef): Rule | null {
   }
   if (src.id === 'apigw' && tgt.id === 'dynamodb') return ['ok', 'Integración directa de servicio (sin Lambda).'];
   if (src.id === 'firehose' && tgt.id === 'redshift') return 'ok';
+  // Reglas de IoT Core y resolvers de AppSync escriben directo en servicios de datos administrados
+  if (src.id === 'iotcore' && ['datastore', 'storage', 'stream', 'queue', 'topic', 'compute', 'eventbus'].includes(tgt.role) && !tgt.vpcBound) return ['ok', 'Regla de IoT: escribe directo en el servicio.'];
+  if (src.id === 'appsync' && ((['datastore', 'search'].includes(tgt.role) && !tgt.vpcBound) || tgt.id === 'aurora')) return ['ok', 'Resolver directo de AppSync (VTL/JS).'];
+  if (src.id === 'transferfamily' && ['storage'].includes(tgt.role)) return ['ok', 'Transfer Family guarda los archivos en S3/EFS.'];
+  if (src.id === 'scheduler') return ['compute', 'workflow', 'queue', 'topic', 'eventbus'].includes(tgt.role) ? 'ok' : ['warn', 'EventBridge Scheduler invoca Lambda, Step Functions, SQS, SNS o ECS.'];
+  if (src.id === 'globalaccelerator') return ['lb', 'compute'].includes(tgt.role) ? 'ok' : ['warn', 'Global Accelerator apunta a ALB, NLB o EC2.'];
+  if (tgt.id === 'dax' && src.role !== 'compute') return ['warn', 'DAX se usa desde la aplicación (SDK de DAX).'];
   if (src.role === 'compute' && tgt.id === 'igw') return ['warn', 'El cómputo en subnet privada sale por un NAT Gateway, no directo por el IGW.'];
   if (src.id === 'shield') return ['cdn', 'lb', 'api', 'dns'].includes(tgt.role) ? 'ok' : ['error', 'Shield protege CloudFront, Route 53, ALB o API Gateway.'];
   if (src.id === 'guardduty') return ['topic', 'eventbus', 'observability', 'compute'].includes(tgt.role) ? 'ok' : ['warn', 'GuardDuty normalmente envía hallazgos a EventBridge/SNS.'];

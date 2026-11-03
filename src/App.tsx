@@ -9,6 +9,8 @@ import { ExportModal, ProjectsModal, TemplatesModal, WizardModal } from './compo
 import { Palette } from './components/Palette';
 import { Sidebar } from './components/Sidebar';
 import { SimPanel } from './components/SimPanel';
+import { SecurityModal } from './components/SecurityPanel';
+import { AiButton, AiPanel, AiWatcher } from './components/AiPanel';
 import { NetLegend, NetModal, netViewData, useNetUi } from './components/NetInspector';
 import { useSim } from './sim/store';
 import { buildThreats } from './threats/model';
@@ -25,7 +27,7 @@ import { traceOverlay } from './net/trace';
 import { useStore } from './store';
 import type { Layer, Severity } from './types';
 
-type ModalKind = 'templates' | 'wizard' | 'projects' | 'export' | 'net' | null;
+type ModalKind = 'templates' | 'wizard' | 'projects' | 'export' | 'net' | 'security' | 'ai' | null;
 
 function Menu({ label, children }: { label: React.ReactNode; children: (close: () => void) => React.ReactNode }) {
   const [open, setOpen] = useState(false);
@@ -63,7 +65,7 @@ function Toolbar({ openModal, onSave, issuesCount }: { openModal: (m: ModalKind)
           <rect width="32" height="32" rx="7" fill="#e8590c" />
           <path d="M8 22h16M10 22V12h4v10M18 22V8h4v14" stroke="#fff" strokeWidth="2.4" fill="none" />
         </svg>
-        <span>ArchiPlan</span>
+        <span className="wide-only">ArchiPlan</span>
       </div>
       <input className="proj-name" value={meta.name} onChange={(e) => setMeta({ name: e.target.value })} aria-label="Nombre del proyecto" />
       {dirty && <span className="dirty" title="Cambios sin guardar en disco">●</span>}
@@ -112,26 +114,28 @@ function Toolbar({ openModal, onSave, issuesCount }: { openModal: (m: ModalKind)
         <button className="tb-icon" onClick={redo} disabled={!future} title="Rehacer (Ctrl+Y)">
           ↷
         </button>
-        <button className="tb-btn" onClick={autoLayout} disabled={view !== 'c2'} title="Reordena las piezas por zona y capa">
-          Auto‑organizar
+        <button className="tb-btn" onClick={autoLayout} disabled={view !== 'c2'} title="Auto-organizar: reordena las piezas por zona y capa" aria-label="Auto-organizar">
+          <span aria-hidden className="narrow-only">⇲</span>
+          <span className="wide-only">Auto‑organizar</span>
         </button>
       </div>
 
       <div className="tb-group">
         <NetButton />
         <SimToggle />
+        <AiButton />
       </div>
 
       <div className="tb-group">
         <div className="seg" role="tablist" aria-label="Nivel C4">
-          <button className={view === 'c1' ? 'on' : ''} onClick={() => setView('c1')} title="C4 nivel 1: actores, sistema y externos">
-            C1 Contexto
+          <button className={view === 'c1' ? 'on' : ''} onClick={() => setView('c1')} aria-label="C1 Contexto" title="C4 nivel 1: actores, sistema y externos">
+            C1<span className="wide-only"> Contexto</span>
           </button>
-          <button className={view === 'c2' ? 'on' : ''} onClick={() => setView('c2')} title="C4 nivel 2: contenedores / servicios">
-            C2 Contenedores
+          <button className={view === 'c2' ? 'on' : ''} onClick={() => setView('c2')} aria-label="C2 Contenedores" title="C4 nivel 2: contenedores / servicios">
+            C2<span className="wide-only"> Contenedores</span>
           </button>
-          <button className={view === 'c3' ? 'on' : ''} disabled={!c3Ready} onClick={() => setView('c3')} title={c3Ready ? 'C4 nivel 3: componentes del servicio' : 'Selecciona una pieza de cómputo o haz doble clic sobre ella'}>
-            C3 Componentes
+          <button className={view === 'c3' ? 'on' : ''} disabled={!c3Ready} onClick={() => setView('c3')} aria-label="C3 Componentes" title={c3Ready ? 'C4 nivel 3: componentes del servicio' : 'Selecciona una pieza de cómputo o haz doble clic sobre ella'}>
+            C3<span className="wide-only"> Componentes</span>
           </button>
         </div>
         <Menu label={layers.length ? `Capas (${layers.length})` : 'Capas'}>
@@ -252,7 +256,8 @@ export default function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const netAnalysis = useMemo(() => analyzeNetwork(nodes, edges, securityGroups), [structKey, securityGroups]); // eslint-disable-line react-hooks/exhaustive-deps
   const issues = useMemo(() => [...validate(nodes, edges), ...netIssues(netAnalysis, nodes)], [structKey, netAnalysis]); // eslint-disable-line react-hooks/exhaustive-deps
-  const threatModel = useMemo(() => buildThreats(nodes, edges, threatState), [structKey, threatState]); // eslint-disable-line react-hooks/exhaustive-deps
+  const security = useStore((s) => s.security);
+  const threatModel = useMemo(() => buildThreats(nodes, edges, threatState, { security, securityGroups }), [structKey, threatState, security, securityGroups]); // eslint-disable-line react-hooks/exhaustive-deps
   const guide = useMemo(() => buildGuide(nodes, edges, decisions, issues, threatModel.threats), [structKey, decisions, issues, threatModel]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const ctx = useMemo(() => {
@@ -357,6 +362,7 @@ export default function App() {
             <div className={`center ${simOpen ? 'with-sim' : ''}`}>
               {view === 'c3' ? <C3Canvas /> : <Canvas />}
               {netViewOn && view === 'c2' && <NetLegend />}
+              <AiPanel issues={issues} threats={threatModel.threats} />
               {simOpen && view !== 'c3' && <SimPanel />}
             </div>
             <Sidebar issues={issues} guide={guide} threats={threatModel.threats} />
@@ -366,6 +372,8 @@ export default function App() {
           {modal === 'projects' && <ProjectsModal onClose={() => setModal(null)} />}
           {modal === 'export' && <ExportModal onClose={() => setModal(null)} />}
           {modal === 'net' && <NetModal onClose={() => setModal(null)} />}
+          <AiWatcher issues={issues} threats={threatModel.threats} />
+          {modal === 'security' && <SecurityModal onClose={() => setModal(null)} threats={threatModel.threats} />}
           <Toasts />
         </div>
       </CanvasContext.Provider>

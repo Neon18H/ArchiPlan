@@ -304,27 +304,6 @@ export function analyzeNetwork(nodes: AppNode[], edges: AppEdge[], groups?: Secu
     }
     for (const n of services) if (needsSg(n, map) && !net.sgIdsOf(n).length) general.push({ nodeIds: [n.id], id: `nosg:${n.id}`, ok: false, severity: 'warn', title: `${n.data.label} no tiene ${SG}`, detail: `Se le aplicaría el grupo por defecto. Asígnale un ${SG}.` });
   }
-  // Auto Scaling coherente
-  for (const n of services) {
-    const p = n.data.props;
-    if (('minSize' in p || 'maxSize' in p || 'maxTasks' in p) && p.autoscaling !== false) {
-      const min = p.minSize !== undefined ? Number(p.minSize) : 0;
-      const max = Number(p.maxSize ?? p.maxTasks);
-      const des = Number(p.count ?? p.desired);
-      if (Number.isFinite(max) && Number.isFinite(des) && (min > max || des < min || des > max))
-        general.push({
-          id: `asg:${n.id}`,
-          nodeIds: [n.id],
-          ok: false,
-          severity: 'error',
-          title: `${n.data.label}: Auto Scaling incoherente`,
-          detail: `Debe cumplirse mínimo ≤ deseado ≤ máximo (hoy ${'minSize' in p ? `${min} ≤ ` : ''}${des} ≤ ${max}). AWS/Azure rechazan esta configuración.`,
-          fix: { kind: 'service', fix: { label: 'Ajustar límites', setProps: [{ nodeId: n.id, props: 'minSize' in p ? { minSize: Math.min(min, des), maxSize: Math.max(max, des) } : { maxTasks: Math.max(max, des) } }] }, label: 'Ajustar límites' },
-        });
-      else if (Number.isFinite(max) && max === des && des > 0 && p.autoscaling !== undefined)
-        general.push({ nodeIds: [n.id], id: `asg-flat:${n.id}`, ok: false, severity: 'warn', title: `${n.data.label}: el máximo es igual al deseado`, detail: 'El grupo nunca podrá crecer ante un pico de tráfico.' });
-    }
-  }
   return { mode: net.mode, net, verdicts, general };
 }
 

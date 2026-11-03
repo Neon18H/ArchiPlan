@@ -1,6 +1,7 @@
 import { getService } from '../catalog/catalog';
 import { byId, isService, isZone, placementOf } from '../lib/graph';
 import type { AppEdge, AppNode, ConnData, ProjectMeta, SecurityGroup, ServiceNode } from '../types';
+import { scalingOf } from '../scaling/model';
 import { effectiveNet, listenPort, targetOf } from '../net/model';
 
 /**
@@ -828,7 +829,7 @@ resource "azurerm_linux_virtual_machine_scale_set" "${name}" {
     type = "SystemAssigned"
   }
 }
-${p.autoscaling ? `
+${['cpu', 'requests', 'step'].includes(scalingOf(n)!.policy) ? `
 resource "azurerm_monitor_autoscale_setting" "${name}" {
   name                = "autoscale-${name.replace(/_/g, '-')}"
   ${RG}
@@ -838,8 +839,8 @@ resource "azurerm_monitor_autoscale_setting" "${name}" {
     name = "default"
     capacity {
       default = ${count}
-      minimum = ${p.minSize !== undefined ? Math.min(count, Number(p.minSize)) : count}
-      maximum = ${p.maxSize !== undefined ? Math.max(count, Number(p.maxSize)) : count * 3}
+      minimum = ${scalingOf(n)!.min}
+      maximum = ${scalingOf(n)!.max}
     }
     rule {
       metric_trigger {
@@ -850,12 +851,12 @@ resource "azurerm_monitor_autoscale_setting" "${name}" {
         time_window        = "PT5M"
         time_aggregation   = "Average"
         operator           = "GreaterThan"
-        threshold          = ${Number(p.targetCpu) || 70}
+        threshold          = ${scalingOf(n)!.policy === 'step' ? scalingOf(n)!.stepThreshold : scalingOf(n)!.targetCpu}
       }
       scale_action {
         direction = "Increase"
         type      = "ChangeCount"
-        value     = "1"
+        value     = "${scalingOf(n)!.policy === 'step' ? scalingOf(n)!.stepAdd : 1}"
         cooldown  = "PT5M"
       }
     }
@@ -972,8 +973,8 @@ resource "azurerm_container_app" "${name}" {
     identity = "System"
   }` : ''}
   template {
-    min_replicas = ${desired}
-    max_replicas = ${Math.max(desired * 5, 10)}
+    min_replicas = ${scalingOf(n)!.min}
+    max_replicas = ${['cpu', 'requests', 'step'].includes(scalingOf(n)!.policy) ? scalingOf(n)!.max : scalingOf(n)!.desired}
     container {
       name   = ${q(name.replace(/_/g, '-').slice(0, 30))}
       image  = ${q(p.image || 'mcr.microsoft.com/k8se/quickstart:latest')} # TODO: imagen de tu registro
@@ -982,7 +983,7 @@ resource "azurerm_container_app" "${name}" {
     }
     http_scale_rule {
       name                = "http"
-      concurrent_requests = "50"
+      concurrent_requests = "${scalingOf(n)!.targetRequests}"
     }
   }
   ingress {
@@ -1014,8 +1015,8 @@ resource "azurerm_kubernetes_cluster" "${name}" {
     name                 = "system"
     vm_size              = "Standard_D4s_v5"
     auto_scaling_enabled = true
-    min_count            = ${nodesN}
-    max_count            = ${nodesN * 3}
+    min_count            = ${scalingOf(n)!.min}
+    max_count            = ${scalingOf(n)!.policy === 'cpu' ? scalingOf(n)!.max : nodesN}
     zones                = ["1", "2", "3"]${subnet ? `
     vnet_subnet_id       = ${subnet}` : ''}
   }

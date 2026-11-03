@@ -84,6 +84,20 @@ export function defaultPort(n: ServiceNode): number {
       return n.data.serviceId === 'az-files' ? 445 : 2049;
     case 'opensearch':
       return 443;
+    case 'neptune':
+      return 8182;
+    case 'memorydb':
+      return 6379;
+    case 'dax':
+      return 8111;
+    case 'mq':
+      return String(p.engine ?? 'RabbitMQ') === 'ActiveMQ' ? 61617 : 5671;
+    case 'fsx':
+      return String(p.type ?? 'WINDOWS') === 'WINDOWS' ? 445 : String(p.type) === 'LUSTRE' ? 988 : 2049;
+    case 'directoryservice':
+      return 389;
+    case 'beanstalk':
+      return 8080;
     case 'ec2':
     case 'ecs':
     case 'eks':
@@ -228,7 +242,7 @@ export function generateSecurityGroups(nodes: AppNode[], edges: AppEdge[]): Gene
     const ports = isLb(sem.to) ? [...new Set([sem.port, ...listenersOf(sem.to).map((l) => l.port)])] : [sem.port];
     for (const port of ports) {
       if (inVpc(from, map) && byNode(from.id)) addIn(g, port, { kind: 'sg', sgId: byNode(from.id)!.id }, `Desde ${from.data.label}`);
-      else if (role(from) === 'cdn') addIn(g, port, { kind: 'prefix', value: 'cdn' }, `Desde ${from.data.label}`);
+      else if (role(from) === 'cdn' && lid(from) !== 'globalaccelerator') addIn(g, port, { kind: 'prefix', value: 'cdn' }, `Desde ${from.data.label}`);
       else addIn(g, port, { kind: 'cidr', value: '0.0.0.0/0' }, role(from) === 'dns' ? 'Clientes de Internet' : `Desde ${from.data.label} (Internet)`);
     }
   }

@@ -1,3 +1,4 @@
+import { scalingOf, scalingProblems } from '../scaling/model';
 import { coverage } from '../c3/model';
 import { cloudText, getService, lid, PLACEMENT_LABEL, primaryCloud, ZONE_PARENT, ZONES } from '../catalog/catalog';
 import { ancestors, byId, isService, isZone, placementOf } from '../lib/graph';
@@ -95,7 +96,7 @@ export function validate(nodes: AppNode[], edges: AppEdge[]): Issue[] {
     if (!['datastore', 'cache', 'search'].includes(d.role)) continue;
     const exposed = incoming(n.id).some((e) => {
       const s = map.get(e.source) as ServiceNode;
-      return s && ['actor', 'external', 'dns', 'cdn', 'lb', 'api'].includes(svc(s).role) && !(svc(s).id === 'apigw' && d.id === 'dynamodb');
+      return s && ['actor', 'external', 'dns', 'cdn', 'lb', 'api'].includes(svc(s).role) && !(svc(s).id === 'apigw' && d.id === 'dynamodb') && !(['iotcore', 'appsync'].includes(svc(s).id) && !d.vpcBound);
     });
     if (exposed) push({ severity: 'error', title: `${name(n)} expuesto a Internet`, detail: 'La capa de datos solo debe ser accesible desde la capa de aplicación.', nodeIds: [n.id] });
   }
@@ -132,17 +133,24 @@ export function validate(nodes: AppNode[], edges: AppEdge[]): Issue[] {
     }
   }
 
+  // ── 6b. Escalado configurado
+  for (const n of services)
+    for (const pr of scalingProblems(n))
+      push({ severity: pr.severity, title: pr.title, detail: pr.detail, nodeIds: [n.id], ...(pr.props ? { fix: { label: 'Corregir escalado', setProps: [{ nodeId: n.id, props: pr.props }] } } : {}) });
+
   // ── 7. Alta disponibilidad
   for (const n of services) {
     const p = n.data.props;
     switch (lid(n)) {
-      case 'ec2':
-        if (Number(p.count) < 2 && !p.autoscaling)
-          push({ severity: 'warn', title: `${name(n)} es un punto único de falla`, detail: 'Una sola instancia sin Auto Scaling. Usa ≥2 instancias en distintas AZ.', nodeIds: [n.id], fix: { label: 'Activar Auto Scaling (2+)', setProps: [{ nodeId: n.id, props: { count: 2, autoscaling: true } }] } });
+      case 'ec2': {
+        const sc = scalingOf(n);
+        if (sc && sc.desired < 2 && (sc.policy === 'manual' || sc.policy === 'fixed'))
+          push({ severity: 'warn', title: `${name(n)} es un punto único de falla`, detail: 'Una sola instancia y sin autoescalado. Usa ≥2 instancias en distintas AZ.', nodeIds: [n.id], fix: { label: 'Escalar por CPU con 2+', setProps: [{ nodeId: n.id, props: { count: 2, autoscaling: true, scalePolicy: 'cpu', minSize: 2 } }] } });
         break;
+      }
       case 'ecs':
         if (Number(p.desired) < 2)
-          push({ severity: 'warn', title: `${name(n)} con una sola tarea`, detail: 'Con 1 tarea no hay tolerancia a fallos ni despliegues sin corte.', nodeIds: [n.id], fix: { label: 'Usar 2 tareas', setProps: [{ nodeId: n.id, props: { desired: 2 } }] } });
+          push({ severity: 'warn', title: `${name(n)} con una sola tarea`, detail: 'Con 1 tarea no hay tolerancia a fallos ni despliegues sin corte.', nodeIds: [n.id], fix: { label: 'Usar 2 tareas', setProps: [{ nodeId: n.id, props: { desired: 2, minSize: 2 } }] } });
         break;
       case 'rds':
         if (!p.multiAZ)

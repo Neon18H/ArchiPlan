@@ -18,6 +18,9 @@ import type { C3Model, ComponentKind } from '../types';
 import { summarizeThreats, type Threat } from '../threats/model';
 import { useThreatsUi } from '../threats/ui';
 import { EdgeNetSection, NetSection, useNetUi } from './NetInspector';
+import { ScalingSection } from './ScalingInspector';
+import { openSecurity } from './SecurityPanel';
+import { SCALING_KEYS, scalingKind } from '../scaling/model';
 
 type Tab = 'props' | 'issues' | 'guide' | 'adr' | 'threats';
 
@@ -303,6 +306,7 @@ function ServiceInspector({ node, issues }: { node: ServiceNode; issues: Issue[]
   const place = placementOf(node, map);
   const conns = edges.filter((e) => e.source === node.id || e.target === node.id);
   const netView = useNetUi((s) => s.view);
+  const configProps = (def.props ?? []).filter((p) => !(scalingKind(node) && SCALING_KEYS.has(p.key)));
   return (
     <div className="inspector">
       <div className="insp-head">
@@ -324,10 +328,11 @@ function ServiceInspector({ node, issues }: { node: ServiceNode; issues: Issue[]
       </div>
       <NodeIssues id={node.id} issues={issues} />
       {netView && <NetSection node={node} />}
-      {def.props?.length ? (
+      <ScalingSection node={node} />
+      {configProps.length ? (
         <div className="insp-section">
           <div className="insp-section-title">Configuración</div>
-          {def.props.map((p) => (
+          {configProps.map((p) => (
             <PropInput key={p.key} def={p} value={node.data.props[p.key]} onChange={(v) => updateNode(node.id, { props: { [p.key]: v } })} />
           ))}
         </div>
@@ -401,16 +406,10 @@ function SimSection({ node }: { node: ServiceNode }) {
           <Field label="Duración media (ms)">
             <input type="number" min={1} value={Number(node.data.props['sim.durationMs'] ?? 120)} onChange={(e) => setProp('sim.durationMs', Number(e.target.value))} />
           </Field>
-          <Field label="Concurrencia máx.">
+          <Field label="Concurrencia de la cuenta">
             <input type="number" min={1} value={Number(node.data.props['sim.concurrency'] ?? 1000)} onChange={(e) => setProp('sim.concurrency', Number(e.target.value))} />
           </Field>
         </div>
-      )}
-      {lidOf(node.data.serviceId) === 'ecs' && (
-        <label className="toggle">
-          <input type="checkbox" checked={node.data.props['sim.autoscaling'] === undefined ? true : !!node.data.props['sim.autoscaling']} onChange={(e) => setProp('sim.autoscaling', e.target.checked)} />
-          <span>Service Auto Scaling</span>
-        </label>
       )}
     </div>
   );
@@ -544,6 +543,9 @@ function ProjectInspector() {
         </Field>
       </div>
       <CloudSection />
+      <button className="btn block" onClick={openSecurity}>
+        ⚙ Seguridad del proyecto (guardrails y prácticas)
+      </button>
       <Field label={`Región ${CLOUD_LABEL[cloud]} por defecto`}>
         <input value={meta.region} onChange={(e) => setMeta({ region: e.target.value })} />
       </Field>

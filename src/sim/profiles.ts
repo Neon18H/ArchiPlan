@@ -6,6 +6,7 @@
  * sobrescribir su capacidad desde el inspector (props `sim.capacity` y `sim.instances`).
  */
 import { getService, lidOf } from '../catalog/catalog';
+import { describeScaling, scalingOf } from '../scaling/model';
 import type { ServiceNode } from '../types';
 
 export type ScaleMode = 'none' | 'asg' | 'instant' | 'serverless-db';
@@ -38,6 +39,12 @@ export interface SimProfile {
   passive?: boolean;
   /** Utilización objetivo del autoescalado (0‑1). Por defecto 0,7. */
   targetUtil?: number;
+  /** Escalado por pasos: instancias que se agregan de golpe. */
+  stepAdd?: number;
+  /** Métrica con la que escala (para explicar los eventos). */
+  scaleMetric?: 'cpu' | 'requests' | 'step' | 'capacity';
+  /** Objetivo de peticiones por instancia (política por peticiones). */
+  targetRequests?: number;
 }
 
 const INF = Number.POSITIVE_INFINITY;
@@ -168,11 +175,11 @@ export function profileFor(node: ServiceNode): SimProfile {
     }
     case 'eks': {
       const n = Math.max(1, num('nodes', 3));
-      prof = base({ perInstance: 400, instances: n, maxInstances: n * 3, scale: 'asg', scaleDelay: 150, latency: 40, replaceTime: 240, multiAz: n >= 2, basis: '~400 req/s por nodo; Cluster Autoscaler agrega nodos en ~2‑3 min.' });
+      prof = base({ perInstance: 400, instances: n, maxInstances: n * 3, scale: 'asg', scaleDelay: 150, latency: 40, replaceTime: 240, multiAz: n >= 2, basis: '~400 req/s por nodo.' });
       break;
     }
     case 'apprunner':
-      prof = base({ perInstance: 100, instances: 1, maxInstances: 25, scale: 'asg', scaleDelay: 60, latency: 50, replaceTime: 60, basis: '100 requests concurrentes por instancia, hasta 25 instancias.' });
+      prof = base({ perInstance: 100, instances: 1, maxInstances: 25, scale: 'asg', scaleDelay: 60, latency: 50, replaceTime: 60, basis: '~100 req/s por instancia (100 peticiones concurrentes).' });
       break;
     case 'ecr':
       prof = base({ perInstance: INF, latency: 0, basis: 'Solo se usa al desplegar.', passive: true });
@@ -288,9 +295,75 @@ export function profileFor(node: ServiceNode): SimProfile {
     case 'sagemaker':
       prof = base({ perInstance: 200, latency: 100, basis: '~200 inferencias/s por instancia del endpoint.' });
       break;
+    case 'beanstalk':
+      prof = base({ perInstance: ec2Capacity(String(p.instanceType ?? 't3.medium')), instances: 2, maxInstances: 6, scale: 'asg', scaleDelay: 180, latency: 40, replaceTime: 240, multiAz: true, basis: `${p.instanceType ?? 't3.medium'}: ~${ec2Capacity(String(p.instanceType ?? 't3.medium'))} req/s por instancia.` });
+      break;
+    case 'lightsail': {
+      const per = String(p.bundle ?? '').startsWith('nano') ? 40 : String(p.bundle ?? '').startsWith('medium') ? 300 : String(p.bundle ?? '').startsWith('large') ? 500 : 150;
+      prof = base({ perInstance: per, latency: 40, multiAz: false, replaceTime: INF, basis: `Una instancia de precio fijo: ~${per} req/s (supuesto). No escala ni se reemplaza sola.` });
+      break;
+    }
+    case 'globalaccelerator':
+      prof = base({ perInstance: INF, latency: 5, basis: 'Red global de AWS con IPs anycast; no limita el throughput.' });
+      break;
+    case 'appsync':
+      prof = base({ perInstance: 2000, latency: 20, basis: 'GraphQL administrado; supuesto de ~2.000 req/s (la cuota real por API es ajustable).', quota: 'Peticiones por segundo por API (ajustable)' });
+      break;
+    case 'iotcore':
+      prof = base({ perInstance: 20000, latency: 20, basis: 'Mensajes MQTT; supuesto de ~20.000 msg/s por cuenta (cuotas ajustables).' });
+      break;
+    case 'transferfamily':
+      prof = base({ perInstance: 100, latency: 200, basis: 'Sesiones SFTP concurrentes: supuesto de ~100 operaciones/s.' });
+      break;
+    case 'mq': {
+      const multi = p.multiAZ !== false;
+      prof = base({ perInstance: 5000, latency: 10, stateful: true, multiAz: multi, failoverTime: multi ? 60 : INF, basis: `Broker mq.m5.large: ~5.000 msg/s (supuesto). ${multi ? 'Multi‑AZ: failover ~1 min.' : 'Una sola instancia: si cae, se detiene la mensajería.'}` });
+      break;
+    }
+    case 'neptune': {
+      const n = Math.max(1, num('instances', 2));
+      prof = base({ perInstance: 1000, instances: n, maxInstances: n, latency: 10, stateful: true, multiAz: n >= 2, failoverTime: n >= 2 ? 30 : 600, basis: '~1.000 consultas de grafo/s por instancia (supuesto).' });
+      break;
+    }
+    case 'memorydb': {
+      const r = Math.max(0, num('replicas', 1));
+      const sh = Math.max(1, num('shards', 1));
+      prof = base({ perInstance: 50000, instances: sh * (1 + r), maxInstances: sh * (1 + r), latency: 2, stateful: true, multiAz: r >= 1, failoverTime: r >= 1 ? 20 : 300, basis: `~50.000 ops/s por nodo; ${sh} shard(s) con ${r} réplica(s). Durable: no pierde datos al reiniciar.` });
+      break;
+    }
+    case 'dax': {
+      const n = Math.max(1, num('nodes', 3));
+      prof = base({ perInstance: 100000, instances: n, maxInstances: n, latency: 1, stateful: true, multiAz: n >= 2, failoverTime: 30, basis: '~100.000 lecturas/s por nodo desde caché (microsegundos).' });
+      break;
+    }
+    case 'keyspaces':
+      prof = base({ perInstance: 10000, latency: 8, basis: 'On‑demand: supuesto de ~10.000 req/s iniciales.' });
+      break;
+    case 'timestream':
+      prof = base({ perInstance: 5000, latency: 20, basis: 'Ingesta de series de tiempo: supuesto de ~5.000 escrituras/s.' });
+      break;
+    case 'fsx':
+      prof = base({ perInstance: 10000, latency: 3, stateful: true, multiAz: true, failoverTime: 60, basis: 'Sistema de archivos administrado: supuesto de ~10.000 ops/s.' });
+      break;
+    case 'ses':
+      prof = base({ perInstance: 14, latency: 100, basis: 'Envío de correo: la cuota inicial típica es baja (decenas por segundo) y se amplía con el historial de la cuenta.', quota: 'Cuota de envío por segundo de la cuenta' });
+      break;
+    case 'kendra':
+      prof = base({ perInstance: 10, latency: 400, basis: 'Búsqueda empresarial: supuesto de ~10 consultas/s por unidad de consulta.' });
+      break;
+    case 'rekognition':
+    case 'textract':
+    case 'comprehend':
+    case 'transcribe':
+    case 'translate':
+    case 'polly':
+      prof = base({ perInstance: 50, latency: 600, basis: 'API de IA administrada: supuesto de ~50 req/s (cuotas por API y región) y ~0,6 s por respuesta.', quota: 'Transacciones por segundo por API' });
+      break;
     default:
       prof = base({ perInstance: INF, latency: 0, basis: `${def.name} queda fuera de la ruta del request en la simulación.`, passive: true });
   }
+
+  applyScaling(node, prof);
 
   // Overrides manuales desde el inspector
   const capOv = Number(p['sim.capacity']);
@@ -299,6 +372,89 @@ export function profileFor(node: ServiceNode): SimProfile {
     prof.basis = `Capacidad definida manualmente: ${capOv} req/s por instancia.`;
   }
   return prof;
+}
+
+/** Aplica la configuración de escalado del inspector (sección «Escalado») al perfil. */
+function applyScaling(node: ServiceNode, prof: SimProfile) {
+  const sc = scalingOf(node);
+  if (!sc) return;
+  const first = prof.basis.split(/(?<=\.)\s/)[0];
+  switch (sc.kind) {
+    case 'instances':
+    case 'tasks':
+    case 'nodes':
+    case 'app': {
+      const grows = sc.policy === 'cpu' || sc.policy === 'requests' || sc.policy === 'step';
+      prof.instances = Math.max(1, sc.desired);
+      prof.maxInstances = grows ? Math.max(prof.instances, sc.max) : prof.instances;
+      prof.scale = grows ? 'asg' : 'none';
+      prof.scaleDelay = sc.detection + sc.warmup;
+      prof.scaleMetric = sc.policy === 'requests' ? 'requests' : sc.policy === 'step' ? 'step' : 'cpu';
+      prof.targetUtil =
+        sc.policy === 'requests' ? (Number.isFinite(prof.perInstance) && prof.perInstance > 0 ? sc.targetRequests / prof.perInstance : 0.7)
+        : sc.policy === 'step' ? sc.stepThreshold / 100
+        : sc.targetCpu / 100;
+      prof.targetRequests = sc.policy === 'requests' ? sc.targetRequests : undefined;
+      prof.stepAdd = sc.policy === 'step' ? sc.stepAdd : undefined;
+      if (sc.kind === 'instances') prof.replaceTime = sc.policy === 'manual' ? INF : 240;
+      prof.multiAz = prof.instances >= 2;
+      prof.basis = `${first} ${describeScaling(node, prof.perInstance)}`;
+      break;
+    }
+    case 'functions':
+      if (sc.reserved) {
+        prof.perInstance = (sc.reserved * 1000) / Math.max(1, prof.latency);
+        prof.quota = `Concurrencia reservada: ${sc.reserved}`;
+      }
+      prof.basis = `${prof.basis} ${describeScaling(node)}`;
+      break;
+    case 'aurora': {
+      const nInst = 1 + (sc.replicas ?? 0);
+      if (sc.serverless) {
+        prof.perInstance = 750;
+        prof.instances = Math.max(1, Math.round((sc.minAcu ?? 2) * nInst));
+        prof.maxInstances = Math.max(prof.instances, Math.round((sc.maxAcu ?? 16) * nInst));
+        prof.scale = 'serverless-db';
+        prof.scaleDelay = 15;
+        prof.scaleMetric = 'capacity';
+        prof.basis = `~750 consultas/s por ACU. ${describeScaling(node)} Failover ${nInst > 1 ? '~30 s' : '~10 min (recrea la instancia)'}.`;
+      } else {
+        prof.perInstance = 3000;
+        prof.instances = nInst;
+        prof.maxInstances = nInst;
+        prof.scale = 'none';
+        prof.basis = `~3.000 consultas/s por instancia. ${describeScaling(node)}`;
+      }
+      prof.multiAz = nInst >= 2;
+      prof.failoverTime = nInst >= 2 ? 30 : 600;
+      break;
+    }
+    case 'nosql':
+      if (node.data.serviceId === 'dynamodb' || lidOf(node.data.serviceId) === 'dynamodb') {
+        if (node.data.serviceId.startsWith('az-')) break;
+        if (sc.billing === 'PROVISIONED') {
+          prof.perInstance = sc.rcu ?? 1000;
+          prof.instances = 1;
+          prof.maxInstances = sc.policy === 'cpu' ? Math.max(1, Math.ceil((sc.maxRcu ?? 4000) / (sc.rcu ?? 1000))) : 1;
+          prof.scale = sc.policy === 'cpu' ? 'asg' : 'none';
+          prof.scaleDelay = 300;
+          prof.scaleMetric = 'capacity';
+          prof.quota = `${sc.rcu} RCU provisionadas`;
+          prof.basis = describeScaling(node);
+        }
+      }
+      break;
+    case 'throttle':
+      if (node.data.serviceId === 'apigw') {
+        prof.perInstance = sc.rateLimit ?? 10000;
+        prof.quota = `Throttling: ${sc.rateLimit} req/s (ráfaga ${sc.burstLimit})`;
+        prof.basis = `${describeScaling(node)} El límite de la cuenta es 10.000 req/s.`;
+      } else if (node.data.props.rateLimit !== undefined) {
+        prof.perInstance = Math.min(prof.perInstance, sc.rateLimit ?? prof.perInstance);
+        prof.basis = `${prof.basis} Política rate-limit: ${sc.rateLimit} req/s.`;
+      }
+      break;
+  }
 }
 
 /** Perfiles propios de Azure (cuando difieren del equivalente de AWS). */
@@ -322,7 +478,7 @@ function azureProfile(node: ServiceNode, num: (k: string, d: number) => number):
     case 'az-appservice': {
       const n = Math.max(1, num('instances', 2));
       const per = { B1: 100, S1: 200, P1v3: 400, P2v3: 800, P3v3: 1600 }[String(p.sku ?? 'P1v3')] ?? 400;
-      return base({ perInstance: per, instances: n, maxInstances: Math.max(n, 10), scale: 'asg', scaleDelay: 240, latency: 45, replaceTime: 120, multiAz: n >= 2, basis: `Plan ${p.sku ?? 'P1v3'}: ~${per} req/s por instancia; el autoescalado reacciona en ~4 min.` });
+      return base({ perInstance: per, instances: n, maxInstances: Math.max(n, 10), scale: 'asg', scaleDelay: 240, latency: 45, replaceTime: 120, multiAz: n >= 2, basis: `Plan ${p.sku ?? 'P1v3'}: ~${per} req/s por instancia.` });
     }
     case 'az-containerapps': {
       const desired = Math.max(1, num('desired', 2));
