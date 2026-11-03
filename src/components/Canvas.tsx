@@ -77,14 +77,23 @@ export function Canvas() {
   const rf = useReactFlow();
   const wrapper = useRef<HTMLDivElement>(null);
 
-  const { attack } = useCanvasCtx();
+  const { attack, sim } = useCanvasCtx();
+  // Failover activo en la simulación: flecha temporal hacia la réplica que atiende
+  const foKeys = sim ? Object.keys(sim.edges).filter((k) => k.startsWith('fo:') && sim.edges[k].rps > 0).join(',') : '';
   const display = useMemo(() => {
     if (view === 'c1') return contextView(nodes, edges, meta.name, meta.description);
+    if (foKeys) {
+      const extra = foKeys.split(',').map((k) => {
+        const [source, target] = k.slice(3).split('>');
+        return { id: k, source, target, type: 'floating', selectable: false, deletable: false, data: { virtual: true }, markerEnd: { type: MarkerType.ArrowClosed, width: 16, height: 16, color: '#2f9e44' } };
+      }) as unknown as AppEdge[];
+      return { nodes: nodes as Node[], edges: [...edges, ...extra] };
+    }
     if (!attack?.virtual.length) return { nodes: nodes as Node[], edges };
     // Saltos de la ruta de ataque que no son una flecha del diagrama (rol IAM, credenciales robadas)
     const extra = attack.virtual.map((v) => ({ id: v.id, source: v.source, target: v.target, type: 'floating', selectable: false, deletable: false, data: { virtual: true }, markerEnd: { type: MarkerType.ArrowClosed, width: 16, height: 16, color: '#c92a2a' } })) as unknown as AppEdge[];
     return { nodes: nodes as Node[], edges: [...edges, ...extra] };
-  }, [view, nodes, edges, meta.name, meta.description, attack]);
+  }, [view, nodes, edges, meta.name, meta.description, attack, foKeys]);
 
   useEffect(() => {
     if (!focusRequest) return;

@@ -192,6 +192,7 @@ export const SERVICES: ServiceDef[] = [
     { key: 'managedRules', label: 'Core Rule Set (OWASP: XSS, LFI…)', type: 'bool', default: true },
     { key: 'sqliRules', label: 'Reglas de inyección SQL', type: 'bool', default: true },
     { key: 'botControl', label: 'Bot Control', type: 'bool', default: false, help: 'Grupo de pago: detecta bots y scrapers aunque vengan de muchas IPs.' },
+    { key: 'atp', label: 'Account Takeover Prevention (login)', type: 'bool', default: false, help: 'Grupo de pago: revisa credenciales filtradas y bloquea el relleno de credenciales en la ruta de login.' },
     { key: 'rateLimit', label: 'Límite req/5min por IP', type: 'number', default: 2000 },
   ] }),
   S({ id: 'shield', name: 'AWS Shield Advanced', short: 'SHD', category: 'security', role: 'waf', layer: 'seguridad', zones: ['outside'], description: 'Protección DDoS avanzada.' }),

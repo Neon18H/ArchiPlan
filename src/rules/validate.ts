@@ -60,6 +60,14 @@ export function validate(nodes: AppNode[], edges: AppEdge[]): Issue[] {
     if (seen.has(key)) push({ severity: 'warn', title: 'Conexión duplicada', detail: 'Hay dos conexiones iguales entre las mismas piezas.', nodeIds: [e.source, e.target], edgeIds: [e.id] });
     seen.add(key);
     const v = evaluateConnection(s, t, map);
+    const replica = isService(s) && isService(t) && ((s.data.props.replicaOf === t.id) || (t.data.props.replicaOf === s.id));
+    if (replica) continue;
+    if (v.level !== 'ok' && v.msg && v.msg.startsWith('Replicación entre bases de datos')) {
+      const sl = (s.data as { label: string }).label;
+      const tl = (t.data as { label: string }).label;
+      push({ severity: 'warn', title: `${sl} → ${tl}: ¿es una réplica?`, detail: 'Configura qué tipo de réplica es y cómo hace failover en ⛑ Resiliencia → Replicación y failover; si no, la simulación no la usa.', nodeIds: [e.source, e.target], edgeIds: [e.id] });
+      continue;
+    }
     if (v.level !== 'ok' && v.msg) {
       const sl = (s.data as { label: string }).label;
       const tl = (t.data as { label: string }).label;

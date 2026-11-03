@@ -5,9 +5,13 @@ import { useStore } from '../store';
 import type { PropValue, ServiceNode } from '../types';
 import { Switch } from './NetInspector';
 import { Num } from './ScalingInspector';
-import { applyResFix } from './ResilienceModal';
+import { applyResFix, useResTab } from './ResilienceModal';
+import { linkOf, linkSummary, replicaFamily, replicationLinks } from '../resilience/replication';
 
-export const openResilience = () => window.dispatchEvent(new CustomEvent('archiplan:open', { detail: 'resilience' }));
+export const openResilience = (tab: 'plan' | 'replication' = 'plan') => {
+  useResTab.getState().setTab(tab);
+  window.dispatchEvent(new CustomEvent('archiplan:open', { detail: 'resilience' }));
+};
 
 function Row({ label, help, on, onChange }: { label: string; help?: string; on: boolean; onChange: (v: boolean) => void }) {
   return (
@@ -69,10 +73,26 @@ export function ResilienceSection({ node }: { node: ServiceNode }) {
     <div className="insp-section res-section">
       <div className="row between">
         <div className="insp-section-title">Resiliencia y failover</div>
-        <button className="linkish small" onClick={openResilience}>
+        <button className="linkish small" onClick={() => openResilience()}>
           Plan completo
         </button>
       </div>
+      {replicaFamily(node) && (
+        <div className="repl-insp">
+          {linkOf(node) ? (
+            <span>
+              ⟲ Réplica de <b>{(nodes.find((n) => n.id === linkOf(node)!.primaryId) as ServiceNode | undefined)?.data.label}</b> · {linkSummary(linkOf(node)!)}
+            </span>
+          ) : replicationLinks(nodes).some((l) => l.primaryId === node.id) ? (
+            <span>⟲ Réplicas: {replicationLinks(nodes).filter((l) => l.primaryId === node.id).map((l) => `${(nodes.find((n) => n.id === l.replicaId) as ServiceNode | undefined)?.data.label} (${linkSummary(l)})`).join(', ')}</span>
+          ) : (
+            <span className="muted">Sin réplicas dibujadas.</span>
+          )}
+          <button className="btn small" onClick={() => openResilience('replication')}>
+            Replicación y failover
+          </button>
+        </div>
+      )}
 
       {r.kind === 'fleet' && (
         <>

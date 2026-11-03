@@ -55,6 +55,10 @@ interface State extends Snapshot {
   redo: () => void;
 
   addService: (serviceId: string, pos?: { x: number; y: number }, parentOverride?: string | null) => string;
+  /** Crea una réplica de una pieza de datos (copia al lado + flecha de replicación). */
+  createReplica: (primaryId: string, mode: string) => string | null;
+  /** Declara (o quita, con primaryId null) que una pieza es réplica de otra. */
+  setReplica: (replicaId: string, primaryId: string | null, patch?: Record<string, PropValue>) => void;
   addZone: (kind: ZoneKind, pos?: { x: number; y: number }) => string;
   reparent: (ids: string[]) => void;
   updateNode: (id: string, patch: { label?: string; notes?: string; props?: Record<string, PropValue> }) => void;
@@ -437,6 +441,44 @@ export const useStore = create<State>((set, get) => ({
     if (parentId) nodes = growToFit(nodes, parentId);
     set({ nodes: sortNodes(nodes) });
     return id;
+  },
+  createReplica: (primaryId, mode) => {
+    const primary = get().nodes.find((n) => n.id === primaryId);
+    if (!isService(primary)) return null;
+    let id: string | null = null;
+    batched(get, set, () => {
+      const nodes = get().nodes;
+      const pos = freeSpot(nodes, primary.parentId ?? null, { x: primary.position.x, y: primary.position.y + NODE_H + 40 });
+      id = uid('n');
+      const node: ServiceNode = {
+        id,
+        type: 'service',
+        position: pos,
+        ...(primary.parentId ? { parentId: primary.parentId } : {}),
+        data: { serviceId: primary.data.serviceId, label: `${primary.data.label} (réplica)`, props: { ...primary.data.props, replicaOf: primaryId, replicaMode: mode, failoverMode: mode === 'standby' ? 'auto' : 'manual' } },
+      };
+      let next: AppNode[] = [...nodes.map((n) => ({ ...n, selected: false })), node];
+      if (primary.parentId) next = growToFit(next, primary.parentId);
+      const edge: AppEdge = { id: uid('e'), source: primaryId, target: id, type: 'floating', data: { protocol: 'Replicación', async: true, level: 'ok' } };
+      set({ nodes: sortNodes(next), edges: [...get().edges, edge] });
+    });
+    get().toast('ok', 'Réplica creada y conectada. Ajusta su tipo y su failover en Resiliencia → Replicación y failover.');
+    return id;
+  },
+  setReplica: (replicaId, primaryId, patch = {}) => {
+    const n = get().nodes.find((x) => x.id === replicaId);
+    if (!isService(n)) return;
+    batched(get, set, () => {
+      if (primaryId) {
+        get().updateNode(replicaId, { props: { replicaOf: primaryId, replicaMode: n.data.props.replicaMode ?? 'read', ...patch } });
+        if (!get().edges.some((e) => (e.source === primaryId && e.target === replicaId) || (e.source === replicaId && e.target === primaryId)))
+          set({ edges: [...get().edges, { id: uid('e'), source: primaryId, target: replicaId, type: 'floating', data: { protocol: 'Replicación', async: true, level: 'ok' } }] });
+      } else {
+        const props = { ...n.data.props };
+        for (const k of ['replicaOf', 'replicaMode', 'failoverMode', 'delayMin', 'copyEveryMin']) delete props[k];
+        set({ nodes: get().nodes.map((x) => (x.id === replicaId && isService(x) ? { ...x, data: { ...x.data, props } } : x)) });
+      }
+    });
   },
   addZone: (kind, pos) => {
     get().commit();

@@ -26,6 +26,8 @@ const STATUS_LABEL: Record<NodeFrame['status'], string> = {
 };
 
 function simExtra(f: NodeFrame): { text: string; tone?: 'good' | 'bad' } | null {
+  if (f.failoverTo) return { text: `→ failover a ${f.failoverTo}`, tone: 'good' };
+  if (f.promoted) return { text: 'Promovida: atiende como primaria', tone: 'good' };
   if (f.blocked !== undefined) return { text: 'Tráfico malicioso detenido en el borde', tone: 'good' };
   if (f.healthy < f.instances) return { text: `${f.healthy}/${f.instances} instancias sanas`, tone: 'bad' };
   if (f.backlog !== undefined && f.backlog > 0.5) return { text: `Cola: ${fmtRps(f.backlog)} mensajes` };

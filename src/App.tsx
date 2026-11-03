@@ -28,6 +28,7 @@ import { analyzeNetwork } from './net/reach';
 import { netIssues } from './net/issues';
 import { traceOverlay } from './net/trace';
 import { attackOverlay } from './attack/paths';
+import { linkSummary, replicationLinks } from './resilience/replication';
 import { useStore } from './store';
 import type { Layer, Severity } from './types';
 
@@ -289,6 +290,8 @@ export default function App() {
     const traceCtx = traceOn && trace ? { ...traceOn, failedEdgeId: traceStep >= trace.hops.length ? trace.failedEdgeId ?? null : null, current: trace.hops[Math.min(traceStep, trace.hops.length) - 1]?.nodeId ?? null } : null;
     const atkPath = simOpen && simMode === 'attack' && view === 'c2' ? attackRes?.paths[attackSel] : null;
     const attack = atkPath ? attackOverlay(atkPath, attackStep) : simOpen && simMode === 'attack' && view === 'c2' ? { nodes: new Map(), edges: new Map(), virtual: [], labels: new Map() } : null;
+    const replicas = new Map<string, string>();
+    for (const l of replicationLinks(nodes)) for (const e of edges) if ((e.source === l.primaryId && e.target === l.replicaId) || (e.source === l.replicaId && e.target === l.primaryId)) replicas.set(e.id, `⟲ réplica · ${linkSummary(l)}`);
     const netBlocked = new Map<string, string>();
     for (const v of netAnalysis.verdicts.values()) if (!v.ok) netBlocked.set(v.edgeId, v.short ?? 'bloqueado');
     const frame = simOpen && simMode === 'load' && simResult && view === 'c2' ? simResult.frames[simIdx] : null;
@@ -310,7 +313,7 @@ export default function App() {
       const short: Record<string, string> = { 'Borde AWS': 'Borde', 'Servicios AWS': cloud === 'azure' ? 'PaaS' : 'AWS', 'Borde Azure': 'Borde', 'Servicios Azure': 'PaaS', 'Subnet pública': 'Pública', 'Subnet privada': 'Privada', 'Subnet de datos': 'Datos', 'Red corporativa': 'Corp.' };
       stride = { nodes: nm, boundaries: new Map(threatModel.boundaries.filter((b) => b.inbound).map((b) => [b.edgeId, `${short[b.from] ?? b.from}→${short[b.to] ?? b.to}`])) };
     }
-    return { nodeIssues, edgeIssues, dimmed, readOnly: view !== 'c2', sim, stride: attack ? null : stride, cloud, trace: traceCtx, netBlocked, netView, attack };
+    return { nodeIssues, edgeIssues, dimmed, readOnly: view !== 'c2', sim, stride: attack ? null : stride, cloud, trace: traceCtx, netBlocked, netView, attack, replicas };
   }, [issues, layers, nodes, edges, view, simOpen, simMode, simResult, simIdx, simPlaying, strideOverlay, threatModel, cloud, trace, traceStep, netAnalysis, netViewOn, attackRes, attackSel, attackStep]);
 
   const counts = { error: issues.filter((i) => i.severity === 'error').length, warn: issues.filter((i) => i.severity === 'warn').length, info: issues.filter((i) => i.severity === 'info').length };

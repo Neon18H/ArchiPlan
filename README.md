@@ -76,6 +76,10 @@ El botón **▶ Simular** abre un panel debajo del lienzo y corre escenarios sob
 | Corrupción de datos | Un bug o un error humano daña los datos: Multi‑AZ y las réplicas copian el daño. Mide cuánto tiempo se sirvieron datos malos, cuánto tarda la restauración (PITR, versionado) y cuántos datos se pierden. |
 | Ransomware | Un atacante con credenciales cifra los datos y borra los backups a su alcance. Solo sobrevive lo que está en otra cuenta con bloqueo inmutable. |
 | Game Day | Prueba combinada: pico de tráfico, en pleno pico cae una AZ y después una dependencia se pone lenta. Reporta la fase más dura. |
+| Relleno de credenciales | Una botnet prueba credenciales filtradas contra el login. Mide cuántas cuentas se toman y si el ataque agota la cuota de Cognito (los usuarios reales tampoco entran). Evalúa rate limit, Bot Control, WAF ATP, CAPTCHA, MFA y threat protection. |
+| Scraping y abuso de API (BOLA) | Bots con cuentas válidas recorren los identificadores de la API. Mide cuántos registros de otros usuarios se exponen sin autorización por objeto. |
+| Exfiltración | Desde una pieza comprometida se vuelca la base de datos. Mide cuántos GB salen antes de detectarlo según la salida a Internet (NAT, Network Firewall), GuardDuty y si la alerta llega al equipo. |
+| Llaves filtradas | Unas access keys en un repositorio público se usan para criptominería. Mide el costo hasta revocarlas (escaneo de secretos, GuardDuty, SCP) y si además abren los datos. |
 | DDoS L7 (HTTP flood) | El rate limit del WAF (según las IPs de la botnet), Bot Control, la caché de la CDN, Shield Advanced, el throttling de API Gateway y el costo en Lambda ("denial of wallet"). |
 | DDoS L3/L4 | Si el punto de entrada está protegido por Shield Standard o queda expuesto. |
 | Ataques web | SQLi, XSS, path traversal y bots contra las reglas del WAF (Core Rule Set, reglas de SQLi, Bot Control). |
@@ -101,13 +105,25 @@ Arriba están los totales de RTO (cuándo vuelve el servicio) y RPO (cuántos da
 
 Cada pieza también tiene una sección **Resiliencia y failover** en el panel de propiedades: zonas de disponibilidad, health checks, despliegue de RDS, réplicas, failover automático, backups, réplica en otra región, política de Route 53 y, en el cómputo, las **llamadas a dependencias** (timeout, reintentos y circuit breaker) que usa la simulación de dependencia lenta.
 
+### Replicación y failover entre piezas
+
+Si dibujas la réplica como una pieza (por ejemplo, una segunda RDS conectada a la principal), la pestaña **⛑ Resiliencia → Replicación y failover** te deja declarar:
+
+- **qué pieza es réplica de cuál** (o crear la réplica con un clic). ArchiPlan sugiere los pares del mismo tipo que están conectados;
+- **el tipo:** standby síncrono en otra AZ, réplica de lectura, réplica en otra región, réplica con retraso o copia aislada en otra cuenta;
+- **el failover:** automático (health check + promoción) o manual (runbook), y el retraso o la frecuencia de copia.
+
+Cada vínculo muestra qué fallas cubre y cuáles no, con su RTO y RPO, y un botón **▶** para simular cada una. En la simulación, cuando la primaria cae, el tráfico pasa a la réplica: el lienzo dibuja la flecha **⟲ failover** y la pieza aparece como «Promovida». Si la réplica no sirve para esa falla, el hallazgo explica por qué. Por ejemplo, una réplica en vivo copia al instante un borrado o un cifrado: contra ransomware solo sirve una copia aislada en otra cuenta, y contra un borrado, una réplica con retraso que se detenga a tiempo.
+
 En **Comparar variantes** aparecen el RTO y el RPO de cada variante ante la caída de la región, datos dañados y ransomware. El asistente IA también recibe el plan de resiliencia.
 
 ## Rutas de ataque (MITRE ATT&CK)
 
 En **▶ Simular → Ataque** (o desde la pestaña Amenazas) ArchiPlan calcula **cómo llegaría un atacante desde Internet hasta los datos más valiosos**: «así llegaría un atacante a la BD en 4 saltos». La ruta se anima sobre el lienzo, salto a salto.
 
-- **Saltos posibles:** escaneo y explotación de la aplicación expuesta (T1190), relleno de credenciales contra el login (T1110.004), cuentas válidas y abuso de autorización (T1078, BOLA), robo de secretos (T1555.006), abuso del rol IAM de la pieza comprometida, aunque no haya flecha en el diagrama (T1078.004), snapshot de la BD compartido con la cuenta del atacante (T1537), movimiento lateral entre servicios y por colas (T1210, T1565), buckets públicos (T1530) y puertos de administración o bases de datos abiertas a Internet.
+- **Perfiles de atacante:** atacante en Internet, llaves filtradas de un desarrollador, proveedor comprometido (T1199), cadena de suministro / CI‑CD (T1195.002, T1525) y administrador con phishing (T1566). Se filtran con los chips del panel.
+- **Qué podría hacer al llegar:** sacar los datos (T1567), cifrarlos o borrarlos (T1486/T1485), borrar el rastro (T1562.008), minar criptomonedas con tu cuenta (T1496) o pasar desapercibido. Cada impacto dice qué lo frena o qué falta.
+- **Saltos posibles:** SSRF al servicio de metadatos (T1552.005, mitigado con IMDSv2), escaneo y explotación de la aplicación expuesta (T1190), relleno de credenciales contra el login (T1110.004), cuentas válidas y abuso de autorización (T1078, BOLA), robo de secretos (T1555.006), abuso del rol IAM de la pieza comprometida, aunque no haya flecha en el diagrama (T1078.004), snapshot de la BD compartido con la cuenta del atacante (T1537), movimiento lateral entre servicios y por colas (T1210, T1565), buckets públicos (T1530) y puertos de administración o bases de datos abiertas a Internet.
 - **Probabilidad:** cada salto empieza con una probabilidad base que baja con los controles presentes: WAF y sus reglas, validación de entradas, parcheo, SCA/SAST, MFA y threat protection en Cognito, autorización por objeto, autenticación entre servicios, permission boundaries, SCP, cifrado con KMS, etc. Cada control lleva su mitigación de MITRE (M10xx).
 - **Valor del objetivo:** según la clasificación de los datos de la pieza (Restringido, Confidencial, Interno, Público).
 - **Cómo cortar la ruta:** el control faltante que más baja la probabilidad, con su arreglo de un clic. Al aplicarlo, las rutas se recalculan.
