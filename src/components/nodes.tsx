@@ -37,16 +37,17 @@ function simExtra(f: NodeFrame): { text: string; tone?: 'good' | 'bad' } | null 
 
 export const ServiceNodeView = memo(function ServiceNodeView({ id, data, selected }: NodeProps<ServiceNode>) {
   const def = getService(data.serviceId);
-  const { nodeIssues, dimmed, readOnly, sim, stride, trace } = useCanvasCtx();
+  const { nodeIssues, dimmed, readOnly, sim, stride, trace, netView } = useCanvasCtx();
   const simF = sim?.nodes[id];
   const thr = stride?.nodes.get(id);
-  const issue = sim || stride || trace ? undefined : nodeIssues.get(id);
+  const issue = sim || stride || trace || netView ? undefined : nodeIssues.get(id);
+  const nv = netView?.nodes.get(id);
   const tr = trace ? trace.nodes.get(id) ?? 'none' : null;
   const color = CATEGORIES[def.category].color;
   const isActor = def.role === 'actor' || def.role === 'external';
   return (
     <div
-      className={`svc ${selected ? 'is-selected' : ''} ${issue ? `has-${issue}` : ''} ${dimmed.has(id) ? 'is-dimmed' : ''} ${isActor ? 'is-actor' : ''} ${simF ? `sim-${simF.status}` : ''} ${tr ? `tr-${tr}` : ''} ${trace?.current === id ? 'tr-current' : ''}`}
+      className={`svc ${selected ? 'is-selected' : ''} ${issue ? `has-${issue}` : ''} ${dimmed.has(id) ? 'is-dimmed' : ''} ${isActor ? 'is-actor' : ''} ${simF ? `sim-${simF.status}` : ''} ${tr ? `tr-${tr}` : ''} ${netView && !nv?.relevant ? 'nv-off' : ''} ${trace?.current === id ? 'tr-current' : ''}`}
       style={{ ['--cat' as string]: color }}
       title={`${def.name}\n${def.description}`}
     >
@@ -73,6 +74,14 @@ export const ServiceNodeView = memo(function ServiceNodeView({ id, data, selecte
       </div>
       {simF && !isActor && ['saturated', 'down', 'degraded', 'hot'].includes(simF.status) && <span className={`sim-pill st-${simF.status}`}>{STATUS_LABEL[simF.status]}</span>}
       {simF && sim?.targetId === id && <span className="sim-target">Objetivo</span>}
+      {nv && (nv.port !== undefined || nv.sgs.length > 0) && (
+        <span className="nv-badges">
+          {nv.port !== undefined && <span className="nv-port">:{nv.port}</span>}
+          {nv.sgs.map((g) => (
+            <span key={g.name} className="nv-sg" style={{ background: g.color }} title={`Grupo: ${g.name}`} />
+          ))}
+        </span>
+      )}
       {tr && ['fail', 'blocked'].includes(tr) && <span className={`tr-pill ${tr}`}>{tr === 'fail' ? 'Falla aquí' : 'Bloqueado'}</span>}
       {thr && thr.open > 0 && (
         <span className={`thr-badge r-${thr.worst}`} title={`${thr.open} amenaza(s) pendiente(s) · máximo riesgo ${thr.worst}`}>

@@ -80,15 +80,26 @@ Las capacidades son **estimaciones** de orden de magnitud: cuotas por defecto de
 
 ## Red configurable (Security Groups, puertos, listeners)
 
-Todo lo de red se configura y queda enlazado con la validación, las simulaciones y el Terraform:
+Todo lo de red se configura y queda enlazado con la validación, las simulaciones y el Terraform.
 
-- **Puertos.** Cada pieza en la VPC tiene su puerto de escucha (*Propiedades → Red y seguridad*). Por defecto sale del servicio (EC2/ECS 8080, PostgreSQL 5432, MySQL 3306, Redis 6379…). Al cambiarlo se actualizan las etiquetas de las flechas que lo mencionan.
-- **Balanceadores.** Listeners (protocolo, puerto, reenviar o redirigir a HTTPS, certificado) y un target group por destino (protocolo, puerto y ruta de health check).
-- **CDN.** Protocolo hacia el origen (solo HTTPS, solo HTTP o igual que el cliente).
-- **Auto Scaling.** Mínimo, máximo y CPU objetivo en EC2/VMSS; tareas o réplicas máximas en ECS/Container Apps. La simulación escala con esos valores.
-- **Security Groups / NSG** (botón **⛨ Red** de la barra):
-  - **Modo automático** (por defecto): cada pieza recibe un grupo con lo mínimo que piden sus flechas.
-  - **Modo manual**: con *Configurar manualmente* los grupos generados pasan a ser tuyos. Puedes crear, renombrar y borrar grupos, editar reglas de entrada y salida (TCP/UDP/todo, rango de puertos; origen CIDR, otro SG o la prefix list de CloudFront/Front Door) y asignarlos a cada pieza.
+**Vista de red (botón ⛨ Red).** Pinta la red sobre el diagrama:
+- Cada flecha muestra su puerto en verde (✓ 8080) o en rojo con el motivo (⛔ SG bloquea :8080).
+- Cada pieza dentro de la VPC muestra el puerto en el que escucha y sus grupos de seguridad (un color por grupo).
+- Haz clic en una flecha para ver la tarjeta **Tráfico de red**, con un interruptor para **permitir o bloquear** ese tráfico. ArchiPlan crea o quita la regla que hace falta.
+- Haz clic en una pieza para ver **Quién puede entrar**, en frases como «App 8080 desde Application Load Balancer». Desde ahí se agregan accesos con **+ Permitir acceso** («Permitir SSH 22 desde un rango de IPs…»).
+
+**Red automática o personalizada.** Al principio la red es *automática*: cada pieza recibe un grupo con lo mínimo que piden sus flechas. Cuando cambias algo (un interruptor, una regla, un grupo), pasa a *personalizada* sola y desde ahí mandan tus reglas. Puedes *volver a automática* cuando quieras.
+
+**Tabla de accesos y grupos.** La leyenda de la vista de red abre:
+- **Accesos**: cada conexión del diagrama con su puerto, su estado y un interruptor, más los accesos extra que no tienen flecha (por ejemplo, SSH abierto a Internet).
+- **Security Groups (avanzado)**: los grupos, a qué piezas se aplican y sus reglas en formato «Permitir [puerto] desde [pieza / CloudFront / Internet / rango]».
+
+**Otros ajustes en *Propiedades → Red*:**
+- Puerto de escucha, con atajos (80, 443, 3000, 8080…).
+- Listeners del balanceador (HTTPS con certificado, redirigir 80→443) y target groups con aviso si el puerto no coincide con el de la app.
+- Cómo llama la CDN a su origen.
+- IP pública.
+- Auto Scaling: mínimo, máximo y CPU objetivo.
 
 **Qué revisa el análisis de red, flecha por flecha:** listener en el puerto llamado, certificado TLS, bucle de redirección CDN→HTTP→HTTPS, balanceador interno llamado desde Internet, puerto del target group distinto del puerto de la app, regla de entrada del SG destino, regla de salida del SG origen, pieza sin SG, ruta de salida (NAT Gateway / VPC Endpoint), cómputo fuera de la VPC y bases de datos abiertas a Internet o SSH/RDP abiertos. Las flechas bloqueadas se pintan en rojo (⛔) en el lienzo. Cada problema aparece en *Validación* con su explicación y un arreglo ⚡ cuando lo hay.
 

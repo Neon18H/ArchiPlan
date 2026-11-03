@@ -6,7 +6,7 @@
  * Modo manual: el arquitecto define los SGs y sus reglas; el análisis usa exactamente eso.
  */
 import { getService, lid, primaryCloud } from '../catalog/catalog';
-import { ancestors, byId, isService, isZone, placementOf, uid } from '../lib/graph';
+import { ancestors, byId, isService, isZone, placementOf } from '../lib/graph';
 import type { AppEdge, AppNode, Listener, NetConfig, SecurityGroup, ServiceNode, SgRule, TargetConfig } from '../types';
 
 export const PORT_PRESETS: { label: string; protocol: SgRule['protocol']; from: number; to: number }[] = [
@@ -210,14 +210,14 @@ export function generateSecurityGroups(nodes: AppNode[], edges: AppEdge[]): Gene
       name: `${azure ? 'nsg' : 'sg'}-${slug(n.data.label)}`,
       description: `Tráfico permitido hacia ${n.data.label}`,
       inbound: [],
-      outbound: [{ id: uid('r'), protocol: 'all', from: 0, to: 65535, peer: { kind: 'cidr', value: '0.0.0.0/0' }, description: 'Salida (por defecto)' }],
+      outbound: [{ id: `${id}_out`, protocol: 'all', from: 0, to: 65535, peer: { kind: 'cidr', value: '0.0.0.0/0' }, description: 'Salida (por defecto)' }],
     });
     assign[n.id] = [id];
   }
   const byNode = (id: string) => groups.find((g) => g.id === `sg_${id}`);
   const addIn = (g: SecurityGroup, port: number, peer: SgRule['peer'], description: string) => {
     if (g.inbound.some((r) => r.from <= port && r.to >= port && JSON.stringify(r.peer) === JSON.stringify(peer))) return;
-    g.inbound.push({ id: uid('r'), protocol: 'tcp', from: port, to: port, peer, description });
+    g.inbound.push({ id: `${g.id}_in${g.inbound.length + 1}`, protocol: 'tcp', from: port, to: port, peer, description });
   };
   for (const e of edges) {
     const sem = semantics(e, map);
@@ -284,3 +284,63 @@ export function ruleText(r: SgRule, groups: SecurityGroup[], cdnName = 'CloudFro
   const peer = r.peer.kind === 'cidr' ? r.peer.value : r.peer.kind === 'prefix' ? `prefijos de ${cdnName}` : groups.find((g) => g.id === (r.peer as { sgId: string }).sgId)?.name ?? 'SG eliminado';
   return `${ports} · ${peer}`;
 }
+
+/* ───────────────────────────── lenguaje claro para reglas y accesos */
+
+export const PORT_NAME: Record<number, string> = {
+  22: 'SSH',
+  80: 'HTTP',
+  443: 'HTTPS',
+  445: 'SMB',
+  1433: 'SQL Server',
+  1521: 'Oracle',
+  2049: 'NFS',
+  3000: 'App',
+  3306: 'MySQL',
+  3389: 'RDP',
+  5432: 'PostgreSQL',
+  5439: 'Redshift',
+  6379: 'Redis',
+  6380: 'Redis TLS',
+  8080: 'App',
+  8443: 'HTTPS alt.',
+  9098: 'Kafka',
+  27017: 'MongoDB',
+};
+
+export const portLabel = (p: number) => (PORT_NAME[p] ? `${PORT_NAME[p]} ${p}` : `puerto ${p}`);
+
+/** ¿La regla cubre este puerto TCP? */
+export const ruleCovers = (r: SgRule, port: number) => r.protocol === 'all' || (r.protocol === 'tcp' && r.from <= port && r.to >= port);
+
+/** ¿El origen/destino de la regla corresponde a esta pieza? */
+export function peerIs(peer: SgRule['peer'], other: ServiceNode, map: Map<string, AppNode>, sgIdsOf: (n: ServiceNode) => string[]): boolean {
+  if (peer.kind === 'cidr') {
+    if (isAnyCidr(peer.value)) return true;
+    const c = inVpc(other, map) ? cidrOf(other, map) : null;
+    return !!c && cidrContains(peer.value, c);
+  }
+  if (peer.kind === 'prefix') return role(other) === 'cdn';
+  return inVpc(other, map) && sgIdsOf(other).includes(peer.sgId);
+}
+
+/** Quién es el origen de una regla, en palabras (nombres de piezas en lugar de ids de SG). */
+export function peerText(peer: SgRule['peer'], nodes: AppNode[], groups: SecurityGroup[], sgIdsOf: (n: ServiceNode) => string[], cdnName = 'CloudFront'): string {
+  if (peer.kind === 'prefix') return cdnName;
+  if (peer.kind === 'cidr') return isAnyCidr(peer.value) ? 'cualquier IP de Internet' : `el rango ${peer.value}`;
+  const g = groups.find((x) => x.id === peer.sgId);
+  if (!g) return 'un grupo eliminado';
+  const users = nodes.filter(isService).filter((n) => sgIdsOf(n).includes(g.id));
+  return users.length ? users.map((n) => n.data.label).join(', ') : `el grupo ${g.name} (sin piezas)`;
+}
+
+export function ruleSentence(r: SgRule, dir: 'inbound' | 'outbound', nodes: AppNode[], groups: SecurityGroup[], sgIdsOf: (n: ServiceNode) => string[], cdnName = 'CloudFront'): string {
+  const what = r.protocol === 'all' ? 'todo el tráfico' : r.from === r.to ? portLabel(r.from) : `${r.protocol.toUpperCase()} ${r.from}–${r.to}`;
+  return `${what} ${dir === 'inbound' ? 'desde' : 'hacia'} ${peerText(r.peer, nodes, groups, sgIdsOf, cdnName)}`;
+}
+
+/** Origen de un acceso, elegido por el arquitecto en palabras. */
+export type AccessSource = { kind: 'node'; id: string } | { kind: 'internet' } | { kind: 'cdn' } | { kind: 'cidr'; value: string };
+
+const SG_COLORS = ['#2a78d6', '#e8590c', '#2f9e44', '#ae3ec9', '#d6336c', '#0c8599', '#e0a100', '#5c7cfa', '#868e96'];
+export const sgColor = (groups: SecurityGroup[], id: string) => SG_COLORS[Math.max(0, groups.findIndex((g) => g.id === id)) % SG_COLORS.length];

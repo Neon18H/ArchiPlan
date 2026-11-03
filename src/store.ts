@@ -6,7 +6,7 @@ import { absolutePosition, ancestors, byId, isService, isZone, nodeSize, placeme
 import { buildFromSpec, NODE_H, NODE_W, type Spec } from './lib/layout';
 import { evaluateConnection } from './rules/connections';
 import type { AppEdge, AppNode, C3Model, Cloud, ConnData, Decision, Fix, Layer, NetConfig, NetFix, Placement, Project, ProjectMeta, PropValue, SecurityGroup, ServiceNode, ThreatState, ZoneKind, ZoneNode } from './types';
-import { generateSecurityGroups, isLb, listenPort } from './net/model';
+import { effectiveNet, generateSecurityGroups, inVpc, isLb, listenPort, needsSg, peerIs, ruleCovers, semantics, type AccessSource } from './net/model';
 
 
 export type ViewMode = 'c2' | 'c1' | 'c3';
@@ -74,7 +74,16 @@ interface State extends Snapshot {
   materializeSecurityGroups: () => void;
   /** Vuelve al modo automático (borra los SG manuales y las asignaciones). */
   resetSecurityGroups: () => void;
-  applyNetFix: (fix: NetFix) => void;
+  applyNetFix: (fix: NetFix, quiet?: boolean) => void;
+  /** Pasa a red personalizada (si estaba automática) sin cambiar el comportamiento. */
+  ensureManualNet: () => void;
+  /** Permite o bloquea el tráfico de una flecha (crea o quita las reglas necesarias). */
+  setAccess: (edgeId: string, allow: boolean) => void;
+  /** Permite tráfico entrante a una pieza desde un origen, en un puerto. */
+  allowInto: (nodeId: string, from: AccessSource, port: number) => void;
+  removeRule: (sgId: string, dir: 'inbound' | 'outbound', ruleId: string) => void;
+  /** Edita los grupos; si la red estaba automática, primero la vuelve personalizada. */
+  editSecurityGroups: (fn: (groups: SecurityGroup[]) => SecurityGroup[], coalesceKey?: string) => void;
 
   loadProject: (p: Project, projectId?: string | null) => void;
   loadSpec: (spec: Spec, meta: Partial<ProjectMeta>, decisions?: Omit<Decision, 'id'>[]) => void;
@@ -232,6 +241,18 @@ function preferredZone(nodes: AppNode[], serviceId: string): string | null {
 }
 
 const init = loadAutosave();
+
+/** Ejecuta varias acciones como un solo paso de deshacer. */
+function batched(get: () => State, set: (p: Partial<State>) => void, fn: () => void) {
+  const { commit } = get();
+  commit();
+  set({ commit: () => {} });
+  try {
+    fn();
+  } finally {
+    set({ commit });
+  }
+}
 const snap = (s: Snapshot): Snapshot => ({ nodes: s.nodes, edges: s.edges, decisions: s.decisions, meta: s.meta, threats: s.threats, securityGroups: s.securityGroups });
 
 /** Al cambiar el puerto de una pieza, actualiza las etiquetas de las flechas que lo mencionan. */
@@ -605,7 +626,7 @@ export const useStore = create<State>((set, get) => ({
     });
     get().toast('info', 'Modo automático: los grupos se derivan de las flechas del diagrama.');
   },
-  applyNetFix: (fix) => {
+  applyNetFix: (fix, quiet) => batched(get, set, () => {
     switch (fix.kind) {
       case 'service':
         get().applyFix(fix.fix);
@@ -655,8 +676,139 @@ export const useStore = create<State>((set, get) => ({
         break;
       }
     }
-    get().toast('ok', `Aplicado: ${fix.label}`);
+    if (!quiet) get().toast('ok', `Aplicado: ${fix.label}`);
+  }),
+
+  ensureManualNet: () => {
+    if (get().securityGroups.length) return;
+    const { nodes, edges } = get();
+    const gen = generateSecurityGroups(nodes, edges);
+    if (!gen.groups.length) return;
+    get().commit();
+    set({
+      securityGroups: gen.groups,
+      nodes: nodes.map((n) => (isService(n) && gen.assign[n.id] ? ({ ...n, data: { ...n.data, net: { ...(n.data.net ?? {}), sgIds: gen.assign[n.id] } } } as AppNode) : n)),
+    });
+    get().toast('info', 'La red pasó a «personalizada»: desde ahora mandan tus reglas. Puedes volver a automática en ⛨ Red.');
   },
+  allowInto: (nodeId, from, port) => batched(get, set, () => {
+    get().ensureManualNet();
+    const target = get().nodes.find((n) => n.id === nodeId);
+    if (!target || !isService(target)) return;
+    // El destino necesita un grupo propio
+    if (!target.data.net?.sgIds?.length) get().applyNetFix({ kind: 'create-sg', nodeId, label: 'grupo' }, true);
+    const t = get().nodes.find((n) => n.id === nodeId) as ServiceNode;
+    const sgId = t.data.net?.sgIds?.[0];
+    if (!sgId) return;
+    let peer: SecurityGroup['inbound'][number]['peer'];
+    let who: string;
+    if (from.kind === 'node') {
+      const src = get().nodes.find((n) => n.id === from.id);
+      if (!src || !isService(src)) return;
+      const map = byId(get().nodes);
+      who = src.data.label;
+      if (needsSg(src, map)) {
+        if (!src.data.net?.sgIds?.length) get().applyNetFix({ kind: 'create-sg', nodeId: src.id, label: 'grupo' }, true);
+        const s2 = get().nodes.find((n) => n.id === from.id) as ServiceNode;
+        peer = { kind: 'sg', sgId: s2.data.net!.sgIds![0] };
+      } else if (getService(src.data.serviceId).role === 'cdn') peer = { kind: 'prefix', value: 'cdn' };
+      else peer = { kind: 'cidr', value: '0.0.0.0/0' };
+    } else if (from.kind === 'cdn') {
+      peer = { kind: 'prefix', value: 'cdn' };
+      who = 'la CDN';
+    } else if (from.kind === 'internet') {
+      peer = { kind: 'cidr', value: '0.0.0.0/0' };
+      who = 'Internet';
+    } else {
+      peer = { kind: 'cidr', value: from.value };
+      who = from.value;
+    }
+    const g = get().securityGroups.find((x) => x.id === sgId);
+    if (!g) return;
+    if (g.inbound.some((r) => ruleCovers(r, port) && JSON.stringify(r.peer) === JSON.stringify(peer))) return;
+    get().setSecurityGroups(get().securityGroups.map((x) => (x.id === sgId ? { ...x, inbound: [...x.inbound, { id: uid('r'), protocol: 'tcp', from: port, to: port, peer, description: `Desde ${who}` }] } : x)));
+  }),
+  removeRule: (sgId, dir, ruleId) => get().editSecurityGroups((gs) => gs.map((g) => (g.id === sgId ? { ...g, [dir]: g[dir].filter((r) => r.id !== ruleId) } : g))),
+  editSecurityGroups: (fn, coalesceKey) => {
+    if (!get().securityGroups.length) {
+      batched(get, set, () => {
+        get().ensureManualNet();
+        get().setSecurityGroups(fn(get().securityGroups));
+      });
+      return;
+    }
+    get().setSecurityGroups(fn(get().securityGroups), coalesceKey);
+  },
+  setAccess: (edgeId, allow) => batched(get, set, () => {
+    const e0 = get().edges.find((e) => e.id === edgeId);
+    if (!e0) return;
+    const sem0 = semantics(e0, byId(get().nodes));
+    if (!sem0 || (sem0.kind !== 'connect' && sem0.kind !== 'egress')) return;
+    get().ensureManualNet();
+    const nodes = get().nodes;
+    const map = byId(nodes);
+    const sem = semantics(e0, map)!;
+    const net = effectiveNet(nodes, get().edges, get().securityGroups);
+    const { from: s, to: t, port } = sem;
+    if (allow) {
+      if (sem.kind === 'connect') get().allowInto(t.id, { kind: 'node', id: s.id }, port);
+      // La salida del origen también debe permitirlo
+      const n2 = get().nodes;
+      const m2 = byId(n2);
+      const s2 = n2.find((n) => n.id === s.id) as ServiceNode;
+      const net2 = effectiveNet(n2, get().edges, get().securityGroups);
+      const sIds = net2.sgIdsOf(s2);
+      if (needsSg(s2, m2) && sIds.length) {
+        const t2 = n2.find((n) => n.id === t.id) as ServiceNode;
+        const outOk = net2.groups.filter((g) => sIds.includes(g.id)).some((g) => g.outbound.some((r) => ruleCovers(r, port) && (sem.kind === 'egress' ? r.peer.kind === 'cidr' && r.peer.value.trim() === '0.0.0.0/0' : peerIs(r.peer, t2, m2, net2.sgIdsOf))));
+        if (!outOk) {
+          const peer = sem.kind === 'connect' && inVpc(t2, m2) && net2.sgIdsOf(t2)[0] ? { kind: 'sg' as const, sgId: net2.sgIdsOf(t2)[0] } : { kind: 'cidr' as const, value: '0.0.0.0/0' };
+          get().setSecurityGroups(get().securityGroups.map((g) => (g.id === sIds[0] ? { ...g, outbound: [...g.outbound, { id: uid('r'), protocol: 'tcp', from: port, to: port, peer, description: `Hacia ${t.data.label}` }] } : g)));
+        }
+      }
+      get().toast('ok', `Permitido: ${s.data.label} → ${t.data.label} (${port})`);
+      return;
+    }
+    // Bloquear: quitar las reglas que dejan pasar este tráfico
+    let removed = 0;
+    const broad: string[] = [];
+    let groups = get().securityGroups;
+    if (sem.kind === 'connect') {
+      const tIds = net.sgIdsOf(t);
+      groups = groups.map((g) => {
+        if (!tIds.includes(g.id)) return g;
+        const keep = g.inbound.filter((r) => {
+          if (!(ruleCovers(r, port) && peerIs(r.peer, s, map, net.sgIdsOf))) return true;
+          const exact = r.protocol === 'tcp' && r.from === port && r.to === port && (r.peer.kind === 'sg' || r.peer.kind === 'prefix' || (r.peer.kind === 'cidr' && !inVpc(s, map)));
+          if (exact) {
+            removed++;
+            return false;
+          }
+          broad.push(`${g.name}: ${r.protocol === 'all' ? 'todo' : `${r.from}-${r.to}`}`);
+          return true;
+        });
+        return { ...g, inbound: keep };
+      });
+    } else {
+      const sIds = net.sgIdsOf(s);
+      groups = groups.map((g) => {
+        if (!sIds.includes(g.id)) return g;
+        const keep = g.outbound.filter((r) => {
+          if (!(ruleCovers(r, port) && r.peer.kind === 'cidr')) return true;
+          if (r.protocol === 'tcp' && r.from === port && r.to === port) {
+            removed++;
+            return false;
+          }
+          broad.push(`${g.name}: salida ${r.protocol === 'all' ? 'de todo el tráfico' : `${r.from}-${r.to}`}`);
+          return true;
+        });
+        return { ...g, outbound: keep };
+      });
+    }
+    get().setSecurityGroups(groups);
+    if (broad.length) get().toast('warn', `Sigue permitido por una regla más amplia (${broad.join('; ')}). Edítala en ⛨ Red → Grupos.`);
+    else get().toast('ok', removed ? `Bloqueado: ${s.data.label} → ${t.data.label}` : 'No había reglas que permitieran este tráfico.');
+  }),
 
   loadProject: (p, projectId = null) => {
     get().commit();

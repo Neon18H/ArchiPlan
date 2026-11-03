@@ -15,6 +15,8 @@ export interface CanvasCtx {
   trace?: { nodes: Map<string, HopStatus>; edges: Map<string, HopStatus>; failedEdgeId: string | null; current: string | null } | null;
   /** Flechas que la configuración de red bloquea (id → etiqueta corta). */
   netBlocked?: Map<string, string>;
+  /** Vista de red: estado y puerto de cada flecha, puerto y grupos de cada pieza. */
+  netView?: { edges: Map<string, { state: 'ok' | 'bad' | 'warn' | 'na'; text: string; title?: string }>; nodes: Map<string, { port?: number; sgs: { name: string; color: string }[]; relevant: boolean }> } | null;
 }
 
 export const CanvasContext = createContext<CanvasCtx>({ nodeIssues: new Map(), edgeIssues: new Map(), dimmed: new Set(), readOnly: false, sim: null, stride: null, cloud: 'aws' });

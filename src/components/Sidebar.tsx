@@ -17,7 +17,7 @@ import { c3Eligible, COMPONENT_KINDS, coverage, neighbors } from '../c3/model';
 import type { C3Model, ComponentKind } from '../types';
 import { summarizeThreats, type Threat } from '../threats/model';
 import { useThreatsUi } from '../threats/ui';
-import { EdgeNetSection, NetSection } from './NetInspector';
+import { EdgeNetSection, NetSection, useNetUi } from './NetInspector';
 
 type Tab = 'props' | 'issues' | 'guide' | 'adr' | 'threats';
 
@@ -302,6 +302,7 @@ function ServiceInspector({ node, issues }: { node: ServiceNode; issues: Issue[]
   const map = byId(nodes);
   const place = placementOf(node, map);
   const conns = edges.filter((e) => e.source === node.id || e.target === node.id);
+  const netView = useNetUi((s) => s.view);
   return (
     <div className="inspector">
       <div className="insp-head">
@@ -322,6 +323,7 @@ function ServiceInspector({ node, issues }: { node: ServiceNode; issues: Issue[]
         <div className="muted small">Válidas: {def.zones.map((z) => PLACEMENT_LABEL[z]).join(' · ')}</div>
       </div>
       <NodeIssues id={node.id} issues={issues} />
+      {netView && <NetSection node={node} />}
       {def.props?.length ? (
         <div className="insp-section">
           <div className="insp-section-title">Configuración</div>
@@ -330,7 +332,7 @@ function ServiceInspector({ node, issues }: { node: ServiceNode; issues: Issue[]
           ))}
         </div>
       ) : null}
-      <NetSection node={node} />
+      {!netView && <NetSection node={node} />}
       {c3Eligible(node) && (
         <button className="btn block c3-open" onClick={() => useStore.getState().openC3(node.id)}>
           ⧉ Ver componentes (C3){node.data.c3?.components.length ? ` · ${node.data.c3.components.length}` : ''}
@@ -451,12 +453,14 @@ function EdgeInspector({ edge }: { edge: AppEdge }) {
   const t = map.get(edge.target);
   const d = (edge.data ?? {}) as ConnData;
   const v = s && t ? evaluateConnection(s, t, map) : null;
+  const netView = useNetUi((st) => st.view);
   return (
     <div className="inspector">
       <div className="insp-title">Conexión</div>
       <div className="edge-ends">
         <b>{(s?.data as { label: string })?.label}</b> → <b>{(t?.data as { label: string })?.label}</b>
       </div>
+      {netView && <EdgeNetSection edge={edge} prominent />}
       {v && v.level !== 'ok' && v.msg && <div className={`rule-msg ${v.level}`}>{v.msg}</div>}
       {v && v.level === 'ok' && <div className="rule-msg ok">Conexión válida según las reglas.</div>}
       <Field label="Protocolo / interacción">
@@ -474,7 +478,7 @@ function EdgeInspector({ edge }: { edge: AppEdge }) {
       <Field label="Descripción del flujo">
         <textarea rows={3} placeholder="Ej.: consulta de catálogo, publica OrdenCreada…" value={d.description ?? ''} onChange={(e) => updateEdge(edge.id, { description: e.target.value })} />
       </Field>
-      <EdgeNetSection edge={edge} />
+      {!netView && <EdgeNetSection edge={edge} />}
       <div className="row gap">
         <button className="btn" onClick={() => reverseEdge(edge.id)}>
           Invertir dirección
