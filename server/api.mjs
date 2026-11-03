@@ -2,6 +2,7 @@
 // Se usa tanto desde Vite (dev) como desde server/index.mjs (producción).
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { handleAi } from './ai.mjs';
 
 const SAFE = /^[a-zA-Z0-9._-]{1,80}$/;
 
@@ -32,6 +33,7 @@ export function createApiHandler() {
     if (!url.pathname.startsWith('/api/')) return next ? next() : undefined;
     const dir = projectsDir();
     try {
+      if (await handleAi(req, res, url)) return;
       await fs.mkdir(dir, { recursive: true });
       if (url.pathname === '/api/health') return send(res, 200, { ok: true, dir });
 

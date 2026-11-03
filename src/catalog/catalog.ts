@@ -119,9 +119,6 @@ export const SERVICES: ServiceDef[] = [
     { key: 'instanceType', label: 'Tipo de instancia', type: 'text', default: 't3.medium' },
     { key: 'count', label: 'Instancias', type: 'number', default: 2, min: 1, max: 100 },
     { key: 'autoscaling', label: 'Auto Scaling Group', type: 'bool', default: true },
-    { key: 'minSize', label: 'ASG · mínimo', type: 'number', default: 2, min: 0, max: 1000, help: 'Instancias mínimas del grupo.' },
-    { key: 'maxSize', label: 'ASG · máximo', type: 'number', default: 6, min: 1, max: 1000, help: 'Tope de instancias al escalar.' },
-    { key: 'targetCpu', label: 'ASG · CPU objetivo (%)', type: 'number', default: 60, min: 10, max: 95, help: 'Target tracking: escala cuando la utilización supera este valor.' },
   ] }),
   S({ id: 'lambda', name: 'AWS Lambda', short: 'λ', category: 'compute', role: 'compute', layer: 'aplicacion', zones: ['outside', 'region', 'subnet-private'], description: 'Funciones serverless por eventos.', inboundProtocol: 'Invoke', props: [
     { key: 'runtime', label: 'Runtime', type: 'select', default: 'nodejs20.x', options: ['nodejs20.x', 'python3.12', 'java21', 'go (provided.al2023)', 'dotnet8'] },
@@ -132,8 +129,6 @@ export const SERVICES: ServiceDef[] = [
     { key: 'cpu', label: 'CPU (unidades)', type: 'number', default: 512 },
     { key: 'memory', label: 'Memoria (MB)', type: 'number', default: 1024 },
     { key: 'desired', label: 'Tareas deseadas', type: 'number', default: 2, min: 1 },
-    { key: 'maxTasks', label: 'Auto Scaling · tareas máximas', type: 'number', default: 8, min: 1 },
-    { key: 'targetCpu', label: 'Auto Scaling · CPU objetivo (%)', type: 'number', default: 60, min: 10, max: 95 },
     { key: 'image', label: 'Imagen', type: 'text', default: 'app:latest' },
   ] }),
   S({ id: 'eks', name: 'Amazon EKS', short: 'EKS', category: 'containers', role: 'compute', layer: 'aplicacion', zones: [...VPC_APP], vpcBound: true, description: 'Kubernetes administrado.', inboundProtocol: 'HTTP', props: [
@@ -200,7 +195,7 @@ export const SERVICES: ServiceDef[] = [
     { key: 'rateLimit', label: 'Límite req/5min por IP', type: 'number', default: 2000 },
   ] }),
   S({ id: 'shield', name: 'AWS Shield Advanced', short: 'SHD', category: 'security', role: 'waf', layer: 'seguridad', zones: ['outside'], description: 'Protección DDoS avanzada.' }),
-  S({ id: 'cognito', name: 'Amazon Cognito', short: 'COG', category: 'security', role: 'identity', layer: 'seguridad', zones: [...OUT_REG], emitsEvents: true, description: 'Registro, login y emisión de tokens (OIDC/OAuth2).', inboundProtocol: 'OIDC/HTTPS', props: [{ key: 'mfa', label: 'MFA', type: 'select', default: 'OPTIONAL', options: ['OFF', 'OPTIONAL', 'ON'] }] }),
+  S({ id: 'cognito', name: 'Amazon Cognito', short: 'COG', category: 'security', role: 'identity', layer: 'seguridad', zones: [...OUT_REG], emitsEvents: true, description: 'Registro, login y emisión de tokens (OIDC/OAuth2).', inboundProtocol: 'OIDC/HTTPS', props: [{ key: 'mfa', label: 'MFA', type: 'select', default: 'OPTIONAL', options: ['OFF', 'OPTIONAL', 'ON'] }, { key: 'threatProtection', label: 'Threat protection (credenciales filtradas, bloqueo adaptativo)', type: 'bool', default: false }] }),
   S({ id: 'secrets', name: 'AWS Secrets Manager', short: 'SM', category: 'security', role: 'secrets', layer: 'seguridad', zones: [...OUT_REG], description: 'Credenciales y secretos con rotación.', inboundProtocol: 'HTTPS (GetSecretValue)', props: [{ key: 'rotation', label: 'Rotación automática', type: 'bool', default: true }] }),
   S({ id: 'kms', name: 'AWS KMS', short: 'KMS', category: 'security', role: 'kms', layer: 'seguridad', zones: [...OUT_REG], description: 'Llaves de cifrado administradas.', inboundProtocol: 'HTTPS (KMS API)' }),
   S({ id: 'acm', name: 'AWS Certificate Manager', short: 'ACM', category: 'security', role: 'cert', layer: 'seguridad', zones: [...OUT_REG], description: 'Certificados TLS gratuitos para CloudFront, ALB y API Gateway.' }),
@@ -223,6 +218,61 @@ export const SERVICES: ServiceDef[] = [
 
   // ───────── DevOps
   S({ id: 'codepipeline', name: 'AWS CodePipeline', short: 'CP', category: 'devops', role: 'devops', layer: 'aplicacion', zones: [...OUT_REG], description: 'CI/CD: compila, prueba y despliega.' }),
+
+  // ───────── Más servicios de AWS
+  // Red
+  S({ id: 'globalaccelerator', name: 'AWS Global Accelerator', short: 'GA', category: 'networking', role: 'cdn', layer: 'borde', zones: ['outside'], description: 'IPs anycast estáticas que llevan el tráfico por la red de AWS hasta ALB/NLB/EC2 (TCP/UDP, failover entre regiones).', inboundProtocol: 'TCP/UDP' }),
+  S({ id: 'transitgw', name: 'AWS Transit Gateway', short: 'TGW', category: 'networking', role: 'netgw', layer: 'red', zones: ['region', 'outside'], description: 'Hub que interconecta VPCs, VPNs y Direct Connect.' }),
+  S({ id: 'directconnect', name: 'AWS Direct Connect', short: 'DX', category: 'networking', role: 'netgw', layer: 'red', zones: ['outside', 'region'], description: 'Enlace dedicado y privado hacia on‑premise (1‑100 Gbps).' }),
+  S({ id: 'networkfirewall', name: 'AWS Network Firewall', short: 'NFW', category: 'security', role: 'netgw', layer: 'seguridad', zones: ['subnet-public', 'subnet-private'], vpcBound: true, description: 'Firewall administrado de la VPC: inspección, IPS y allowlist de dominios de salida.', props: [{ key: 'domainAllowlist', label: 'Allowlist de dominios de salida', type: 'bool', default: true }, { key: 'ips', label: 'IPS (reglas de amenazas administradas)', type: 'bool', default: true }] }),
+  S({ id: 'privatelink', name: 'AWS PrivateLink (servicio propio)', short: 'PL', category: 'networking', role: 'netgw', layer: 'red', zones: ['subnet-private'], vpcBound: true, description: 'Expone un servicio propio (detrás de un NLB) a otras VPCs o cuentas sin pasar por Internet.' }),
+  S({ id: 'cloudmap', name: 'AWS Cloud Map', short: 'MAP', category: 'networking', role: 'dns', layer: 'red', zones: ['region'], description: 'Descubrimiento de servicios (DNS/API) para microservicios.' }),
+  // Cómputo
+  S({ id: 'beanstalk', name: 'AWS Elastic Beanstalk', short: 'EB', category: 'compute', role: 'compute', layer: 'aplicacion', zones: [...VPC_APP], vpcBound: true, description: 'Plataforma administrada sobre EC2 + ALB + Auto Scaling (Java, .NET, Node, Python, PHP…).', inboundProtocol: 'HTTP 8080', props: [{ key: 'platform', label: 'Plataforma', type: 'select', default: 'Node.js 20', options: ['Node.js 20', 'Python 3.12', 'Java 21 Corretto', '.NET 8', 'PHP 8.3', 'Docker'] }, { key: 'instanceType', label: 'Tipo de instancia', type: 'text', default: 't3.medium' }] }),
+  S({ id: 'lightsail', name: 'Amazon Lightsail', short: 'LS', category: 'compute', role: 'compute', layer: 'aplicacion', zones: [...OUT_REG], description: 'VPS de precio fijo para cargas pequeñas (fuera de tu VPC).', inboundProtocol: 'HTTPS', props: [{ key: 'bundle', label: 'Plan', type: 'select', default: 'small_3_0 (2 GB)', options: ['nano_3_0 (0.5 GB)', 'small_3_0 (2 GB)', 'medium_3_0 (4 GB)', 'large_3_0 (8 GB)'] }] }),
+  S({ id: 'batch', name: 'AWS Batch', short: 'BATCH', category: 'compute', role: 'workflow', layer: 'aplicacion', zones: ['subnet-private'], vpcBound: true, description: 'Trabajos por lotes en Fargate o EC2 (colas de jobs, reintentos, prioridades).', props: [{ key: 'compute', label: 'Entorno', type: 'select', default: 'FARGATE', options: ['FARGATE', 'FARGATE_SPOT', 'EC2', 'SPOT'] }, { key: 'maxVcpus', label: 'vCPU máximas', type: 'number', default: 64, min: 1 }] }),
+  // Almacenamiento
+  S({ id: 'fsx', name: 'Amazon FSx', short: 'FSX', category: 'storage', role: 'storage', layer: 'datos', zones: ['subnet-private', 'subnet-data'], vpcBound: true, description: 'Sistemas de archivos administrados: Windows File Server, NetApp ONTAP, Lustre u OpenZFS.', inboundProtocol: 'SMB 445 / NFS 2049', props: [DATA_CLASS, { key: 'type', label: 'Tipo', type: 'select', default: 'WINDOWS', options: ['WINDOWS', 'ONTAP', 'LUSTRE', 'OPENZFS'] }, { key: 'storage', label: 'Capacidad (GB)', type: 'number', default: 1024 }] }),
+  S({ id: 'backup', name: 'AWS Backup', short: 'BKP', category: 'storage', role: 'devops', layer: 'datos', zones: [...OUT_REG], description: 'Backups centralizados con planes, retención y vault lock (también entre cuentas/regiones).' }),
+  S({ id: 'storagegateway', name: 'AWS Storage Gateway', short: 'SGW', category: 'storage', role: 'storage', layer: 'datos', zones: ['outside', 'region'], description: 'Acceso híbrido desde on‑premise a S3/FSx (file, volume, tape).', inboundProtocol: 'NFS/SMB/iSCSI' }),
+  S({ id: 'transferfamily', name: 'AWS Transfer Family', short: 'SFTP', category: 'storage', role: 'api', layer: 'borde', zones: [...OUT_REG], description: 'SFTP/FTPS/AS2 administrado sobre S3 o EFS para intercambio de archivos con terceros.', inboundProtocol: 'SFTP 22', props: [{ key: 'protocol', label: 'Protocolo', type: 'select', default: 'SFTP', options: ['SFTP', 'FTPS', 'AS2'] }] }),
+  S({ id: 'datasync', name: 'AWS DataSync', short: 'DS', category: 'storage', role: 'devops', layer: 'datos', zones: [...OUT_REG], description: 'Migración y sincronización de datos entre on‑premise y AWS.' }),
+  // Bases de datos
+  S({ id: 'neptune', name: 'Amazon Neptune', short: 'NEP', category: 'database', role: 'datastore', layer: 'datos', zones: ['subnet-data', 'subnet-private'], vpcBound: true, description: 'Base de datos de grafos (Gremlin, openCypher, SPARQL).', inboundProtocol: 'Gremlin 8182', props: [DATA_CLASS, { key: 'instances', label: 'Instancias', type: 'number', default: 2, min: 1 }, { key: 'encrypted', label: 'Cifrado en reposo', type: 'bool', default: true }] }),
+  S({ id: 'memorydb', name: 'Amazon MemoryDB', short: 'MDB', category: 'database', role: 'cache', layer: 'datos', zones: ['subnet-data', 'subnet-private'], vpcBound: true, description: 'Base de datos en memoria compatible con Redis/Valkey, durable (Multi‑AZ con log transaccional).', inboundProtocol: 'Redis 6379', props: [DATA_CLASS, { key: 'shards', label: 'Shards', type: 'number', default: 1, min: 1 }, { key: 'replicas', label: 'Réplicas por shard', type: 'number', default: 1, min: 0 }] }),
+  S({ id: 'keyspaces', name: 'Amazon Keyspaces', short: 'KS', category: 'database', role: 'datastore', layer: 'datos', zones: [...OUT_REG], description: 'Cassandra administrado y serverless.', inboundProtocol: 'CQL 9142', props: [DATA_CLASS] }),
+  S({ id: 'timestream', name: 'Amazon Timestream', short: 'TS', category: 'database', role: 'datastore', layer: 'datos', zones: [...OUT_REG], description: 'Base de datos de series de tiempo (IoT, métricas, telemetría).', inboundProtocol: 'HTTPS', props: [DATA_CLASS] }),
+  S({ id: 'dax', name: 'DynamoDB Accelerator (DAX)', short: 'DAX', category: 'database', role: 'cache', layer: 'datos', zones: ['subnet-data', 'subnet-private'], vpcBound: true, description: 'Caché en memoria para DynamoDB (microsegundos).', inboundProtocol: 'DAX 8111', props: [{ key: 'nodes', label: 'Nodos', type: 'number', default: 3, min: 1 }] }),
+  // Integración
+  S({ id: 'mq', name: 'Amazon MQ', short: 'MQ', category: 'integration', role: 'queue', layer: 'integracion', zones: ['subnet-private', 'subnet-data'], vpcBound: true, description: 'Broker administrado RabbitMQ o ActiveMQ (AMQP, MQTT, STOMP) para migrar sistemas existentes.', inboundProtocol: 'AMQPS 5671', props: [{ key: 'engine', label: 'Motor', type: 'select', default: 'RabbitMQ', options: ['RabbitMQ', 'ActiveMQ'] }, { key: 'multiAZ', label: 'Alta disponibilidad (Multi‑AZ)', type: 'bool', default: true }] }),
+  S({ id: 'appsync', name: 'AWS AppSync', short: 'GQL', category: 'integration', role: 'api', layer: 'borde', zones: [...OUT_REG], description: 'API GraphQL administrada con suscripciones en tiempo real.', inboundProtocol: 'HTTPS (GraphQL)' }),
+  S({ id: 'scheduler', name: 'Amazon EventBridge Scheduler', short: 'SCH', category: 'integration', role: 'eventbus', layer: 'integracion', zones: [...OUT_REG], description: 'Tareas programadas (cron/rate) que invocan Lambda, Step Functions, SQS, ECS…' }),
+  S({ id: 'ses', name: 'Amazon SES', short: 'SES', category: 'integration', role: 'topic', layer: 'integracion', zones: [...OUT_REG], description: 'Envío (y recepción) de correo transaccional y masivo.', inboundProtocol: 'HTTPS (SendEmail)' }),
+  S({ id: 'iotcore', name: 'AWS IoT Core', short: 'IOT', category: 'integration', role: 'api', layer: 'borde', zones: [...OUT_REG], description: 'Conecta millones de dispositivos por MQTT con certificados X.509 y reglas hacia otros servicios.', inboundProtocol: 'MQTT/TLS 8883' }),
+  // Seguridad e identidad
+  S({ id: 'identitycenter', name: 'IAM Identity Center', short: 'SSO', category: 'security', role: 'identity', layer: 'seguridad', zones: [...OUT_REG], description: 'Acceso de los empleados a las cuentas de AWS y apps con SSO y MFA.', inboundProtocol: 'SAML/OIDC' }),
+  S({ id: 'directoryservice', name: 'AWS Directory Service', short: 'AD', category: 'security', role: 'identity', layer: 'seguridad', zones: ['subnet-private'], vpcBound: true, description: 'Microsoft Active Directory administrado.', inboundProtocol: 'LDAP/Kerberos' }),
+  S({ id: 'inspector', name: 'Amazon Inspector', short: 'INS', category: 'security', role: 'observability', layer: 'seguridad', zones: [...OUT_REG], description: 'Escaneo continuo de vulnerabilidades en EC2, imágenes de ECR y Lambda.' }),
+  S({ id: 'securityhub', name: 'AWS Security Hub', short: 'SHUB', category: 'security', role: 'observability', layer: 'seguridad', zones: [...OUT_REG], description: 'Postura de seguridad: estándares (CIS, FSBP) y hallazgos centralizados.' }),
+  S({ id: 'macie', name: 'Amazon Macie', short: 'MAC', category: 'security', role: 'observability', layer: 'seguridad', zones: [...OUT_REG], description: 'Descubre datos sensibles (PII) en buckets de S3.' }),
+  S({ id: 'config', name: 'AWS Config', short: 'CFG', category: 'observability', role: 'observability', layer: 'observabilidad', zones: [...OUT_REG], description: 'Inventario y reglas de cumplimiento de la configuración de los recursos.' }),
+  // Observabilidad y gestión
+  S({ id: 'grafana', name: 'Amazon Managed Grafana', short: 'GRF', category: 'observability', role: 'observability', layer: 'observabilidad', zones: [...OUT_REG], description: 'Dashboards sobre CloudWatch, Prometheus, X‑Ray y más.' }),
+  S({ id: 'prometheus', name: 'Amazon Managed Service for Prometheus', short: 'AMP', category: 'observability', role: 'observability', layer: 'observabilidad', zones: [...OUT_REG], description: 'Métricas compatibles con Prometheus (ideal para EKS).' }),
+  S({ id: 'ssm', name: 'AWS Systems Manager', short: 'SSM', category: 'observability', role: 'devops', layer: 'observabilidad', zones: [...OUT_REG], description: 'Session Manager (sin SSH), Patch Manager, Parameter Store y automatizaciones.' }),
+  S({ id: 'cloudformation', name: 'AWS CloudFormation', short: 'CFN', category: 'devops', role: 'devops', layer: 'aplicacion', zones: [...OUT_REG], description: 'Infraestructura como código nativa de AWS.' }),
+  S({ id: 'codebuild', name: 'AWS CodeBuild', short: 'CB', category: 'devops', role: 'devops', layer: 'aplicacion', zones: [...OUT_REG], description: 'Compilación y pruebas administradas (contenedores efímeros).' }),
+  // Analítica
+  S({ id: 'emr', name: 'Amazon EMR', short: 'EMR', category: 'analytics', role: 'analytics', layer: 'datos', zones: ['subnet-private'], vpcBound: true, description: 'Spark, Hive y Presto administrados (en EC2, EKS o serverless).' }),
+  S({ id: 'lakeformation', name: 'AWS Lake Formation', short: 'LF', category: 'analytics', role: 'analytics', layer: 'datos', zones: [...OUT_REG], description: 'Gobierno del data lake: permisos por tabla, columna y fila.' }),
+  // IA
+  S({ id: 'rekognition', name: 'Amazon Rekognition', short: 'REK', category: 'ai', role: 'ai', layer: 'aplicacion', zones: [...OUT_REG], description: 'Análisis de imágenes y video (rostros, objetos, moderación).', inboundProtocol: 'HTTPS (API)' }),
+  S({ id: 'textract', name: 'Amazon Textract', short: 'TXT', category: 'ai', role: 'ai', layer: 'aplicacion', zones: [...OUT_REG], description: 'Extrae texto, tablas y formularios de documentos.', inboundProtocol: 'HTTPS (API)' }),
+  S({ id: 'comprehend', name: 'Amazon Comprehend', short: 'CMP', category: 'ai', role: 'ai', layer: 'aplicacion', zones: [...OUT_REG], description: 'NLP: entidades, sentimiento, clasificación y detección de PII.', inboundProtocol: 'HTTPS (API)' }),
+  S({ id: 'transcribe', name: 'Amazon Transcribe', short: 'TRS', category: 'ai', role: 'ai', layer: 'aplicacion', zones: [...OUT_REG], description: 'Voz a texto.', inboundProtocol: 'HTTPS (API)' }),
+  S({ id: 'translate', name: 'Amazon Translate', short: 'TRL', category: 'ai', role: 'ai', layer: 'aplicacion', zones: [...OUT_REG], description: 'Traducción automática.', inboundProtocol: 'HTTPS (API)' }),
+  S({ id: 'polly', name: 'Amazon Polly', short: 'POL', category: 'ai', role: 'ai', layer: 'aplicacion', zones: [...OUT_REG], description: 'Texto a voz.', inboundProtocol: 'HTTPS (API)' }),
+  S({ id: 'kendra', name: 'Amazon Kendra', short: 'KEN', category: 'ai', role: 'search', layer: 'datos', zones: [...OUT_REG], description: 'Búsqueda empresarial inteligente (RAG sobre documentos internos).', inboundProtocol: 'HTTPS (API)' }),
 ];
 
 SERVICES.push(...AZURE_SERVICES);

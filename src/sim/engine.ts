@@ -689,12 +689,17 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
         const u = healthy > 0 ? total / (p.perInstance * healthy) : 0;
         const thr = p.targetUtil ?? 0.7;
         if (u > thr && s.instances < p.maxInstances) {
-          const want = Math.min(p.maxInstances, Math.max(s.instances + 1, Math.ceil(total / (p.perInstance * Math.max(0.2, thr - 0.1))) + s.lost));
+          const want = p.stepAdd ? Math.min(p.maxInstances, s.instances + p.stepAdd) : Math.min(p.maxInstances, Math.max(s.instances + 1, Math.ceil(total / (p.perInstance * Math.max(0.2, thr - 0.1))) + s.lost));
           s.pending = { at: t + p.scaleDelay, to: want };
-          events.push({ t, label: `${label(id)}: utilización ${Math.round(u * 100)}% → escala a ${want} ${p.scale === 'serverless-db' ? 'ACU (×)' : 'instancias'} (listas en ~${p.scaleDelay} s)`, kind: 'info', nodeId: id });
+          const why =
+            p.scaleMetric === 'requests' ? `${Math.round(total / Math.max(1, healthy))} req/s por instancia (objetivo ${p.targetRequests})`
+            : p.scaleMetric === 'step' ? `CPU ${Math.round(Math.min(u, 1) * 100)}% (umbral ${Math.round(thr * 100)}%) → +${p.stepAdd}`
+            : p.scaleMetric === 'capacity' ? `capacidad al ${Math.round(u * 100)}%`
+            : `CPU ${Math.round(Math.min(u, 1) * 100)}% (objetivo ${Math.round(thr * 100)}%)`;
+          events.push({ t, label: `${label(id)}: ${why} → escala a ${want} ${p.scale === 'serverless-db' ? 'ACU' : 'instancias'} (listas en ~${p.scaleDelay} s, según tu configuración)`, kind: 'info', nodeId: id });
         } else if (u > 1 && s.instances >= p.maxInstances && !s.pending) {
           s.pending = { at: t + 120, to: s.instances }; // evita repetir el aviso cada paso
-          events.push({ t, label: `${label(id)}: llegó al máximo de ${p.maxInstances} instancias y sigue saturado`, kind: 'bad', nodeId: id });
+          events.push({ t, label: `${label(id)}: llegó al máximo configurado (${p.maxInstances}) y sigue saturado — sube el máximo en su sección «Escalado»`, kind: 'bad', nodeId: id });
         }
       }
     }
@@ -847,11 +852,12 @@ function recommendFor(n: ServiceNode, p: SimProfile): string {
   const id = lid(n);
   switch (id) {
     case 'ec2':
-      return n.data.props.autoscaling ? `Aumenta el máximo del Auto Scaling Group (hoy ${p.maxInstances}) o usa instancias más grandes; el escalado tarda ~3 min, considera escalado predictivo.` : 'Activa Auto Scaling y usa al menos 2 instancias en AZ distintas.';
     case 'ecs':
     case 'eks':
     case 'apprunner':
-      return `Sube el máximo de tareas/nodos (hoy ${p.maxInstances}) o la CPU por tarea.`;
+      return p.scale === 'none'
+        ? `No tiene autoescalado (Escalado → «${n.data.props.scalePolicy === 'manual' || n.data.props.autoscaling === false ? 'Sin ASG' : 'Tamaño fijo'}»). Actívalo por CPU o por peticiones en su sección «Escalado».`
+        : `En su sección «Escalado»: sube el máximo (hoy ${p.maxInstances}), baja el objetivo para que reaccione antes o reduce el calentamiento (hoy tarda ~${p.scaleDelay} s). También puedes usar instancias más grandes.`;
     case 'lambda':
       return 'Pide un aumento de la concurrencia de la cuenta, reserva concurrencia para esta función o reduce su duración.';
     case 'apigw':

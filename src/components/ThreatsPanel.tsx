@@ -5,6 +5,9 @@ import { useSim } from '../sim/store';
 import { useStore } from '../store';
 import { STATUS_LABEL, STRIDE, summarizeThreats, threatsToCsv, type Stride, type Threat, type ThreatStatus } from '../threats/model';
 import type { ThreatStatusOverride } from '../types';
+import { SETTING_MAP, SECURITY_GROUPS, SECURITY_SETTINGS } from '../security/settings';
+import { Switch, useNetUi } from './NetInspector';
+import { openSecurity } from './SecurityPanel';
 
 const RISK_ORDER = ['Crítico', 'Alto', 'Medio', 'Bajo'] as const;
 
@@ -56,8 +59,10 @@ function ThreatCard({ t, open, onToggle }: { t: Threat; open: boolean; onToggle:
           <ul className="controls">
             {t.controls.map((c) => (
               <li key={c.key} className={`${c.ok ? 'ok' : ''} ${c.required ? 'req' : 'opt'}`}>
-                {c.auto ? (
-                  <span className={`ctrl-auto ${c.ok ? 'ok' : 'no'}`} title="Se detecta en el diagrama">
+                {c.setting && c.source === 'proyecto' ? (
+                  <Switch on={c.ok} onChange={(v) => useStore.getState().setSecurity({ [c.setting![0]]: v })} label={c.label} />
+                ) : c.auto ? (
+                  <span className={`ctrl-auto ${c.ok ? 'ok' : 'no'}`} title={c.source === 'red' ? 'Según la red configurada' : 'Se detecta en el diagrama'}>
                     {c.ok ? '✓' : '✗'}
                   </span>
                 ) : (
@@ -69,9 +74,29 @@ function ThreatCard({ t, open, onToggle }: { t: Threat; open: boolean; onToggle:
                     {!c.required && <em> · recomendado</em>}
                     {c.group && <em> · alternativa</em>}
                   </span>
-                  <span className="ctrl-src">{c.auto ? 'Detectado en el diagrama' : 'Lo marcas tú cuando esté implementado'}</span>
+                  <span className="ctrl-src">
+                    {c.source === 'proyecto' && c.setting ? (
+                      <>
+                        Seguridad del proyecto · {SECURITY_GROUPS.find((g) => g.id === SETTING_MAP.get(c.setting![0])?.group)?.label}{' '}
+                        <button className="linklike small" onClick={openSecurity}>
+                          ver todo
+                        </button>
+                      </>
+                    ) : c.source === 'red' ? (
+                      <>
+                        Según tu red{' '}
+                        <button className="linklike small" onClick={() => (setView('c2'), useNetUi.getState().setView(true))}>
+                          ⛨ ver red
+                        </button>
+                      </>
+                    ) : c.auto ? (
+                      'Detectado en el diagrama'
+                    ) : (
+                      'Lo marcas tú cuando esté implementado'
+                    )}
+                  </span>
                   {c.hint && !c.ok && <span className="ctrl-hint">{c.hint}</span>}
-                  {c.fix && !c.ok && (
+                  {c.fix && !c.ok && !(c.source === 'proyecto' && c.fix.security) && (
                     <button
                       className="btn small fix"
                       onClick={() => {
@@ -149,6 +174,7 @@ export function ThreatsPanel({ threats }: { threats: Threat[] }) {
   const selected = useMemo(() => nodes.filter((n) => n.selected).map((n) => n.id), [nodes]);
   const selEdges = useMemo(() => edges.filter((e) => e.selected).map((e) => e.id), [edges]);
   const meta = useStore((s) => s.meta);
+  const security = useStore((s) => s.security);
   const sum = summarizeThreats(threats);
   const [scopeOff, setScopeOff] = useState(false);
   const scoped = !scopeOff && (selected.length > 0 || selEdges.length > 0);
@@ -191,6 +217,9 @@ export function ThreatsPanel({ threats }: { threats: Threat[] }) {
       <div className="progress" title={`${pct}% tratado`}>
         <div className="progress-bar" style={{ width: `${pct}%`, background: '#0ca30c' }} />
       </div>
+      <button className="btn small sec-open" onClick={openSecurity}>
+        ⚙ Seguridad del proyecto · {SECURITY_SETTINGS.filter((x) => security[x.key]).length}/{SECURITY_SETTINGS.length} activos
+      </button>
       <div className="stride-filter">
         {sum.byStride.map(({ k, open: o }) => (
           <button key={k} className={strideF.includes(k) ? 'on' : ''} style={strideF.includes(k) ? { background: STRIDE[k].color, borderColor: STRIDE[k].color } : undefined} onClick={() => setStrideF(strideF.includes(k) ? strideF.filter((x) => x !== k) : [...strideF, k])} title={`${STRIDE[k].es}: ${STRIDE[k].property}`}>

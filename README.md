@@ -24,7 +24,7 @@ Los proyectos se guardan como archivos `*.archi.json` en la carpeta `projects/`.
 
 | Función | Detalle |
 |---|---|
-| **Lienzo** | Arrastra piezas desde la paleta: ≈50 servicios de AWS, ≈45 de Azure y actores genéricos. Haz doble clic para que la pieza quede en la zona correcta. Puedes deshacer y rehacer. |
+| **Lienzo** | Arrastra piezas desde la paleta: ≈90 servicios de AWS (incluidos Global Accelerator, Transit Gateway, Network Firewall, Beanstalk, Batch, FSx, Neptune, MemoryDB, Amazon MQ, AppSync, IoT Core, SES, Inspector, Security Hub, servicios de IA…), ≈45 de Azure y actores genéricos. Haz doble clic para que la pieza quede en la zona correcta. Puedes deshacer y rehacer. |
 | **Zonas** | Región → VPC → subnets pública/privada/de datos, más grupos libres. Al soltar una pieza dentro de una zona, la zona la contiene, y la zona crece sola. |
 | **Reglas de conexión** | Cada pieza tiene un *rol*. Las conexiones sin sentido se bloquean y se explica por qué: usuario → BD, Internet → subnet privada, SQS → RDS, BD que inicia conexiones, WAF a algo que no sea CloudFront/ALB/API, etc. Las conexiones dudosas se permiten con un aviso. |
 | **Validación en vivo** | Revisa la ubicación por zona, los puntos de entrada sin WAF, los puntos únicos de falla, Multi‑AZ, el cifrado, una subnet privada sin NAT ni VPC Endpoint, si falta observabilidad o identidad, los secretos de BD y las piezas sueltas. Muchas reglas traen un **arreglo automático ⚡**. |
@@ -115,6 +115,51 @@ En **▶ Simular → Petición de usuario** se sigue una petición real, salto a
 
 Cuando algo está mal configurado, la petición se corta donde fallaría en la nube real. El panel muestra el código que vería el usuario (por ejemplo 504 si un SG bloquea el balanceador → app, 503 si el target group apunta a otro puerto, 502 si falta el listener, 500 si la app no llega a la BD, o `ERR_TOO_MANY_REDIRECTS`). También dice **dónde te equivocaste** y trae el botón para corregirlo. La **batería de pruebas** corre las cinco peticiones a la vez. Los escenarios de carga también tienen en cuenta las conexiones bloqueadas.
 
+## Escalado configurable
+
+Cada pieza que escala tiene su sección **Escalado** en *Propiedades*, con una frase que resume qué va a pasar. Por ejemplo: «Empieza con 2 instancias; si la CPU pasa de 60 % agrega instancias hasta 6 (cada una tarda ~180 s en estar lista)».
+
+| Pieza | Qué se configura |
+|---|---|
+| EC2 / VMSS / Elastic Beanstalk | Política: sin ASG, tamaño fijo, por CPU (target tracking), por peticiones (ALBRequestCountPerTarget) o por pasos. También mínimo, inicial, máximo, objetivo y calentamiento. |
+| ECS / Container Apps | Tareas o réplicas mínimas, iniciales y máximas, y la política (CPU, peticiones o pasos). |
+| EKS / AKS | Nodos y autoscaler. |
+| Lambda / Functions | Concurrencia reservada y aprovisionada. |
+| Aurora | Serverless v2 (ACU mínimas y máximas) o instancias fijas, y réplicas. |
+| DynamoDB / Cosmos DB | On‑demand o provisionada (RCU con auto scaling), o RU/s. |
+| API Gateway / APIM | Throttling (límite y ráfaga). |
+
+La simulación usa **exactamente** esa configuración: si eliges «Tamaño fijo», no escala. Los eventos explican por qué escaló y cuánto tardó, y si llega al máximo te dice que lo subas. El Terraform genera el ASG, las políticas (target tracking, step scaling con su alarma), la concurrencia de Lambda, el rango de ACU de Aurora, el auto scaling de DynamoDB y el throttling de la API.
+
+## Seguridad del proyecto
+
+En *Amenazas → ⚙ Seguridad del proyecto* (o en *Propiedades* del proyecto) se configuran los guardrails y las prácticas que no son una pieza del diagrama, agrupados así:
+
+- **Cuenta y gobierno:** SCP, permission boundary, MFA y SSO, logs inmutables, backups en otra cuenta.
+- **Operación:** hallazgos al SIEM, runbook de DDoS, parcheo, restauraciones probadas.
+- **Pipeline:** SAST/DAST, SCA, escaneo de secretos.
+- **Aplicación:** validación de entradas, BOLA, sesiones, auditoría, firmas de webhooks, anti‑replay, resiliencia…
+- **Datos:** TLS en la BD, AUTH en la caché, logs de acceso.
+- **IA.**
+
+Cada ajuste cumple los controles correspondientes en **todas** las amenazas a la vez, y los del modelo de amenazas se muestran como interruptores. Varios generan Terraform: la política de permission boundary aplicada a todos los roles, la SCP, el trail con Object Lock, la regla de EventBridge de GuardDuty a SNS, Inspector y Patch Manager, AWS Backup con vault lock, la alarma de picos y el parameter group con TLS obligatorio.
+
+Los controles que dependen de la red ahora se calculan con la red configurada, en lugar de marcarse a mano:
+- El SG de la base de datos solo acepta tráfico desde el grupo de la aplicación.
+- El ALB solo acepta tráfico desde CloudFront.
+- Hay redirección HTTP→HTTPS.
+- El throttling de la API está configurado.
+- La salida está controlada con Network Firewall.
+
+## Asistente IA
+
+El botón **✦ IA** abre un asistente que lee el diagrama completo cada vez que le escribes: las piezas, la red y los SG, el escalado, la validación, las amenazas abiertas, la seguridad del proyecto y tus últimas simulaciones. A partir de eso te dice qué está mal y dónde corregirlo dentro de ArchiPlan. Las piezas que menciona son enlaces al diagrama.
+
+- **Proveedores:** OpenAI (GPT), Anthropic (Claude), DeepSeek u OpenRouter. En ⚙ eliges el proveedor, pegas tu API key y el modelo; «Ver los modelos de mi cuenta» lista los disponibles.
+- **Acciones rápidas:** revisar la arquitectura, qué falta para producción, revisar la red y los SG, si aguanta un pico, riesgos de seguridad, costos y explicar la selección.
+- **Revisar mientras diseño:** al dejar de editar unos segundos, comenta los cambios (opcional, consume tokens).
+- **Privacidad:** la API key se guarda solo en tu equipo, en `~/.archiplan/ai.json`, con permisos 600. Nunca va en los proyectos ni en el repositorio, y las llamadas salen desde el servidor local. Por eso el asistente funciona con `npm run serve` o `npm run dev`.
+
 ## Modelo de amenazas (STRIDE)
 
 La pestaña **Amenazas** genera un modelo STRIDE a partir del diagrama, y se actualiza cada vez que lo cambias:
@@ -143,6 +188,10 @@ src/export/        Mermaid, Terraform AWS y Azure, documento, imagen/PDF
 src/sim/           Simulación: perfiles de capacidad, escenarios y motor
 src/threats/       Modelo de amenazas STRIDE: zonas de confianza, reglas y controles
 src/net/           Red configurable: modelo (SG, puertos, listeners), alcanzabilidad y trazado de peticiones
+src/scaling/       Escalado configurable (políticas por tipo de pieza)
+src/security/      Seguridad del proyecto (guardrails y prácticas que cumplen controles)
+src/ai/            Asistente IA: contexto del diagrama y cliente
+server/ai.mjs      Proxy local hacia OpenAI, Anthropic, DeepSeek y OpenRouter
 src/components/    Lienzo, paleta, panel lateral, modales
 ```
 

@@ -14,7 +14,9 @@ import { cloudText, getService, lid, primaryCloud } from '../catalog/catalog';
 import { ancestors, byId, isService, placementOf } from '../lib/graph';
 import { profileFor } from '../sim/profiles';
 import type { ScenarioKind } from '../sim/scenarios';
-import type { AppEdge, AppNode, ConnData, Fix, Role, ServiceNode, ThreatState } from '../types';
+import type { AppEdge, AppNode, ConnData, Fix, Role, SecurityGroup, ServiceNode, ThreatState } from '../types';
+import { CONTROL_SETTING, SETTING_MAP } from '../security/settings';
+import { effectiveNet, isAnyCidr, listenersOf } from '../net/model';
 
 export type Stride = 'S' | 'T' | 'R' | 'I' | 'D' | 'E';
 export const STRIDE: Record<Stride, { name: string; es: string; property: string; color: string }> = {
@@ -43,6 +45,10 @@ export interface Control {
   group?: string;
   hint?: string;
   fix?: Fix;
+  /** Ajustes de «Seguridad del proyecto» que cumplen este control. */
+  setting?: string[];
+  /** Origen del dato: diagrama, red configurada o ajuste del proyecto. */
+  source?: 'diagrama' | 'red' | 'proyecto' | 'manual';
 }
 
 export interface Threat {
@@ -116,8 +122,15 @@ const TLS_RE = /https|tls|ssl|oidc|443|wss|grpcs|dns/i;
 
 /* ───────────────────────────── generación */
 
-export function buildThreats(nodes: AppNode[], edges: AppEdge[], state: Record<string, ThreatState> = {}): { threats: Threat[]; boundaries: Boundary[] } {
+export function buildThreats(
+  nodes: AppNode[],
+  edges: AppEdge[],
+  state: Record<string, ThreatState> = {},
+  opts: { security?: Record<string, boolean>; securityGroups?: SecurityGroup[] } = {},
+): { threats: Threat[]; boundaries: Boundary[] } {
   const map = byId(nodes);
+  const sec = opts.security ?? {};
+  const net = effectiveNet(nodes, edges, opts.securityGroups);
   const services = nodes.filter(isService);
   if (!services.length) return { threats: [], boundaries: [] };
   const ids = new Set(services.map((n) => n.id));
@@ -154,10 +167,15 @@ export function buildThreats(nodes: AppNode[], edges: AppEdge[], state: Record<s
   type InControl = Omit<Control, 'ok'> & { ok?: boolean };
   const push = (t: Omit<Threat, 'score' | 'risk' | 'status' | 'computedStatus' | 'controls'> & { controls: InControl[] }) => {
     const st = state[t.id] ?? {};
-    const controls: Control[] = t.controls.map((c) => ({
-      ...c,
-      ok: c.auto ? !!c.ok : !!st.controls?.[c.key],
-    }));
+    const controls: Control[] = t.controls.map((c) => {
+      const setting = c.setting ?? (!c.auto ? CONTROL_SETTING[c.key] : undefined);
+      if (setting?.length) {
+        const on = setting.some((k) => sec[k]) || (c.auto ? !!c.ok : false) || !!st.controls?.[c.key];
+        const first = setting[0];
+        return { ...c, auto: true, ok: on, setting, source: c.auto && c.ok ? c.source ?? 'diagrama' : 'proyecto', fix: on ? undefined : c.fix ?? { label: `Activar: ${SETTING_MAP.get(first)?.label ?? first}`, security: { [first]: true } } };
+      }
+      return { ...c, ok: c.auto ? !!c.ok : !!st.controls?.[c.key], source: c.source ?? (c.auto ? 'diagrama' : 'manual') };
+    });
     // Estado calculado: todos los obligatorios cumplidos (en grupos basta uno)
     const required = controls.filter((c) => c.required);
     const groups = new Map<string, boolean>();
@@ -171,6 +189,21 @@ export function buildThreats(nodes: AppNode[], edges: AppEdge[], state: Record<s
     const computedStatus: ThreatStatus = required.length && allOk ? 'mitigada' : anyOk ? 'parcial' : 'abierta';
     const { score, risk } = riskOf(t.likelihood, t.impact);
     threats.push({ ...t, controls, score, risk, computedStatus, status: st.status ?? computedStatus, note: st.note, owner: st.owner });
+  };
+
+  // ── Datos de la red configurada (⛨ Red) para los controles que dependen de los Security Groups
+  const sgsOf = (n: ServiceNode) => net.sgIdsOf(n).map((id) => net.groups.find((g) => g.id === id)).filter((g): g is SecurityGroup => !!g);
+  /** El SG de la pieza solo acepta tráfico desde otros SG (no desde rangos de IP abiertos). */
+  const onlyFromSgs = (n: ServiceNode) => {
+    const gs = sgsOf(n);
+    if (!gs.length) return false;
+    const rules = gs.flatMap((g) => g.inbound);
+    return rules.length > 0 && rules.every((r) => r.peer.kind === 'sg' && r.protocol !== 'all');
+  };
+  const onlyFromCdn = (n: ServiceNode) => {
+    const gs = sgsOf(n);
+    const rules = gs.flatMap((g) => g.inbound);
+    return gs.length > 0 && rules.length > 0 && rules.every((r) => r.peer.kind === 'prefix' || r.peer.kind === 'sg' || (r.peer.kind === 'cidr' && !isAnyCidr(r.peer.value)));
   };
 
   // ── Puntos de entrada expuestos a Internet (resolviendo DNS)
@@ -314,7 +347,7 @@ export function buildThreats(nodes: AppNode[], edges: AppEdge[], state: Record<s
           { key: 'tls', label: 'Conexión cifrada (HTTPS/TLS)', auto: true, ok: TLS_RE.test(proto) || proto === '', required: true },
           { key: 'minimize', label: 'Enviar solo los datos mínimos necesarios (sin datos personales innecesarios)', auto: false, required: true },
           { key: 'resilience', label: 'Timeouts, reintentos con backoff y circuit breaker (o una cola en medio)', auto: false, required: true },
-          { key: 'egress', label: 'Control de salida: allowlist de dominios (Network Firewall / proxy)', auto: false, required: false },
+          { key: 'egress', label: 'Control de salida: allowlist de dominios (Network Firewall / proxy)', auto: true, ok: has('networkfirewall'), required: false, fix: has('networkfirewall') ? undefined : { label: 'Agregar Network Firewall', add: [{ serviceId: 'networkfirewall' }] } },
         ],
         sim: { kind: 'node-outage', targetId: x.id, label: 'Simular caída del tercero' },
       });
@@ -404,7 +437,11 @@ export function buildThreats(nodes: AppNode[], edges: AppEdge[], state: Record<s
         refs: ['OWASP A02:2021', 'CWE-319'],
         controls: [
           { key: 'tls', label: 'HTTPS con certificado TLS (ACM)', auto: true, ok: tlsIn || acm || r === 'api', required: true, fix: tlsIn || acm ? undefined : addOrConnect('acm', null, en, 'Agregar certificado ACM') },
-          { key: 'hsts', label: 'Redirección HTTP→HTTPS, HSTS y TLS 1.2+', auto: false, required: false },
+          (() => {
+            const ls = role(en) === 'lb' ? listenersOf(en) : [];
+            const ok = role(en) === 'cdn' || role(en) === 'api' || (ls.some((l) => l.protocol === 'HTTPS' && l.cert) && ls.filter((l) => l.protocol === 'HTTP').every((l) => l.action === 'redirect-https'));
+            return { key: 'hsts', label: 'Redirección HTTP→HTTPS, HSTS y TLS 1.2+', auto: true, ok, required: false, source: 'red' as const, hint: ok ? undefined : 'Configura los listeners en Propiedades → Red: HTTPS con certificado y el 80 redirigiendo a HTTPS.' };
+          })(),
         ],
       });
     }
@@ -427,7 +464,7 @@ export function buildThreats(nodes: AppNode[], edges: AppEdge[], state: Record<s
       impact: 3,
       refs: ['ATT&CK T1190', 'AWS: restricting access to ALB origins'],
       controls: [
-        { key: 'restrict', label: 'Security group del ALB solo con la prefix list de CloudFront (o cabecera secreta validada)', auto: false, required: true, group: 'origin' },
+        { key: 'restrict', label: 'Security group del ALB solo con la prefix list de CloudFront (o cabecera secreta validada)', auto: true, ok: onlyFromCdn(lb), required: true, group: 'origin', source: 'red', hint: onlyFromCdn(lb) ? undefined : 'En ⛨ Red, el grupo del balanceador acepta tráfico de cualquier IP: quita esa regla y deja solo la de CloudFront.' },
         { key: 'waf-alb', label: 'WAF asociado también al balanceador', auto: true, ok: !!wafOf(lb), required: true, group: 'origin', fix: wafOf(lb) ? undefined : anyWaf ? { label: 'Asociar el WAF también al ALB', connect: [{ source: anyWaf.id, target: lb.id }] } : undefined },
       ],
       sim: { kind: 'ddos-l7', targetId: lb.id, label: 'Simular ataque directo al ALB' },
@@ -452,7 +489,7 @@ export function buildThreats(nodes: AppNode[], edges: AppEdge[], state: Record<s
       controls: [
         { key: 'authorizer', label: 'Authorizer JWT/OIDC en la API', auto: true, ok: authorizer, required: true, fix: authorizer ? undefined : addOrConnect('cognito', api, null, 'Agregar Cognito como authorizer') },
         { key: 'bola', label: 'Autorización por objeto: el usuario solo accede a sus propios recursos', auto: false, required: true },
-        { key: 'quota', label: 'Throttling y cuotas por cliente (usage plans)', auto: false, required: false },
+        { key: 'quota', label: 'Throttling y cuotas por cliente (usage plans)', auto: true, ok: api.data.props.rateLimit !== undefined, required: false, hint: 'Se configura en la sección «Escalado» de la API (límite y ráfaga).', fix: api.data.props.rateLimit !== undefined ? undefined : setProps(api, { rateLimit: 1000, burstLimit: 500 }, 'Limitar a 1.000 req/s') },
       ],
     });
   }
@@ -514,7 +551,7 @@ export function buildThreats(nodes: AppNode[], edges: AppEdge[], state: Record<s
       impact: 3,
       refs: ['OWASP A01:2021', 'ATT&CK T1078.004', 'CWE-250'],
       controls: [
-        { key: 'least', label: 'Rol con mínimo privilegio, sin comodines', auto: false, required: true, hint: 'El Terraform que exporta ArchiPlan ya genera la política a partir de las flechas del diagrama.' },
+        { key: 'least', label: 'Rol con mínimo privilegio, sin comodines (lo genera el Terraform a partir de las flechas)', auto: true, ok: true, required: true },
         { key: 'boundary', label: 'Permission boundary o SCP que limite el máximo', auto: false, required: false },
       ],
     });
@@ -534,7 +571,7 @@ export function buildThreats(nodes: AppNode[], edges: AppEdge[], state: Record<s
       refs: ['OWASP A06:2021', 'ATT&CK T1190'],
       controls: [
         ...(isContainer ? [{ key: 'ecr', label: 'Imágenes desde ECR con escaneo al subir', auto: true, ok: ecrLinked, required: true, fix: ecrLinked ? undefined : addOrConnect('ecr', null, c, 'Agregar ECR') }] : []),
-        { key: 'patch', label: sid(c) === 'ec2' ? 'Parcheo del SO (SSM Patch Manager) y Amazon Inspector' : 'Escaneo de dependencias (SCA) en CI y actualización continua', auto: false, required: true },
+        { key: 'patch', label: sid(c) === 'ec2' ? 'Parcheo del SO (SSM Patch Manager) y Amazon Inspector' : 'Escaneo de dependencias (SCA) en CI y actualización continua', auto: true, ok: sid(c) === 'ec2' && has('inspector'), required: true, setting: sid(c) === 'ec2' ? ['patching'] : ['sca'] },
         { key: 'runtime', label: 'Detección en tiempo de ejecución (GuardDuty)', auto: true, ok: has('guardduty'), required: false },
         ...(sid(c) === 'ec2' ? [{ key: 'imdsv2', label: 'IMDSv2 obligatorio (lo configura el Terraform exportado)', auto: true, ok: true, required: false }] : []),
       ],
@@ -572,7 +609,7 @@ export function buildThreats(nodes: AppNode[], edges: AppEdge[], state: Record<s
       impact: 2,
       refs: ['ATT&CK T1499', 'Well‑Architected REL'],
       controls: [
-        { key: 'autoscale', label: 'Escala automáticamente', auto: true, ok: scales, required: true, fix: sid(c) === 'ec2' && !scales ? setProps(c, { autoscaling: true, count: Math.max(2, Number(c.data.props.count) || 2) }, 'Activar Auto Scaling') : undefined },
+        { key: 'autoscale', label: 'Escala automáticamente', auto: true, ok: scales, required: true, fix: !scales && ['ec2', 'ecs', 'eks', 'apprunner'].includes(sid(c)) ? setProps(c, { scalePolicy: 'cpu', autoscaling: true, 'sim.autoscaling': true, ...(sid(c) === 'ec2' ? { count: Math.max(2, Number(c.data.props.count) || 2) } : {}) }, 'Escalar por CPU') : undefined, hint: 'Se configura en la sección «Escalado» de la pieza.' },
         { key: 'multiaz', label: 'Al menos 2 instancias en zonas distintas', auto: true, ok: p.multiAz || sid(c) === 'lambda', required: true, fix: sid(c) === 'ecs' && !p.multiAz ? setProps(c, { desired: 2 }, 'Usar 2 tareas') : sid(c) === 'ec2' && !p.multiAz ? setProps(c, { count: 2, autoscaling: true }, 'Usar 2 instancias') : undefined },
       ],
       sim: { kind: 'spike', label: 'Simular pico de tráfico' },
@@ -626,7 +663,9 @@ export function buildThreats(nodes: AppNode[], edges: AppEdge[], state: Record<s
         { key: 'noinet', label: 'Sin acceso directo desde Internet', auto: true, ok: !exposed, required: true },
         ...(s === 's3' ? [{ key: 'bpa', label: 'Bloqueo de acceso público en el bucket', auto: true, ok: !p.public, required: true, fix: p.public ? setProps(d, { public: false }, 'Bloquear acceso público') : undefined }] : []),
         ...(vpcBound ? [{ key: 'isolated', label: 'En una subnet de datos aislada', auto: true, ok: place === 'subnet-data', required: false, hint: 'Arrástrala a una subnet de datos.' }] : []),
-        { key: 'least', label: 'Políticas IAM / security groups que solo permiten a la aplicación', auto: false, required: true },
+        ...(vpcBound
+          ? [{ key: 'least', label: 'Su security group solo acepta tráfico desde el grupo de la aplicación', auto: true, ok: onlyFromSgs(d), required: true, source: 'red' as const, hint: onlyFromSgs(d) ? undefined : 'En ⛨ Red, la pieza acepta tráfico desde rangos de IP (o no tiene grupo). Deja solo el grupo de la aplicación como origen.' }]
+          : [{ key: 'least', label: 'Política de recurso / IAM que solo permite a la aplicación (lo genera el Terraform)', auto: true, ok: true, required: true }]),
       ],
     });
     if (encryptable || s === 'dynamodb' || s === 'elasticache') {
@@ -778,7 +817,7 @@ export function buildThreats(nodes: AppNode[], edges: AppEdge[], state: Record<s
       controls: [
         { key: 'mfa', label: 'MFA (obligatorio para cuentas privilegiadas)', auto: true, ok: mfa !== 'OFF', required: true, fix: mfa === 'OFF' ? setProps(id, { mfa: 'OPTIONAL' }, 'Activar MFA') : undefined },
         { key: 'password', label: 'Política de contraseñas robusta (12+ caracteres en el Terraform exportado)', auto: true, ok: true, required: false },
-        { key: 'threatprot', label: 'Protección ante credenciales comprometidas y bloqueo adaptativo (Cognito threat protection)', auto: false, required: true },
+        { key: 'threatprot', label: 'Protección ante credenciales comprometidas y bloqueo adaptativo (Cognito threat protection)', auto: true, ok: !!id.data.props.threatProtection, required: true, fix: id.data.props.threatProtection ? undefined : setProps(id, { threatProtection: true }, 'Activar threat protection') },
         { key: 'waf', label: 'WAF delante del flujo de login', auto: true, ok: !!anyWaf, required: false },
       ],
       sim: { kind: 'web-attacks', label: 'Simular bots contra el login' },
@@ -828,7 +867,7 @@ export function buildThreats(nodes: AppNode[], edges: AppEdge[], state: Record<s
       controls: isDb
         ? [
             { key: 'tls', label: 'TLS obligatorio en la conexión (rds.force_ssl / require_secure_transport / transit encryption)', auto: false, required: true },
-            { key: 'sg', label: 'Security group que solo acepta el puerto desde el SG de la aplicación (en el Terraform exportado)', auto: true, ok: true, required: false },
+            { key: 'sg', label: 'Security group que solo acepta el puerto desde el SG de la aplicación', auto: true, ok: onlyFromSgs(t), required: false, source: 'red' as const, hint: onlyFromSgs(t) ? undefined : 'Revisa el grupo de la base de datos en ⛨ Red: tiene orígenes por rango de IP o abiertos.' },
           ]
         : [
             { key: 'tls', label: managedApi && !TLS_RE.test(proto) ? 'Cifrado por la API de AWS (HTTPS)' : 'Cifrado en tránsito (HTTPS/TLS)', auto: !(!tlsAuto && !fromInternet && zs.trust >= 2), ok: tlsAuto, required: true, hint: tlsAuto ? undefined : 'Usa HTTPS en la conexión (edita el protocolo de la flecha) o re‑cifra en el balanceador.' },

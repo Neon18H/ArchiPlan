@@ -3,6 +3,7 @@ import { byId, isService, isZone, placementOf } from '../lib/graph';
 import { buildGuide } from '../rules/guide';
 import { COMPONENT_KINDS } from '../c3/model';
 import { validate } from '../rules/validate';
+import { describeScaling, SCALING_KEYS, scalingKind } from '../scaling/model';
 import { analyzeNetwork } from '../net/reach';
 import { netIssues } from '../net/issues';
 import { effectiveNet, isLb, listenersOf, listenPort, needsSg, ruleText } from '../net/model';
@@ -49,7 +50,7 @@ function model(p: Project): DocModel {
     g.outbound.map((r) => ruleText(r, netCfg.groups, cdnName)).join('; ') || 'nada',
   ]);
   const cloud = primaryCloud(nodes, meta.provider ?? 'aws');
-  const tm = buildThreats(nodes, edges, p.threats ?? {});
+  const tm = buildThreats(nodes, edges, p.threats ?? {}, { security: p.security, securityGroups: p.securityGroups });
   const guide = buildGuide(nodes, edges, decisions, issues, tm.threats);
   const role = (n: ServiceNode) => getService(n.data.serviceId).role;
   const actors = services.filter((n) => role(n) === 'actor');
@@ -57,8 +58,9 @@ function model(p: Project): DocModel {
   const outsideIds = new Set([...actors, ...externals].map((n) => n.id));
 
   const propsText = (n: ServiceNode) => {
-    const defs = getService(n.data.serviceId).props ?? [];
-    return defs.map((d) => `${d.label}: ${typeof n.data.props[d.key] === 'boolean' ? (n.data.props[d.key] ? 'sí' : 'no') : n.data.props[d.key]}`).join('; ');
+    const defs = (getService(n.data.serviceId).props ?? []).filter((d) => !(scalingKind(n) && SCALING_KEYS.has(d.key)));
+    const sc = describeScaling(n);
+    return [...defs.map((d) => `${d.label}: ${typeof n.data.props[d.key] === 'boolean' ? (n.data.props[d.key] ? 'sí' : 'no') : n.data.props[d.key]}`), ...(sc ? [`Escalado: ${sc}`] : [])].join('; ');
   };
 
   const layers = (Object.keys(LAYERS) as (keyof typeof LAYERS)[])

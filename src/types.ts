@@ -241,6 +241,8 @@ export interface Project {
   threats?: Record<string, ThreatState>;
   /** Security Groups configurados. Vacío = modo automático (derivados de las flechas). */
   securityGroups?: SecurityGroup[];
+  /** Seguridad del proyecto: prácticas y guardrails configurados (ver src/security/settings.ts). */
+  security?: Record<string, boolean>;
 }
 
 export type Severity = 'error' | 'warn' | 'info';
@@ -272,4 +274,6 @@ export interface Fix {
   /** Conexiones a crear. 'new:N' referencia la N-ésima pieza agregada. */
   connect?: { source: string; target: string; protocol?: string }[];
   setProps?: { nodeId: string; props: Record<string, PropValue> }[];
+  /** Ajustes de «Seguridad del proyecto» a activar. */
+  security?: Record<string, boolean>;
 }

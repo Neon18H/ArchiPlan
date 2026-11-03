@@ -1,6 +1,7 @@
 import { getService } from '../catalog/catalog';
 import { byId, isService, isZone, placementOf } from '../lib/graph';
 import type { AppEdge, AppNode, ProjectMeta, SecurityGroup, ServiceNode, SgRule } from '../types';
+import { scalingOf } from '../scaling/model';
 import { effectiveNet, listenersOf, listenPort, originProtocol, targetOf } from '../net/model';
 
 /**
@@ -8,7 +9,7 @@ import { effectiveNet, listenersOf, listenPort, originProtocol, targetOf } from 
  * No pretende ser un despliegue final: es un punto de partida con la red,
  * los recursos, los security groups derivados de las conexiones y TODOs.
  */
-export function toTerraform(nodes: AppNode[], edges: AppEdge[], meta: ProjectMeta, securityGroups?: SecurityGroup[]): string {
+export function toTerraform(nodes: AppNode[], edges: AppEdge[], meta: ProjectMeta, securityGroups?: SecurityGroup[], security: Record<string, boolean> = {}): string {
   const map = byId(nodes);
   const services = nodes.filter(isService).filter((n) => getService(n.data.serviceId).provider !== 'azure');
   const zones = nodes.filter(isZone);
@@ -64,7 +65,11 @@ terraform {
     aws = {
       source  = "hashicorp/aws"
       version = "~> 5.0"
-    }
+    }${services.some((n) => n.data.serviceId === 'mq') ? `
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.6"
+    }` : ''}
   }
 }
 
@@ -306,7 +311,8 @@ ${g.inbound.map((r, i) => ruleBlock(g, r, 'ingress', i + 1)).join('')}${g.outbou
     const stmts = policyFor(n);
     block(`
 resource "aws_iam_role" "${name}" {
-  name = "\${local.name}-${name.replace(/_/g, '-')}"
+  name = "\${local.name}-${name.replace(/_/g, '-')}"${security.boundary ? `
+  permissions_boundary = aws_iam_policy.app_boundary.arn` : ''}
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -652,6 +658,10 @@ resource "aws_apigatewayv2_stage" "${name}" {
   api_id      = aws_apigatewayv2_api.${name}.id
   name        = "$default"
   auto_deploy = true
+  default_route_settings {
+    throttling_rate_limit  = ${scalingOf(n)!.rateLimit}
+    throttling_burst_limit = ${scalingOf(n)!.burstLimit}
+  }
 }
 ${fns
   .map(
@@ -700,7 +710,7 @@ resource "aws_lambda_function" "${name}" {
   handler       = "index.handler"
   filename      = "build/${name}.zip" # TODO: artefacto de tu pipeline
   memory_size   = ${Number(p.memory) || 512}
-  timeout       = ${Number(p.timeout) || 30}${cw ? `
+  timeout       = ${Number(p.timeout) || 30}${Number(p.reservedConcurrency) > 0 ? `\n  reserved_concurrent_executions = ${Number(p.reservedConcurrency)}` : ''}${cw ? `
   tracing_config {
     mode = "Active"
   }` : ''}${subnets ? `
@@ -735,7 +745,9 @@ resource "aws_lambda_event_source_mapping" "${tfName(s)}_to_${name}" {
       }
       case 'ec2': {
         const lb = lbTarget(n);
-        const asg = !!p.autoscaling;
+        const sc = scalingOf(n)!;
+        const asg = sc.policy !== 'manual';
+        const grows = ['cpu', 'requests', 'step'].includes(sc.policy);
         block(`
 ${header}
 data "aws_ami" "${name}" {
@@ -757,18 +769,19 @@ resource "aws_launch_template" "${name}" {
 }
 ${asg ? `
 resource "aws_autoscaling_group" "${name}" {
-  name_prefix         = "\${local.name}-${name.replace(/_/g, '-')}-"
-  min_size            = ${p.minSize !== undefined ? Math.max(0, Number(p.minSize)) : Math.max(1, Number(p.count) || 2)}
-  max_size            = ${p.maxSize !== undefined ? Math.max(1, Number(p.maxSize)) : Math.max(2, (Number(p.count) || 2) * 3)}
-  desired_capacity    = ${Math.max(1, Number(p.count) || 2)}
-  vpc_zone_identifier = ${subnets ?? '[] # TODO'}${lb ? `\n  target_group_arns   = [aws_lb_target_group.${tgName(lb, n)}.arn]` : ''}
-  health_check_type   = ${q(lb ? 'ELB' : 'EC2')}
+  name_prefix             = "\${local.name}-${name.replace(/_/g, '-')}-"
+  min_size                = ${grows ? sc.min : sc.desired}
+  max_size                = ${grows ? sc.max : sc.desired}
+  desired_capacity        = ${sc.desired}
+  default_instance_warmup = ${sc.warmup}
+  vpc_zone_identifier     = ${subnets ?? '[] # TODO'}${lb ? `\n  target_group_arns       = [aws_lb_target_group.${tgName(lb, n)}.arn]` : ''}
+  health_check_type       = ${q(lb ? 'ELB' : 'EC2')}
   launch_template {
     id      = aws_launch_template.${name}.id
     version = "$Latest"
   }
 }
-
+${sc.policy === 'cpu' ? `
 resource "aws_autoscaling_policy" "${name}_cpu" {
   name                   = "${name.replace(/_/g, '-')}-cpu"
   autoscaling_group_name = aws_autoscaling_group.${name}.name
@@ -777,12 +790,54 @@ resource "aws_autoscaling_policy" "${name}_cpu" {
     predefined_metric_specification {
       predefined_metric_type = "ASGAverageCPUUtilization"
     }
-    target_value = ${Number(p.targetCpu) || 60}
+    target_value = ${sc.targetCpu}
+  }
+}
+` : ''}${sc.policy === 'requests' ? (lb && lb.data.serviceId === 'alb' ? `
+resource "aws_autoscaling_policy" "${name}_requests" {
+  name                   = "${name.replace(/_/g, '-')}-requests"
+  autoscaling_group_name = aws_autoscaling_group.${name}.name
+  policy_type            = "TargetTrackingScaling"
+  target_tracking_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ALBRequestCountPerTarget"
+      resource_label         = "\${aws_lb.${tfName(lb)}.arn_suffix}/\${aws_lb_target_group.${tgName(lb, n)}.arn_suffix}"
+    }
+    target_value = ${sc.targetRequests * 60} # peticiones por minuto por instancia (${sc.targetRequests} req/s)
   }
 }
 ` : `
+# TODO: el escalado por peticiones necesita un ALB delante de ${n.data.label}
+`) : ''}${sc.policy === 'step' ? `
+resource "aws_autoscaling_policy" "${name}_step" {
+  name                      = "${name.replace(/_/g, '-')}-step"
+  autoscaling_group_name    = aws_autoscaling_group.${name}.name
+  policy_type               = "StepScaling"
+  adjustment_type           = "ChangeInCapacity"
+  estimated_instance_warmup = ${sc.warmup}
+  step_adjustment {
+    metric_interval_lower_bound = 0
+    scaling_adjustment          = ${sc.stepAdd}
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "${name}_cpu_high" {
+  alarm_name          = "\${local.name}-${name.replace(/_/g, '-')}-cpu-alta"
+  namespace           = "AWS/EC2"
+  metric_name         = "CPUUtilization"
+  statistic           = "Average"
+  period              = 60
+  evaluation_periods  = 2
+  threshold           = ${sc.stepThreshold}
+  comparison_operator = "GreaterThanThreshold"
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.${name}.name
+  }
+  alarm_actions = [aws_autoscaling_policy.${name}_step.arn]
+}
+` : ''}` : `
 resource "aws_instance" "${name}" {
-  count     = ${Number(p.count) || 1}
+  count     = ${sc.desired}
   subnet_id = element(${subnets ?? '[] # TODO'}, count.index)
   launch_template {
     id      = aws_launch_template.${name}.id
@@ -830,7 +885,7 @@ resource "aws_ecs_service" "${name}" {
   name            = ${q(name.replace(/_/g, '-'))}
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.${name}.arn
-  desired_count   = ${Number(p.desired) || 2}
+  desired_count   = ${scalingOf(n)!.desired}
   launch_type     = "FARGATE"
   network_configuration {
     subnets         = ${subnets ?? '[] # TODO'}
@@ -842,29 +897,41 @@ resource "aws_ecs_service" "${name}" {
     container_port   = ${listenPort(n)}
   }` : ''}
 }
-${p['sim.autoscaling'] !== false ? `
+${(() => {
+  const sc = scalingOf(n)!;
+  if (!['cpu', 'requests', 'step'].includes(sc.policy)) return '';
+  const metric = sc.policy === 'requests' && lb && lb.data.serviceId === 'alb'
+    ? `    predefined_metric_specification {
+      predefined_metric_type = "ALBRequestCountPerTarget"
+      resource_label         = "\${aws_lb.${tfName(lb)}.arn_suffix}/\${aws_lb_target_group.${tgName(lb, n)}.arn_suffix}"
+    }`
+    : `    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+    }`;
+  const target = sc.policy === 'requests' && lb ? sc.targetRequests * 60 : sc.policy === 'step' ? sc.stepThreshold : sc.targetCpu;
+  return `
 resource "aws_appautoscaling_target" "${name}" {
   service_namespace  = "ecs"
   resource_id        = "service/\${aws_ecs_cluster.main.name}/\${aws_ecs_service.${name}.name}"
   scalable_dimension = "ecs:service:DesiredCount"
-  min_capacity       = ${Number(p.desired) || 2}
-  max_capacity       = ${p.maxTasks !== undefined ? Math.max(Number(p.desired) || 1, Number(p.maxTasks)) : (Number(p.desired) || 2) * 4}
+  min_capacity       = ${sc.min}
+  max_capacity       = ${sc.max}
 }
 
-resource "aws_appautoscaling_policy" "${name}_cpu" {
-  name               = "${name.replace(/_/g, '-')}-cpu"
+resource "aws_appautoscaling_policy" "${name}_scale" {
+  name               = "${name.replace(/_/g, '-')}-${sc.policy}"
   policy_type        = "TargetTrackingScaling"
   service_namespace  = aws_appautoscaling_target.${name}.service_namespace
   resource_id        = aws_appautoscaling_target.${name}.resource_id
   scalable_dimension = aws_appautoscaling_target.${name}.scalable_dimension
   target_tracking_scaling_policy_configuration {
-    target_value = ${Number(p.targetCpu) || 60}
-    predefined_metric_specification {
-      predefined_metric_type = "ECSServiceAverageCPUUtilization"
-    }
+    target_value       = ${target}
+    scale_out_cooldown = ${sc.warmup}
+${metric}
   }
 }
-` : ''}`);
+`;
+})()}`);
         break;
       }
       case 'eks':
@@ -980,7 +1047,7 @@ resource "aws_db_instance" "${name}" {
   identifier                  = "\${local.name}-${name.replace(/_/g, '-')}"
   engine                      = ${q(p.engine || 'postgres')}
   instance_class              = ${q(p.instanceClass || 'db.t4g.medium')}
-  allocated_storage           = ${Number(p.storage) || 50}${n.data.net?.port ? `\n  port                        = ${n.data.net.port}` : ''}
+  allocated_storage           = ${Number(p.storage) || 50}${n.data.net?.port ? `\n  port                        = ${n.data.net.port}` : ''}${security.dbTls ? `\n  parameter_group_name        = aws_db_parameter_group.${name}_tls.name` : ''}${security.dataAuditLogs ? `\n  enabled_cloudwatch_logs_exports = [${String(p.engine || 'postgres').includes('postgres') ? '"postgresql"' : '"audit", "error"'}]` : ''}
   username                    = "app_admin"
   manage_master_user_password = true # contraseña en Secrets Manager con rotación
   multi_az                    = ${!!p.multiAZ}
@@ -994,7 +1061,8 @@ resource "aws_db_instance" "${name}" {
 `);
         break;
       case 'aurora': {
-        const instances = 1 + (Number(p.replicas) || 0);
+        const asc = scalingOf(n)!;
+        const instances = 1 + (asc.replicas ?? 0);
         block(`
 ${header}
 resource "aws_db_subnet_group" "${name}" {
@@ -1012,10 +1080,10 @@ resource "aws_rds_cluster" "${name}" {
   backup_retention_period     = 7
   deletion_protection         = true
   skip_final_snapshot         = false
-  final_snapshot_identifier   = "\${local.name}-${name.replace(/_/g, '-')}-final"${p.serverless ? `
+  final_snapshot_identifier   = "\${local.name}-${name.replace(/_/g, '-')}-final"${asc.serverless ? `
   serverlessv2_scaling_configuration {
-    min_capacity = 0.5
-    max_capacity = 8
+    min_capacity = ${asc.minAcu}
+    max_capacity = ${asc.maxAcu}
   }` : ''}
 }
 
@@ -1024,7 +1092,7 @@ resource "aws_rds_cluster_instance" "${name}" {
   identifier         = "\${local.name}-${name.replace(/_/g, '-')}-\${count.index}"
   cluster_identifier = aws_rds_cluster.${name}.id
   engine             = aws_rds_cluster.${name}.engine
-  instance_class     = ${q(p.serverless ? 'db.serverless' : 'db.r6g.large')}
+  instance_class     = ${q(asc.serverless ? 'db.serverless' : 'db.r6g.large')}
 }
 `);
         break;
@@ -1034,7 +1102,7 @@ resource "aws_rds_cluster_instance" "${name}" {
 ${header}
 resource "aws_dynamodb_table" "${name}" {
   name         = "\${local.name}-${name.replace(/_/g, '-')}"
-  billing_mode = ${q(p.billing || 'PAY_PER_REQUEST')}${p.billing === 'PROVISIONED' ? '\n  read_capacity  = 5\n  write_capacity = 5' : ''}
+  billing_mode = ${q(p.billing || 'PAY_PER_REQUEST')}${p.billing === 'PROVISIONED' ? `\n  read_capacity  = ${scalingOf(n)!.rcu}\n  write_capacity = ${Math.max(1, Math.round((scalingOf(n)!.rcu ?? 1000) / 4))}` : ''}
   hash_key     = ${q(p.pk || 'pk')}${p.streams ? '\n  stream_enabled   = true\n  stream_view_type = "NEW_AND_OLD_IMAGES"' : ''}
   attribute {
     name = ${q(p.pk || 'pk')}
@@ -1046,6 +1114,241 @@ resource "aws_dynamodb_table" "${name}" {
   server_side_encryption {
     enabled = true
   }
+}
+${p.billing === 'PROVISIONED' && scalingOf(n)!.policy === 'cpu' ? `
+resource "aws_appautoscaling_target" "${name}_read" {
+  service_namespace  = "dynamodb"
+  resource_id        = "table/\${aws_dynamodb_table.${name}.name}"
+  scalable_dimension = "dynamodb:table:ReadCapacityUnits"
+  min_capacity       = ${scalingOf(n)!.rcu}
+  max_capacity       = ${scalingOf(n)!.maxRcu}
+}
+
+resource "aws_appautoscaling_policy" "${name}_read" {
+  name               = "${name.replace(/_/g, '-')}-read"
+  policy_type        = "TargetTrackingScaling"
+  service_namespace  = aws_appautoscaling_target.${name}_read.service_namespace
+  resource_id        = aws_appautoscaling_target.${name}_read.resource_id
+  scalable_dimension = aws_appautoscaling_target.${name}_read.scalable_dimension
+  target_tracking_scaling_policy_configuration {
+    target_value = 70
+    predefined_metric_specification {
+      predefined_metric_type = "DynamoDBReadCapacityUtilization"
+    }
+  }
+}
+` : ''}`);
+        break;
+      case 'mq':
+        block(`
+${header}
+resource "random_password" "${name}_mq" {
+  length  = 24
+  special = false
+}
+
+resource "aws_mq_broker" "${name}" {
+  broker_name                = "\${local.name}-${name.replace(/_/g, '-')}"
+  engine_type                = ${q(p.engine || 'RabbitMQ')}
+  engine_version             = ${q(p.engine === 'ActiveMQ' ? '5.18' : '3.13')} # TODO: versión soportada
+  host_instance_type         = "mq.m5.large"
+  deployment_mode            = ${q(p.engine === 'ActiveMQ' ? (p.multiAZ !== false ? 'ACTIVE_STANDBY_MULTI_AZ' : 'SINGLE_INSTANCE') : p.multiAZ !== false ? 'CLUSTER_MULTI_AZ' : 'SINGLE_INSTANCE')}
+  publicly_accessible        = false
+  auto_minor_version_upgrade = true
+  subnet_ids                 = ${p.multiAZ !== false ? (dataSubnets ?? '[] # TODO') : `[element(${dataSubnets ?? '[]'}, 0)]`}${sg ? `\n  security_groups            = [${sg}]` : ''}
+  user {
+    username = "app"
+    password = random_password.${name}_mq.result
+  }
+}
+`);
+        break;
+      case 'neptune':
+        block(`
+${header}
+resource "aws_neptune_subnet_group" "${name}" {
+  name       = "\${local.name}-${name.replace(/_/g, '-')}"
+  subnet_ids = ${dataSubnets ?? '[] # TODO'}
+}
+
+resource "aws_neptune_cluster" "${name}" {
+  cluster_identifier                  = "\${local.name}-${name.replace(/_/g, '-')}"
+  engine                              = "neptune"
+  storage_encrypted                   = ${p.encrypted !== false}
+  iam_database_authentication_enabled = true
+  neptune_subnet_group_name           = aws_neptune_subnet_group.${name}.name${sg ? `\n  vpc_security_group_ids              = [${sg}]` : ''}
+  backup_retention_period             = 7
+  skip_final_snapshot                 = false
+  final_snapshot_identifier           = "\${local.name}-${name.replace(/_/g, '-')}-final"
+}
+
+resource "aws_neptune_cluster_instance" "${name}" {
+  count              = ${Math.max(1, Number(p.instances) || 2)}
+  cluster_identifier = aws_neptune_cluster.${name}.id
+  instance_class     = "db.r6g.large"
+  engine             = "neptune"
+}
+`);
+        break;
+      case 'memorydb':
+        block(`
+${header}
+resource "aws_memorydb_subnet_group" "${name}" {
+  name       = "\${local.name}-${name.replace(/_/g, '-')}"
+  subnet_ids = ${dataSubnets ?? '[] # TODO'}
+}
+
+resource "aws_memorydb_cluster" "${name}" {
+  name                   = "\${local.name}-${name.replace(/_/g, '-')}"
+  node_type              = "db.t4g.small"
+  num_shards             = ${Math.max(1, Number(p.shards) || 1)}
+  num_replicas_per_shard = ${Math.max(0, Number(p.replicas) || 1)}
+  acl_name               = "open-access" # TODO: crea un ACL con usuarios (RBAC)
+  tls_enabled            = true
+  subnet_group_name      = aws_memorydb_subnet_group.${name}.name${sg ? `\n  security_group_ids     = [${sg}]` : ''}
+}
+`);
+        break;
+      case 'keyspaces':
+        block(`
+${header}
+resource "aws_keyspaces_keyspace" "${name}" {
+  name = ${q(`${slug.replace(/-/g, '_')}_${name}`.slice(0, 48))}
+}
+`);
+        break;
+      case 'timestream':
+        block(`
+${header}
+resource "aws_timestreamwrite_database" "${name}" {
+  database_name = "\${local.name}-${name.replace(/_/g, '-')}"
+}
+`);
+        break;
+      case 'ses':
+        block(`
+${header}
+variable "ses_domain" {
+  type        = string
+  description = "Dominio desde el que se envían los correos"
+  default     = "example.com"
+}
+
+resource "aws_sesv2_email_identity" "${name}" {
+  email_identity = var.ses_domain
+}
+`);
+        break;
+      case 'appsync':
+        block(`
+${header}
+resource "aws_appsync_graphql_api" "${name}" {
+  name                = "\${local.name}-${name.replace(/_/g, '-')}"
+  authentication_type = ${q(outs(n).some(({ t }) => t.data.serviceId === 'cognito') ? 'AMAZON_COGNITO_USER_POOLS' : 'AWS_IAM')}${outs(n).some(({ t }) => t.data.serviceId === 'cognito') ? `
+  user_pool_config {
+    user_pool_id   = aws_cognito_user_pool.${tfName(outs(n).find(({ t }) => t.data.serviceId === 'cognito')!.t)}.id
+    default_action = "ALLOW"
+  }` : ''}
+  schema = <<-EOT
+    type Query {
+      ping: String
+    }
+    schema {
+      query: Query
+    }
+  EOT
+}
+`);
+        break;
+      case 'globalaccelerator': {
+        const targetsGa = outs(n).filter(({ t }) => ['alb', 'nlb', 'ec2'].includes(t.data.serviceId));
+        block(`
+${header}
+resource "aws_globalaccelerator_accelerator" "${name}" {
+  name            = "\${local.name}-${name.replace(/_/g, '-')}"
+  ip_address_type = "IPV4"
+  enabled         = true
+}
+
+resource "aws_globalaccelerator_listener" "${name}" {
+  accelerator_arn = aws_globalaccelerator_accelerator.${name}.id
+  protocol        = "TCP"
+  port_range {
+    from_port = 443
+    to_port   = 443
+  }
+}
+${targetsGa.length ? `
+resource "aws_globalaccelerator_endpoint_group" "${name}" {
+  listener_arn = aws_globalaccelerator_listener.${name}.id
+${targetsGa
+  .filter(({ t }) => t.data.serviceId !== 'ec2')
+  .map(({ t }) => `  endpoint_configuration {
+    endpoint_id                    = aws_lb.${tfName(t)}.arn
+    client_ip_preservation_enabled = true
+  }`)
+  .join('\n')}
+}
+` : ''}`);
+        break;
+      }
+      case 'transitgw':
+        block(`
+${header}
+resource "aws_ec2_transit_gateway" "${name}" {
+  description = ${q(n.data.label)}
+}
+${vpc ? `
+resource "aws_ec2_transit_gateway_vpc_attachment" "${name}" {
+  transit_gateway_id = aws_ec2_transit_gateway.${name}.id
+  vpc_id             = aws_vpc.main.id
+  subnet_ids         = ${hasSubnet('subnet-private') ? 'aws_subnet.private[*].id' : '[] # TODO'}
+}
+` : ''}`);
+        break;
+      case 'cloudmap':
+        block(`
+${header}
+resource "aws_service_discovery_private_dns_namespace" "${name}" {
+  name = "\${var.project}.internal"
+  vpc  = ${vpc ? 'aws_vpc.main.id' : '"" # TODO'}
+}
+`);
+        break;
+      case 'inspector':
+        if (!security.patching)
+          block(`
+${header}
+data "aws_caller_identity" "inspector" {}
+
+resource "aws_inspector2_enabler" "${name}" {
+  account_ids    = [data.aws_caller_identity.inspector.account_id]
+  resource_types = ["EC2", "ECR", "LAMBDA"]
+}
+`);
+        break;
+      case 'securityhub':
+        block(`
+${header}
+resource "aws_securityhub_account" "${name}" {}
+
+resource "aws_securityhub_standards_subscription" "${name}_fsbp" {
+  standards_arn = "arn:aws:securityhub:\${var.region}::standards/aws-foundational-security-best-practices/v/1.0.0"
+  depends_on    = [aws_securityhub_account.${name}]
+}
+`);
+        break;
+      case 'macie':
+        block(`
+${header}
+resource "aws_macie2_account" "${name}" {}
+`);
+        break;
+      case 'prometheus':
+        block(`
+${header}
+resource "aws_prometheus_workspace" "${name}" {
+  alias = "\${local.name}-${name.replace(/_/g, '-')}"
 }
 `);
         break;
@@ -1302,7 +1605,10 @@ resource "aws_cognito_user_pool" "${name}" {
   name                     = "\${local.name}-${name.replace(/_/g, '-')}"
   mfa_configuration        = ${q(p.mfa || 'OPTIONAL')}
   auto_verified_attributes = ["email"]
-  username_attributes      = ["email"]${p.mfa !== 'OFF' ? `
+  username_attributes      = ["email"]${p.threatProtection ? `
+  user_pool_add_ons {
+    advanced_security_mode = "ENFORCED" # threat protection: credenciales filtradas y bloqueo adaptativo
+  }` : ''}${p.mfa !== 'OFF' ? `
   software_token_mfa_configuration {
     enabled = true
   }` : ''}
@@ -1399,7 +1705,7 @@ resource "aws_cloudwatch_metric_alarm" "${tfName(s)}_errors" {
       case 'cloudtrail':
         block(`
 ${header}
-# TODO: aws_cloudtrail requiere un bucket S3 con política para cloudtrail.amazonaws.com
+# El trail y su bucket se generan en la sección «Seguridad del proyecto» (al final del archivo).
 `);
         break;
       case 'vpce': {
@@ -1461,6 +1767,203 @@ ${header}
     if (n.data.serviceId === 'cloudfront') outputs.push(`output "${name}_domain" {\n  value = aws_cloudfront_distribution.${name}.domain_name\n}`);
     if (n.data.serviceId === 'apigw') outputs.push(`output "${name}_url" {\n  value = aws_apigatewayv2_api.${name}.api_endpoint\n}`);
   }
+  // ───────── Seguridad del proyecto (⚙ en la pestaña Amenazas)
+  const hasSid = (x: string) => services.some((n) => n.data.serviceId === x);
+  const secBlocks: string[] = [];
+  if (security.boundary)
+    secBlocks.push(`
+# Límite máximo de permisos para los roles de las aplicaciones (permission boundary)
+resource "aws_iam_policy" "app_boundary" {
+  name        = "\${local.name}-app-boundary"
+  description = "Techo de permisos de los roles de la aplicacion"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      { Sid = "PermitirServiciosDeLaApp", Effect = "Allow", Action = ["s3:*", "dynamodb:*", "sqs:*", "sns:*", "events:*", "secretsmanager:GetSecretValue", "kms:Decrypt", "kms:GenerateDataKey", "logs:*", "xray:*", "cloudwatch:PutMetricData", "bedrock:InvokeModel", "states:StartExecution", "lambda:InvokeFunction", "ecr:GetAuthorizationToken", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ec2:CreateNetworkInterface", "ec2:DescribeNetworkInterfaces", "ec2:DeleteNetworkInterface", "ssm:GetParameter*"], Resource = "*" },
+      { Sid = "NuncaIAMNiOrganizacion", Effect = "Deny", Action = ["iam:*", "organizations:*", "account:*", "cloudtrail:StopLogging", "cloudtrail:DeleteTrail", "guardduty:DeleteDetector"], Resource = "*" }
+    ]
+  })
+}
+`);
+  if (security.scp)
+    secBlocks.push(`
+# SCP de guardrails: se adjunta desde la cuenta de administración de AWS Organizations
+variable "organization_target_id" {
+  type        = string
+  description = "ID de la OU o cuenta a la que se adjunta la SCP (deja vacío si no usas Organizations)"
+  default     = ""
+}
+
+resource "aws_organizations_policy" "guardrails" {
+  name = "\${local.name}-guardrails"
+  type = "SERVICE_CONTROL_POLICY"
+  content = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      { Sid = "ProtegerAuditoria", Effect = "Deny", Action = ["cloudtrail:StopLogging", "cloudtrail:DeleteTrail", "guardduty:DeleteDetector", "guardduty:DisassociateFromMasterAccount", "config:StopConfigurationRecorder"], Resource = "*" },
+      { Sid = "NoSalirDeLaOrganizacion", Effect = "Deny", Action = ["organizations:LeaveOrganization"], Resource = "*" },
+      { Sid = "SoloRegionesAprobadas", Effect = "Deny", NotAction = ["iam:*", "organizations:*", "route53:*", "cloudfront:*", "waf:*", "wafv2:*", "support:*", "sts:*"], Resource = "*", Condition = { StringNotEquals = { "aws:RequestedRegion" = [var.region, "us-east-1"] } } }
+    ]
+  })
+}
+
+resource "aws_organizations_policy_attachment" "guardrails" {
+  count     = var.organization_target_id == "" ? 0 : 1
+  policy_id = aws_organizations_policy.guardrails.id
+  target_id = var.organization_target_id
+}
+`);
+  if (security.logLock || hasSid('cloudtrail'))
+    secBlocks.push(`
+# Trail de auditoría${security.logLock ? ' con logs inmutables (Object Lock)' : ''}
+resource "aws_s3_bucket" "audit_logs" {
+  bucket_prefix       = "\${local.name}-audit-"
+  object_lock_enabled = ${!!security.logLock}
+}
+${security.logLock ? `
+resource "aws_s3_bucket_object_lock_configuration" "audit_logs" {
+  bucket = aws_s3_bucket.audit_logs.id
+  rule {
+    default_retention {
+      mode = "COMPLIANCE"
+      days = 365
+    }
+  }
+}
+` : ''}
+resource "aws_s3_bucket_policy" "audit_logs" {
+  bucket = aws_s3_bucket.audit_logs.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      { Sid = "AclCheck", Effect = "Allow", Principal = { Service = "cloudtrail.amazonaws.com" }, Action = "s3:GetBucketAcl", Resource = aws_s3_bucket.audit_logs.arn },
+      { Sid = "Write", Effect = "Allow", Principal = { Service = "cloudtrail.amazonaws.com" }, Action = "s3:PutObject", Resource = "\${aws_s3_bucket.audit_logs.arn}/AWSLogs/*", Condition = { StringEquals = { "s3:x-amz-acl" = "bucket-owner-full-control" } } }
+    ]
+  })
+}
+
+resource "aws_cloudtrail" "main" {
+  name                          = "\${local.name}-trail"
+  s3_bucket_name                = aws_s3_bucket.audit_logs.id
+  is_multi_region_trail         = true
+  include_global_service_events = true
+  enable_log_file_validation    = true
+  depends_on                    = [aws_s3_bucket_policy.audit_logs]
+}
+`);
+  if (security.siem)
+    secBlocks.push(`
+# Hallazgos de seguridad al equipo de respuesta
+resource "aws_sns_topic" "security_alerts" {
+  name = "\${local.name}-security-alerts"
+}
+
+resource "aws_cloudwatch_event_rule" "guardduty_findings" {
+  name          = "\${local.name}-guardduty-findings"
+  event_pattern = jsonencode({ source = ["aws.guardduty"], "detail-type" = ["GuardDuty Finding"], detail = { severity = [{ numeric = [">=", 4] }] } })
+}
+
+resource "aws_cloudwatch_event_target" "guardduty_findings" {
+  rule = aws_cloudwatch_event_rule.guardduty_findings.name
+  arn  = aws_sns_topic.security_alerts.arn
+}
+
+resource "aws_sns_topic_policy" "security_alerts" {
+  arn = aws_sns_topic.security_alerts.arn
+  policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [{ Effect = "Allow", Principal = { Service = "events.amazonaws.com" }, Action = "sns:Publish", Resource = aws_sns_topic.security_alerts.arn }]
+  })
+}
+`);
+  if (security.patching)
+    secBlocks.push(`
+# Escaneo de vulnerabilidades y parcheo automático
+data "aws_caller_identity" "current" {}
+
+resource "aws_inspector2_enabler" "main" {
+  account_ids    = [data.aws_caller_identity.current.account_id]
+  resource_types = ["EC2", "ECR", "LAMBDA"]
+}
+
+resource "aws_ssm_association" "patching" {
+  name                = "AWS-RunPatchBaseline"
+  schedule_expression = "cron(0 4 ? * SUN *)"
+  parameters = {
+    Operation = "Install"
+  }
+  targets {
+    key    = "tag:Project"
+    values = [var.project]
+  }
+}
+`);
+  if (security.offsiteBackup)
+    secBlocks.push(`
+# Backups con bloqueo (para copiar a otra cuenta/región agrega un copy_action)
+resource "aws_backup_vault" "main" {
+  name = "\${local.name}-vault"
+}
+
+resource "aws_backup_vault_lock_configuration" "main" {
+  backup_vault_name  = aws_backup_vault.main.name
+  min_retention_days = 7
+  max_retention_days = 365
+}
+
+resource "aws_backup_plan" "main" {
+  name = "\${local.name}-diario"
+  rule {
+    rule_name         = "diario"
+    target_vault_name = aws_backup_vault.main.name
+    schedule          = "cron(0 3 * * ? *)"
+    lifecycle {
+      delete_after = 35
+    }
+  }
+}
+`);
+  const firstLb = services.find((n) => n.data.serviceId === 'alb');
+  if (security.ddosRunbook && firstLb)
+    secBlocks.push(`
+# Alarma de tráfico anómalo (punto de partida del runbook de DDoS)
+resource "aws_cloudwatch_metric_alarm" "traffic_spike" {
+  alarm_name          = "\${local.name}-pico-de-trafico"
+  namespace           = "AWS/ApplicationELB"
+  metric_name         = "RequestCount"
+  statistic           = "Sum"
+  period              = 60
+  evaluation_periods  = 3
+  threshold           = 60000 # TODO: ajusta a ~3x tu pico normal por minuto
+  comparison_operator = "GreaterThanThreshold"
+  dimensions = {
+    LoadBalancer = aws_lb.${tfName(firstLb)}.arn_suffix
+  }${security.siem ? `
+  alarm_actions = [aws_sns_topic.security_alerts.arn]` : ''}
+}
+`);
+  const pgDbs = services.filter((n) => n.data.serviceId === 'rds');
+  if (security.dbTls && pgDbs.length)
+    secBlocks.push(
+      pgDbs
+        .map((n) => {
+          const eng = String(n.data.props.engine || 'postgres');
+          const mysql = eng.includes('mysql') || eng.includes('maria');
+          return `
+resource "aws_db_parameter_group" "${tfName(n)}_tls" {
+  name_prefix = "\${local.name}-${tfName(n).replace(/_/g, '-')}-tls-"
+  family      = ${q(mysql ? 'mysql8.0' : 'postgres16')} # TODO: ajusta a la versión del motor
+  parameter {
+    name  = ${q(mysql ? 'require_secure_transport' : 'rds.force_ssl')}
+    value = "1"
+  }
+}
+`;
+        })
+        .join(''),
+    );
+  if (secBlocks.length) block('# ═════════════ Seguridad del proyecto\n' + secBlocks.join(''));
+
   if (outputs.length) block('# ═════════════ Salidas\n' + outputs.join('\n\n'));
   return out.join('\n');
 }
