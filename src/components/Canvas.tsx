@@ -16,6 +16,7 @@ import { byId, isService } from '../lib/graph';
 import { evaluateConnection } from '../rules/connections';
 import { useStore } from '../store';
 import { useSim } from '../sim/store';
+import { c3Eligible } from '../c3/model';
 import type { AppEdge, AppNode, ConnData, ZoneKind } from '../types';
 import { FloatingEdge } from './FloatingEdge';
 import { ServiceNodeView, SystemNodeView, ZoneNodeView } from './nodes';
@@ -146,6 +147,10 @@ export function Canvas() {
         isValidConnection={isValidConnection as never}
         connectionMode={ConnectionMode.Loose}
         onNodeDragStart={() => commit()}
+        onNodeDoubleClick={(_, n) => {
+          if (view === 'c2' && c3Eligible(useStore.getState().nodes.find((x) => x.id === n.id))) useStore.getState().openC3(n.id);
+        }}
+        zoomOnDoubleClick={false}
         onNodeDragStop={(_, __, dragged) => reparent(dragged.map((n) => n.id))}
         onMoveEnd={() => {
           const el = wrapper.current;

@@ -10,7 +10,7 @@
  * - El estado se calcula de los controles y el arquitecto puede aceptar el riesgo o
  *   marcarla como "no aplica" con una justificación.
  */
-import { getService } from '../catalog/catalog';
+import { cloudText, getService, lid, primaryCloud } from '../catalog/catalog';
 import { ancestors, byId, isService, placementOf } from '../lib/graph';
 import { profileFor } from '../sim/profiles';
 import type { ScenarioKind } from '../sim/scenarios';
@@ -82,15 +82,16 @@ export const ZONE_INFO: Record<string, { label: string; trust: number }> = {
   'vpc-data': { label: 'Subnet de datos', trust: 4 },
 };
 
-export function trustZone(n: ServiceNode, map: Map<string, AppNode>): { id: TrustZoneId; label: string; trust: number } {
+export function trustZone(n: ServiceNode, map: Map<string, AppNode>, cloud: 'aws' | 'azure' = 'aws'): { id: TrustZoneId; label: string; trust: number } {
+  const z = (id: TrustZoneId) => ({ id, ...ZONE_INFO[id], label: cloud === 'azure' ? ZONE_INFO[id].label.replace('AWS', 'Azure') : ZONE_INFO[id].label });
   const d = getService(n.data.serviceId);
-  if (n.data.serviceId === 'onprem') return { id: 'corporate', ...ZONE_INFO.corporate };
+  if (lid(n) === 'onprem') return { id: 'corporate', ...ZONE_INFO.corporate };
   if (d.role === 'actor' || d.role === 'external') return { id: 'internet', ...ZONE_INFO.internet };
   const custom = ancestors(n, map).find((z) => z.data.zoneKind === 'boundary');
   const place = placementOf(n, map);
   const base: TrustZoneId = place === 'subnet-public' ? 'vpc-public' : place === 'subnet-private' ? 'vpc-private' : place === 'subnet-data' ? 'vpc-data' : place === 'region' ? 'aws' : 'edge';
   if (custom && base !== 'vpc-public' && base !== 'vpc-private' && base !== 'vpc-data') return { id: `custom:${custom.id}`, label: custom.data.label, trust: 2 };
-  return { id: base, ...ZONE_INFO[base] };
+  return z(base);
 }
 
 export interface Boundary {
@@ -123,12 +124,13 @@ export function buildThreats(nodes: AppNode[], edges: AppEdge[], state: Record<s
   const E = edges.filter((e) => ids.has(e.source) && ids.has(e.target));
   const svc = (id: string) => map.get(id) as ServiceNode;
   const role = (n: ServiceNode) => getService(n.data.serviceId).role;
-  const sid = (n: ServiceNode) => n.data.serviceId;
+  const sid = (n: ServiceNode) => lid(n);
   const out = (n: ServiceNode) => E.filter((e) => e.source === n.id).map((e) => ({ e, t: svc(e.target) }));
   const inc = (n: ServiceNode) => E.filter((e) => e.target === n.id).map((e) => ({ e, s: svc(e.source) }));
   const ofSid = (x: string) => services.filter((n) => sid(n) === x);
   const has = (x: string) => ofSid(x).length > 0;
-  const zone = (n: ServiceNode) => trustZone(n, map);
+  const cloud = primaryCloud(nodes);
+  const zone = (n: ServiceNode) => trustZone(n, map, cloud);
   const threats: Threat[] = [];
 
   // Arreglos reutilizables
@@ -833,6 +835,17 @@ export function buildThreats(nodes: AppNode[], edges: AppEdge[], state: Record<s
             ...(fromInternet ? [] : [{ key: 'authn', label: 'El destino autentica al origen (IAM/SigV4, mTLS o token)', auto: managedApi, ok: managedApi, required: false }]),
           ],
     });
+  }
+
+  // Textos en la nube del diagrama
+  if (cloud === 'azure') {
+    const t = (x: string) => cloudText(x, cloud);
+    for (const th of threats) {
+      th.title = t(th.title);
+      th.description = t(th.description);
+      th.element = t(th.element);
+      th.controls = th.controls.map((c) => ({ ...c, label: t(c.label), hint: c.hint ? t(c.hint) : c.hint, fix: c.fix ? { ...c.fix, label: t(c.fix.label) } : c.fix }));
+    }
   }
 
   // Orden: riesgo, luego estado

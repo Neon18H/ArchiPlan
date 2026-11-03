@@ -1,6 +1,7 @@
-import { CATEGORIES, getService, LAYERS, ZONES } from '../catalog/catalog';
+import { CATEGORIES, CLOUD_LABEL, getService, LAYERS, primaryCloud, zoneLabel } from '../catalog/catalog';
 import { byId, isService, isZone, placementOf } from '../lib/graph';
 import { buildGuide } from '../rules/guide';
+import { COMPONENT_KINDS } from '../c3/model';
 import { validate } from '../rules/validate';
 import type { ConnData, Project, ServiceNode } from '../types';
 import { buildThreats, STATUS_LABEL, STRIDE, summarizeThreats, type Stride, type Threat } from '../threats/model';
@@ -14,6 +15,7 @@ interface DocModel {
   description: string;
   context: { actors: string[]; externals: string[]; interactions: string[] };
   layers: { layer: string; rows: string[][] }[];
+  c3: { service: string; kind: string; rows: string[][]; rels: string[] }[];
   network: string[];
   flows: string[][];
   decisions: Project['decisions'];
@@ -31,6 +33,7 @@ function model(p: Project): DocModel {
   const services = nodes.filter(isService);
   const label = (id: string) => (map.get(id)?.data as { label?: string })?.label ?? id;
   const issues = validate(nodes, edges);
+  const cloud = primaryCloud(nodes, meta.provider ?? 'aws');
   const tm = buildThreats(nodes, edges, p.threats ?? {});
   const guide = buildGuide(nodes, edges, decisions, issues, tm.threats);
   const role = (n: ServiceNode) => getService(n.data.serviceId).role;
@@ -58,7 +61,7 @@ function model(p: Project): DocModel {
     for (const n of nodes.filter((x) => x.parentId === parent)) {
       if (isZone(n)) {
         const extra = Object.entries(n.data.props).map(([k, v]) => `${k}=${v}`).join(', ');
-        network.push(`${'  '.repeat(depth)}- **${n.data.label}** (${ZONES[n.data.zoneKind].label}${extra ? `; ${extra}` : ''})`);
+        network.push(`${'  '.repeat(depth)}- **${n.data.label}** (${zoneLabel(n.data.zoneKind, cloud)}${extra ? `; ${extra}` : ''})`);
         walk(n.id, depth + 1);
       } else if (isService(n) && parent) {
         network.push(`${'  '.repeat(depth)}- ${n.data.label}`);
@@ -76,7 +79,7 @@ function model(p: Project): DocModel {
       ['Proyecto', meta.name],
       ['Autor', meta.author || '—'],
       ['Ambiente', meta.environment || '—'],
-      ['Proveedor / región', `AWS / ${meta.region}`],
+      ['Proveedor / región', `${CLOUD_LABEL[cloud]} / ${meta.region}`],
       ['Fecha', new Date().toLocaleDateString('es-CO', { year: 'numeric', month: 'long', day: 'numeric' })],
       ['Componentes', `${total} piezas, ${edges.length} conexiones, ${nodes.filter(isZone).length} zonas`],
       ['Categorías', [...cats].join(', ') || '—'],
@@ -98,6 +101,18 @@ function model(p: Project): DocModel {
     decisions,
     risks: issues.map((i) => ({ sev: SEV[i.severity], title: i.title, detail: i.detail })),
     checklist: guide.map((g) => ({ title: g.title, done: g.done, optional: g.optional })),
+    c3: services
+      .filter((n) => n.data.c3?.components.length)
+      .map((n) => {
+        const m = n.data.c3!;
+        const nameOf = (ref: string) => (ref.startsWith('ext:') ? `${label(ref.slice(4))} (externo)` : m.components.find((c) => c.id === ref)?.label ?? '?');
+        return {
+          service: n.data.label,
+          kind: getService(n.data.serviceId).name,
+          rows: m.components.map((c) => [c.label, COMPONENT_KINDS[c.kind].label, c.tech ?? '', c.description ?? '']),
+          rels: m.links.map((l) => `${nameOf(l.source)} → ${nameOf(l.target)}${l.label ? ` (${l.label})` : ''}`),
+        };
+      }),
     threats: tm.threats,
     boundaries: [...new Set(tm.boundaries.filter((b) => b.inbound).map((b) => b.label))],
     tsum: summarizeThreats(tm.threats),
@@ -127,6 +142,11 @@ export function toMarkdown(p: Project, diagramFile = 'diagrama.png'): string {
   for (const l of m.layers) {
     L.push(`### ${l.layer}`, '', '| Componente | Servicio | Ubicación | Configuración | Notas |', '|---|---|---|---|---|');
     L.push(...l.rows.map((r) => `| ${r.map(mdEsc).join(' | ')} |`), '');
+  }
+  for (const c of m.c3) {
+    L.push(`### Componentes internos de ${c.service} (C4 nivel 3)`, '', `_Contenedor: ${c.kind}_`, '', '| Componente | Tipo | Tecnología | Responsabilidad |', '|---|---|---|---|');
+    L.push(...c.rows.map((r) => `| ${r.map(mdEsc).join(' | ')} |`), '');
+    if (c.rels.length) L.push('**Relaciones:**', '', ...c.rels.map((r) => `- ${r}`), '');
   }
   L.push('## 5. Red y ubicación', '');
   L.push(...(m.network.length ? m.network : ['Sin zonas de red definidas.']), '');
@@ -209,6 +229,7 @@ ${diagramDataUrl ? `<img class="diagram" src="${diagramDataUrl}" alt="Diagrama d
 ${m.context.interactions.length ? `<ul>${m.context.interactions.map((i) => `<li>${h(i)}</li>`).join('')}</ul>` : ''}
 <h2>4. Componentes por capa (C4 nivel 2)</h2>
 ${m.layers.map((l) => `<h3>${h(l.layer)}</h3>${table(['Componente', 'Servicio', 'Ubicación', 'Configuración', 'Notas'], l.rows)}`).join('')}
+${m.c3.map((c) => `<h3>Componentes internos de ${h(c.service)} (C4 nivel 3)</h3><p class="muted">Contenedor: ${h(c.kind)}</p>${table(['Componente', 'Tipo', 'Tecnología', 'Responsabilidad'], c.rows)}${c.rels.length ? `<ul>${c.rels.map((r) => `<li>${h(r)}</li>`).join('')}</ul>` : ''}`).join('')}
 <h2>5. Red y ubicación</h2>
 ${m.network.length ? `<ul class="tree">${m.network.map((n) => `<li style="padding-left:${(n.match(/^ */)?.[0].length ?? 0) * 10}px">${md(n.trim().replace(/^- /, ''))}</li>`).join('')}</ul>` : '<p>Sin zonas de red definidas.</p>'}
 <h2>6. Flujos y conexiones</h2>

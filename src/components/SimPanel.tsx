@@ -101,7 +101,7 @@ export function SimPanel() {
         </div>
         <p className="sim-desc">{meta.description}</p>
         <div className="sim-fields">{meta.fields.map(field)}</div>
-        <p className="sim-disclaimer">Estimaciones con cuotas por defecto de AWS y cargas típicas. Ajusta la capacidad de cada pieza en su panel de propiedades.</p>
+        <p className="sim-disclaimer">Estimaciones con cuotas y límites por defecto de la nube y cargas típicas. Ajusta la capacidad de cada pieza en su panel de propiedades.</p>
       </div>
 
       <div className="sim-main">

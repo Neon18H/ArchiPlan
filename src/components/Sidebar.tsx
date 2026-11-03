@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { CATEGORIES, getService, LAYERS, PLACEMENT_LABEL, SERVICE_MAP, ZONES } from '../catalog/catalog';
+import { CATEGORIES, getService, LAYERS, lidOf, PLACEMENT_LABEL, SERVICE_MAP, ZONES } from '../catalog/catalog';
 import { byId, isService, isZone, placementOf } from '../lib/graph';
 import { evaluateConnection } from '../rules/connections';
 import { validate } from '../rules/validate';
@@ -9,7 +9,12 @@ import type { AppEdge, AppNode, ConnData, Decision, Issue, PropDef, PropValue, S
 import { ServiceIcon } from './ServiceIcon';
 import { fmtRps, profileFor } from '../sim/profiles';
 import { useSim } from '../sim/store';
+import { useCloud, useCloudText } from '../lib/useCloud';
+import { CLOUD_LABEL } from '../catalog/catalog';
+import type { Cloud } from '../types';
 import { ThreatsPanel } from './ThreatsPanel';
+import { c3Eligible, COMPONENT_KINDS, coverage, neighbors } from '../c3/model';
+import type { C3Model, ComponentKind } from '../types';
 import { summarizeThreats, type Threat } from '../threats/model';
 import { useThreatsUi } from '../threats/ui';
 
@@ -35,7 +40,8 @@ export function Sidebar({ issues, guide, threats }: { issues: Issue[]; guide: Gu
   }, []);
 
   // Al seleccionar algo, mostrar propiedades automáticamente
-  const selKey = selNodes.map((n) => n.id).join(',') + selEdges.map((e) => e.id).join(',');
+  const c3Sel = useStore((s) => s.c3Selection);
+  const selKey = selNodes.map((n) => n.id).join(',') + selEdges.map((e) => e.id).join(',') + c3Sel.join(',');
   const [lastSel, setLastSel] = useState('');
   if (selKey !== lastSel) {
     setLastSel(selKey);
@@ -118,7 +124,145 @@ function PropInput({ def, value, onChange }: { def: PropDef; value: PropValue | 
   );
 }
 
+function C3Inspector() {
+  const nodes = useStore((s) => s.nodes);
+  const edges = useStore((s) => s.edges);
+  const c3Id = useStore((s) => s.c3Id);
+  const sel = useStore((s) => s.c3Selection);
+  const { setC3, setC3Selection, setView } = useStore.getState();
+  const node = nodes.find((n) => n.id === c3Id);
+  if (!c3Eligible(node)) return <div className="pad muted">Abre una pieza con doble clic para ver sus componentes.</div>;
+  const model: C3Model = node.data.c3 ?? { components: [], links: [] };
+  const save = (m: C3Model, key?: string) => setC3(node.id, m, key);
+  const comp = sel.length === 1 ? model.components.find((c) => c.id === sel[0]) : undefined;
+  const link = sel.length === 1 ? model.links.find((l) => l.id === sel[0]) : undefined;
+  const nameOf = (ref: string) => (ref.startsWith('ext:') ? (nodes.find((n) => n.id === ref.slice(4))?.data as { label?: string })?.label ?? '?' : model.components.find((c) => c.id === ref)?.label ?? '?');
+
+  if (comp) {
+    const k = COMPONENT_KINDS[comp.kind];
+    const upd = (patch: Partial<typeof comp>) => save({ ...model, components: model.components.map((c) => (c.id === comp.id ? { ...c, ...patch } : c)) }, `comp:${comp.id}`);
+    const rels = model.links.filter((l) => l.source === comp.id || l.target === comp.id);
+    return (
+      <div className="inspector">
+        <div className="insp-head">
+          <div className="c3-kind-chip big" style={{ background: k.color }}>
+            {k.short}
+          </div>
+          <div>
+            <div className="insp-title">Componente</div>
+            <div className="insp-sub">Dentro de {node.data.label}</div>
+          </div>
+        </div>
+        <Field label="Nombre">
+          <input value={comp.label} onChange={(e) => upd({ label: e.target.value })} />
+        </Field>
+        <Field label="Tipo">
+          <select value={comp.kind} onChange={(e) => upd({ kind: e.target.value as ComponentKind })}>
+            {(Object.keys(COMPONENT_KINDS) as ComponentKind[]).map((x) => (
+              <option key={x} value={x}>
+                {COMPONENT_KINDS[x].label}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="Tecnología" help="Ej.: Spring Boot controller, Prisma, SDK de AWS, OpenTelemetry">
+          <input value={comp.tech ?? ''} onChange={(e) => upd({ tech: e.target.value })} />
+        </Field>
+        <Field label="Responsabilidad">
+          <textarea rows={3} value={comp.description ?? ''} placeholder={k.help} onChange={(e) => upd({ description: e.target.value })} />
+        </Field>
+        <div className="insp-section">
+          <div className="insp-section-title">Relaciones ({rels.length})</div>
+          {rels.length === 0 && <div className="muted small">Arrastra desde un punto del borde del componente hacia otro componente o dependencia.</div>}
+          {rels.map((l) => (
+            <button key={l.id} className="conn-row" onClick={() => setC3Selection([l.id])}>
+              <span>{l.source === comp.id ? '→' : '←'}</span>
+              <span className="conn-name">{nameOf(l.source === comp.id ? l.target : l.source)}</span>
+              <span className="conn-proto">{l.label}</span>
+            </button>
+          ))}
+        </div>
+        <button className="btn danger block" onClick={() => (save({ components: model.components.filter((c) => c.id !== comp.id), links: model.links.filter((l) => l.source !== comp.id && l.target !== comp.id) }), setC3Selection([]))}>
+          Eliminar componente
+        </button>
+      </div>
+    );
+  }
+  if (link) {
+    const upd = (label: string) => save({ ...model, links: model.links.map((l) => (l.id === link.id ? { ...l, label } : l)) }, `link:${link.id}`);
+    return (
+      <div className="inspector">
+        <div className="insp-title">Relación</div>
+        <div className="edge-ends">
+          <b>{nameOf(link.source)}</b> → <b>{nameOf(link.target)}</b>
+        </div>
+        <Field label="Descripción / protocolo">
+          <input value={link.label ?? ''} placeholder="usa, consulta, publica OrdenCreada…" onChange={(e) => upd(e.target.value)} />
+        </Field>
+        <div className="row gap">
+          <button className="btn" onClick={() => save({ ...model, links: model.links.map((l) => (l.id === link.id ? { ...l, source: l.target, target: l.source } : l)) })}>
+            Invertir dirección
+          </button>
+          <button className="btn danger" onClick={() => (save({ ...model, links: model.links.filter((l) => l.id !== link.id) }), setC3Selection([]))}>
+            Eliminar
+          </button>
+        </div>
+      </div>
+    );
+  }
+  const cov = coverage(node, nodes, edges);
+  const nb = neighbors(node.id, nodes, edges);
+  return (
+    <div className="inspector">
+      <div className="insp-head">
+        <ServiceIcon def={getService(node.data.serviceId)} size={40} />
+        <div>
+          <div className="insp-title">{node.data.label}</div>
+          <div className="insp-sub">C3 · {model.components.length} componentes · {model.links.length} relaciones</div>
+        </div>
+      </div>
+      <p className="insp-desc">Los módulos internos de este servicio y cómo usan sus dependencias de C2. Selecciona un componente para editarlo.</p>
+      <div className="insp-section">
+        <div className="insp-section-title">Coherencia con C2</div>
+        {model.components.length === 0 ? (
+          <div className="muted small">Aún no hay componentes.</div>
+        ) : cov.missing.length === 0 && cov.orphans.length === 0 ? (
+          <div className="rule-msg ok">Todas las dependencias de C2 están implementadas por algún componente.</div>
+        ) : (
+          <>
+            {cov.missing.map((m) => (
+              <div key={m.node.id} className="rule-msg warn">
+                {m.dir === 'in' ? 'Nadie atiende las llamadas de' : 'Ningún componente usa'} <b>{m.node.data.label}</b>.
+              </div>
+            ))}
+            {cov.orphans.map((c) => (
+              <div key={c.id} className="rule-msg warn">
+                <b>{c.label}</b> no tiene relaciones.
+              </div>
+            ))}
+          </>
+        )}
+      </div>
+      <div className="insp-section">
+        <div className="insp-section-title">Dependencias en C2 ({nb.length})</div>
+        {nb.map((x) => (
+          <div key={x.edgeId} className="conn-row static">
+            <span>{x.dir === 'out' ? '→' : '←'}</span>
+            <span className="conn-name">{x.node.data.label}</span>
+            <span className="conn-proto">{x.protocol}</span>
+          </div>
+        ))}
+      </div>
+      <button className="btn block" onClick={() => setView('c2')}>
+        ← Volver a C2
+      </button>
+    </div>
+  );
+}
+
 function Inspector({ selNodes, selEdges, issues }: { selNodes: AppNode[]; selEdges: AppEdge[]; issues: Issue[] }) {
+  const view = useStore((s) => s.view);
+  if (view === 'c3') return <C3Inspector />;
   if (selNodes.length + selEdges.length > 1) {
     return (
       <div className="pad">
@@ -185,6 +329,11 @@ function ServiceInspector({ node, issues }: { node: ServiceNode; issues: Issue[]
           ))}
         </div>
       ) : null}
+      {c3Eligible(node) && (
+        <button className="btn block c3-open" onClick={() => useStore.getState().openC3(node.id)}>
+          ⧉ Ver componentes (C3){node.data.c3?.components.length ? ` · ${node.data.c3.components.length}` : ''}
+        </button>
+      )}
       <SimSection node={node} />
       <Field label="Notas / responsabilidad">
         <textarea rows={3} placeholder="¿Qué hace esta pieza? ¿Quién es dueño?" value={node.data.notes ?? ''} onChange={(e) => updateNode(node.id, { notes: e.target.value })} />
@@ -216,6 +365,7 @@ function SimSection({ node }: { node: ServiceNode }) {
   const simOpen = useSim((s) => s.open);
   const frame = useSim((s) => (s.open && s.result ? s.result.frames[s.idx] : null));
   const p = profileFor(node);
+  const ct = useCloudText();
   if (p.passive || ['user', 'admin'].includes(node.data.serviceId)) return null;
   const f = frame?.nodes[node.id];
   const capTotal = Number.isFinite(p.perInstance) ? p.perInstance * (p.scale === 'instant' ? 1 : p.instances) : Infinity;
@@ -230,8 +380,8 @@ function SimSection({ node }: { node: ServiceNode }) {
           {p.instances > 1 && p.scale !== 'instant' ? ` (${fmtRps(p.perInstance)} × ${p.instances})` : ''}
           {p.maxInstances > p.instances ? ` · escala hasta ×${p.maxInstances}` : ''}
         </div>
-        <div className="muted small">{p.basis}</div>
-        {p.quota && <div className="muted small">Cuota: {p.quota}</div>}
+        <div className="muted small">{ct(p.basis)}</div>
+        {p.quota && <div className="muted small">Cuota: {ct(p.quota)}</div>}
       </div>
       {simOpen && f && (
         <div className={`sim-now-node st-${f.status}`}>
@@ -242,7 +392,7 @@ function SimSection({ node }: { node: ServiceNode }) {
       <Field label="Capacidad por instancia (req/s)" help="Déjalo vacío para usar la estimación. Pon aquí el resultado de tus pruebas de carga.">
         <input type="number" min={0} placeholder={Number.isFinite(p.perInstance) ? String(Math.round(p.perInstance)) : '∞'} value={ov === undefined || ov === '' ? '' : Number(ov)} onChange={(e) => setProp('sim.capacity', e.target.value === '' ? '' : Number(e.target.value))} />
       </Field>
-      {node.data.serviceId === 'lambda' && (
+      {lidOf(node.data.serviceId) === 'lambda' && (
         <div className="row gap">
           <Field label="Duración media (ms)">
             <input type="number" min={1} value={Number(node.data.props['sim.durationMs'] ?? 120)} onChange={(e) => setProp('sim.durationMs', Number(e.target.value))} />
@@ -252,7 +402,7 @@ function SimSection({ node }: { node: ServiceNode }) {
           </Field>
         </div>
       )}
-      {node.data.serviceId === 'ecs' && (
+      {lidOf(node.data.serviceId) === 'ecs' && (
         <label className="toggle">
           <input type="checkbox" checked={node.data.props['sim.autoscaling'] === undefined ? true : !!node.data.props['sim.autoscaling']} onChange={(e) => setProp('sim.autoscaling', e.target.checked)} />
           <span>Service Auto Scaling</span>
@@ -334,7 +484,31 @@ function EdgeInspector({ edge }: { edge: AppEdge }) {
   );
 }
 
+function CloudSection() {
+  const cloud = useCloud();
+  const convert = useStore((s) => s.convertCloud);
+  const other: Cloud = cloud === 'aws' ? 'azure' : 'aws';
+  return (
+    <div className="cloud-box">
+      <div>
+        <span className="field-label">Nube principal</span>
+        <div className={`cloud-pill c-${cloud}`}>{CLOUD_LABEL[cloud]}</div>
+      </div>
+      <button
+        className="btn small"
+        onClick={() => {
+          if (window.confirm(`Se reemplazará cada pieza por su equivalente en ${CLOUD_LABEL[other]} (puedes deshacer con Ctrl+Z). ¿Continuar?`)) convert(other);
+        }}
+        title="Reemplaza cada servicio por su equivalente y conserva conexiones, zonas y configuración compatible"
+      >
+        ⇄ Convertir a {CLOUD_LABEL[other]}
+      </button>
+    </div>
+  );
+}
+
 function ProjectInspector() {
+  const cloud = useCloud();
   const meta = useStore((s) => s.meta);
   const nodes = useStore((s) => s.nodes);
   const edges = useStore((s) => s.edges);
@@ -362,7 +536,8 @@ function ProjectInspector() {
           </select>
         </Field>
       </div>
-      <Field label="Región AWS por defecto">
+      <CloudSection />
+      <Field label={`Región ${CLOUD_LABEL[cloud]} por defecto`}>
         <input value={meta.region} onChange={(e) => setMeta({ region: e.target.value })} />
       </Field>
       <div className="stats">
@@ -499,7 +674,7 @@ function GuidePanel({ guide }: { guide: GuideStep[] }) {
                     return (
                       <button key={id} className="sug" disabled={view !== 'c2'} onClick={() => focus([addService(id)])} title={def.description}>
                         <ServiceIcon def={def} size={20} />
-                        {def.name.replace(/^(Amazon|AWS) /, '')}
+                        {def.name.replace(/^(Amazon|AWS|Azure|Microsoft) /, '')}
                       </button>
                     );
                   })}

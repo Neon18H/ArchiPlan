@@ -1,5 +1,5 @@
-import { defaultProps, getService, LAYERS, ZONES } from '../catalog/catalog';
-import type { AppEdge, AppNode, Layer, PropValue, ServiceNode, ZoneKind, ZoneNode } from '../types';
+import { defaultProps, getService, LAYERS, lidOf, zoneLabel, ZONES } from '../catalog/catalog';
+import type { AppEdge, AppNode, Cloud, Layer, PropValue, ServiceNode, ZoneKind, ZoneNode } from '../types';
 import { sqlPortFor, suggestProtocol } from '../rules/connections';
 import { uid } from './graph';
 
@@ -18,6 +18,7 @@ export interface Spec {
   services: SpecService[];
   edges: [string, string, string?][];
   region?: string;
+  cloud?: Cloud;
   zoneMeta?: Partial<Record<'region' | 'vpc' | 'public' | 'private' | 'data', { id?: string; label?: string; props?: Record<string, PropValue> }>>;
 }
 
@@ -62,7 +63,7 @@ export function buildFromSpec(spec: Spec): { nodes: AppNode[]; edges: AppEdge[] 
       style: { width: w, height: h },
       width: w,
       height: h,
-      data: { zoneKind: kind, label: meta?.label ?? z.label, props: { ...props, ...(meta?.props ?? {}) } },
+      data: { zoneKind: kind, label: meta?.label ?? zoneLabel(kind, spec.cloud ?? 'aws'), props: { ...props, ...(meta?.props ?? {}) } },
     };
   };
   const layerOrder = (s: SpecService) => LAYERS[getService(s.serviceId).layer].order;
@@ -181,7 +182,8 @@ export function buildFromSpec(spec: Spec): { nodes: AppNode[]; edges: AppEdge[] 
     const sb = spec.services.find((s) => s.key === b);
     if (!sa || !sb) continue;
     const sug = suggestProtocol(getService(sa.serviceId), getService(sb.serviceId));
-    if (sb.serviceId === 'rds' || sb.serviceId === 'aurora') sug.protocol = sqlPortFor(sb.props?.engine ?? (sb.serviceId === 'aurora' ? 'aurora-postgresql' : 'postgres'));
+    const sbl = lidOf(sb.serviceId);
+    if (sbl === 'rds' || sbl === 'aurora') sug.protocol = sqlPortFor(sb.props?.engine ?? defaultProps(getService(sb.serviceId).props).engine ?? (sbl === 'aurora' ? 'aurora-postgresql' : 'postgres'));
     edges.push({
       id: uid('e'),
       source: idOf.get(a)!,

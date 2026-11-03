@@ -14,7 +14,7 @@
  * Es un modelo analítico de orden de magnitud: sirve para comparar diseños y encontrar
  * cuellos de botella y puntos únicos de falla, no para predecir números exactos.
  */
-import { getService } from '../catalog/catalog';
+import { cloudText, getService, lid, primaryCloud } from '../catalog/catalog';
 import { ancestors, byId, isService, placementOf } from '../lib/graph';
 import type { AppEdge, AppNode, Role, ServiceNode } from '../types';
 import { fmtRps, profileFor, type SimProfile } from './profiles';
@@ -122,7 +122,7 @@ const ROUTERS: Role[] = ['cdn', 'lb', 'api', 'dns'];
 const MESSAGING: Role[] = ['queue', 'topic', 'eventbus', 'stream', 'workflow'];
 
 function sourceWeight(n: ServiceNode) {
-  return { user: 1, admin: 0.05, external: 0.2, onprem: 0.2 }[n.data.serviceId] ?? 0.2;
+  return { user: 1, admin: 0.05, external: 0.2, onprem: 0.2 }[lid(n)] ?? 0.2;
 }
 
 function classify(s: ServiceNode, t: ServiceNode, ps: SimProfile, pt: SimProfile): { kind: EdgeKind | 'entry' | 'login'; w: number } | null {
@@ -185,7 +185,7 @@ export function pickDefaultTarget(nodes: AppNode[], edges: AppEdge[], kind: Scen
     return (services.find((n) => role(n) === 'external' && edges.some((e) => e.target === n.id)) ?? services.find((n) => role(n) === 'datastore') ?? services.find((n) => role(n) === 'compute'))?.id ?? null;
   }
   // Punto de entrada: el primer destino del usuario (resolviendo el DNS)
-  const user = services.find((n) => n.data.serviceId === 'user') ?? services.find((n) => role(n) === 'actor' || role(n) === 'external');
+  const user = services.find((n) => lid(n) === 'user') ?? services.find((n) => role(n) === 'actor' || role(n) === 'external');
   if (!user) return services.find((n) => ROUTERS.includes(role(n)) && role(n) !== 'dns')?.id ?? null;
   const targets: string[] = [];
   for (const e of edges.filter((x) => x.source === user.id)) {
@@ -210,7 +210,7 @@ export function targetCandidates(nodes: AppNode[], kind: Scenario['kind']): Serv
   const role = (n: ServiceNode) => getService(n.data.serviceId).role;
   if (kind === 'instance-failure') return services.filter((n) => getService(n.data.serviceId).vpcBound && !['lb', 'netgw'].includes(role(n)) || profileFor(n).stateful);
   if (kind === 'node-outage') return services.filter((n) => !['actor'].includes(role(n)) && !profileFor(n).passive);
-  return services.filter((n) => ['cdn', 'lb', 'api', 'compute', 'external'].includes(role(n)) && n.data.serviceId !== 'lambda');
+  return services.filter((n) => ['cdn', 'lb', 'api', 'compute', 'external'].includes(role(n)) && lid(n) !== 'lambda');
 }
 
 /* ───────────────────────────── simulación */
@@ -220,7 +220,7 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario): SimR
   const services = nodes.filter(isService);
   const svcIds = new Set(services.map((n) => n.id));
   const prof = new Map<string, SimProfile>(services.map((n) => [n.id, profileFor(n)]));
-  const def = (id: string) => getService((map.get(id) as ServiceNode).data.serviceId);
+  const def = (id: string) => getService(lid(map.get(id) as ServiceNode));
   const label = (id: string) => (map.get(id) as ServiceNode)?.data.label ?? id;
   const warnings: string[] = [];
   const events: SimEvent[] = [];
@@ -339,7 +339,7 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario): SimR
       if (Number.isFinite(p.failoverTime)) {
         down(id, t, t + p.failoverTime, `${cause} — failover en curso`, healthyBefore > 1 ? 'failover completo, réplica promovida' : 'servicio restablecido');
         if (healthyBefore > 1) s.lost += Math.min(k, healthyBefore - 1);
-        if (getService((map.get(id) as ServiceNode).data.serviceId).role === 'cache' && healthyBefore <= 1) {
+        if (getService(lid(map.get(id) as ServiceNode)).role === 'cache' && healthyBefore <= 1) {
           s.coldFrom = t + p.failoverTime;
           s.coldUntil = t + p.failoverTime + 120;
         }
@@ -388,8 +388,8 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario): SimR
 
   // Protección del objetivo (WAF / Shield Advanced asociados)
   const protectors = edges.filter((e) => e.target === targetId).map((e) => map.get(e.source)).filter(isService);
-  const waf = protectors.find((n) => n.data.serviceId === 'waf');
-  const shieldAdv = protectors.find((n) => n.data.serviceId === 'shield');
+  const waf = protectors.find((n) => lid(n) === 'waf');
+  const shieldAdv = protectors.find((n) => lid(n) === 'shield');
   const wp = waf?.data.props ?? {};
   const rateLimit = Number(wp.rateLimit) || 2000;
   const blockFrac = (flow: number, t: number): number => {
@@ -436,7 +436,7 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario): SimR
       if (!place.startsWith('subnet-')) continue;
       const d = getService(n.data.serviceId);
       const p = prof.get(n.id)!;
-      if (p.passive || ['lb', 'netgw'].includes(d.role) || n.data.serviceId === 'lambda') continue;
+      if (p.passive || ['lb', 'netgw'].includes(d.role) || lid(n) === 'lambda') continue;
       const vpc = ancestors(n, map).find((z) => z.data.zoneKind === 'vpc');
       const azs = Number(vpc?.data.props.azs ?? 2);
       if (azs < 2) {
@@ -480,11 +480,11 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario): SimR
   let lambdaGbSeconds = 0;
   let peakLambdaConc = 0;
   let lambdaToRdsMaxConn = Infinity;
-  const lambdaToRds = services.filter((n) => n.data.serviceId === 'lambda' && (outE.get(n.id) ?? []).some((e) => ['rds', 'aurora'].includes((map.get(e.t) as ServiceNode).data.serviceId)));
+  const lambdaToRds = services.filter((n) => lid(n) === 'lambda' && (outE.get(n.id) ?? []).some((e) => ['rds', 'aurora'].includes(lid(map.get(e.t) as ServiceNode))));
   for (const l of lambdaToRds) {
     for (const e of outE.get(l.id) ?? []) {
       const tgt = map.get(e.t) as ServiceNode;
-      if (['rds', 'aurora'].includes(tgt.data.serviceId)) lambdaToRdsMaxConn = Math.min(lambdaToRdsMaxConn, Math.round(prof.get(tgt.id)!.perInstance / 3.5));
+      if (['rds', 'aurora'].includes(lid(tgt))) lambdaToRdsMaxConn = Math.min(lambdaToRdsMaxConn, Math.round(prof.get(tgt.id)!.perInstance / 3.5));
     }
   }
 
@@ -658,7 +658,7 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario): SimR
         attackTotals.toApp += attack * DT;
       }
       if (['datastore', 'search'].includes(d.role)) for (let f = 2; f < F; f++) perFlow[f].toData += o[f] * DT;
-      if (map.get(id) && (map.get(id) as ServiceNode).data.serviceId === 'lambda') {
+      if (map.get(id) && lid(map.get(id) as ServiceNode) === 'lambda') {
         const sv = served.get(id)!;
         const dur = p.latency;
         const mem = Number((map.get(id) as ServiceNode).data.props.memory) || 512;
@@ -802,13 +802,21 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario): SimR
   };
 
   const findings = buildFindings({ sc, summary, frames, peakUtil, prof, map, targetId, waf, shieldAdv, perFlow, l34Mitigated, peakLambdaConc, lambdaToRdsMaxConn, services, outE, edges, warnings });
+  const cloud = primaryCloud(nodes);
+  if (cloud === 'azure') {
+    for (const e of events) e.label = cloudText(e.label, cloud);
+    for (const f of findings) {
+      f.title = cloudText(f.title, cloud);
+      f.detail = cloudText(f.detail, cloud);
+    }
+  }
   return { scenario: sc, targetId, frames, events, summary, findings, warnings };
 }
 
 /* ───────────────────────────── hallazgos */
 
 function recommendFor(n: ServiceNode, p: SimProfile): string {
-  const id = n.data.serviceId;
+  const id = lid(n);
   switch (id) {
     case 'ec2':
       return n.data.props.autoscaling ? `Aumenta el máximo del Auto Scaling Group (hoy ${p.maxInstances}) o usa instancias más grandes; el escalado tarda ~3 min, considera escalado predictivo.` : 'Activa Auto Scaling y usa al menos 2 instancias en AZ distintas.';
@@ -938,7 +946,7 @@ function buildFindings(c: FindingCtx): Finding[] {
   if (sc.kind === 'instance-failure' && c.targetId) {
     const p = c.prof.get(c.targetId)!;
     if (s.minSuccess >= 0.999) out.push({ severity: 'ok', title: 'Failover transparente', detail: `La caída de una instancia de ${label(c.targetId)} no afectó a los usuarios.`, nodeIds: [c.targetId] });
-    else if (p.stateful && Number.isFinite(p.failoverTime)) out.push({ severity: 'warn', title: `Corte de ~${p.failoverTime} s durante el failover`, detail: `Mientras ${label(c.targetId)} promueve su réplica/standby, las operaciones que dependen de ella fallan. Usa reintentos en la aplicación${['rds', 'aurora'].includes((c.map.get(c.targetId) as ServiceNode).data.serviceId) ? ' y RDS Proxy (reduce el failover a segundos)' : ''}.`, nodeIds: [c.targetId] });
+    else if (p.stateful && Number.isFinite(p.failoverTime)) out.push({ severity: 'warn', title: `Corte de ~${p.failoverTime} s durante el failover`, detail: `Mientras ${label(c.targetId)} promueve su réplica/standby, las operaciones que dependen de ella fallan. Usa reintentos en la aplicación${['rds', 'aurora'].includes(lid(c.map.get(c.targetId) as ServiceNode)) ? ' y RDS Proxy (reduce el failover a segundos)' : ''}.`, nodeIds: [c.targetId] });
   }
   if (sc.kind === 'node-outage' && c.targetId) {
     const affected = frames.find((f) => f.t >= sc.eventAt && f.t < sc.eventAt + sc.eventDuration);
@@ -963,7 +971,7 @@ function buildFindings(c: FindingCtx): Finding[] {
     const blockedPct = a.sent > 0 ? a.blocked / a.sent : 0;
     const absorbedPct = a.sent > 0 ? a.absorbed / a.sent : 0;
     if (!c.waf) {
-      const viaCdn = c.edges.some((e) => e.target === tgt.id && (c.map.get(e.source) as ServiceNode)?.data?.serviceId === 'cloudfront');
+      const viaCdn = c.edges.some((e) => e.target === tgt.id && lid(c.map.get(e.source) as ServiceNode) === 'cloudfront');
       out.push({ severity: 'error', title: `${label(tgt.id)} no tiene WAF`, detail: `El 100% del flood pasó la entrada${absorbedPct > 0 ? ` (la CDN absorbió ${Math.round(absorbedPct * 100)}% desde caché)` : ''}. Asocia un WAF con regla de rate limit${viaCdn ? ' y restringe el origen para que solo acepte tráfico de CloudFront' : ''}.`, nodeIds: [tgt.id] });
     } else {
       const perIp = sc.attackRps / Math.max(1, sc.botIps);
@@ -971,11 +979,11 @@ function buildFindings(c: FindingCtx): Finding[] {
       out.push({ severity: blockedPct > 0.9 ? 'ok' : blockedPct > 0.5 ? 'warn' : 'error', title: `El WAF bloqueó ${Math.round(blockedPct * 100)}% del ataque`, detail: perIp * 300 > rl ? `Cada IP superó el límite (${Math.round(perIp * 300)} vs ${rl} req/5 min). Los primeros ~30 s, antes de la detección, sí pasaron.` : `Ataque distribuido: cada IP envía solo ${Math.round(perIp * 300)} req/5 min, por debajo del límite de ${rl}. ${c.waf.data.props.botControl ? 'Bot Control ayudó parcialmente.' : 'Activa Bot Control,'} ${c.shieldAdv ? '' : 'considera Shield Advanced (mitigación automática L7)'} o baja el límite para rutas sensibles.`, nodeIds: [c.waf.id] });
     }
     if (s.lambdaCostUsd && s.lambdaCostUsd > 0.01) out.push({ severity: 'warn', title: `Costo del ataque en Lambda: ~US$${s.lambdaCostUsd.toFixed(2)}`, detail: `El flood que llegó al backend generó invocaciones pagas ("denial of wallet"). Extrapolado a 24 h: ~US$${((s.lambdaCostUsd * 86400) / Math.max(1, sc.eventDuration)).toFixed(0)}.`, nodeIds: [] });
-    const apigw = c.services.find((n) => n.data.serviceId === 'apigw' && (c.peakUtil.get(n.id) ?? 0) > 1);
+    const apigw = c.services.find((n) => lid(n) === 'apigw' && (c.peakUtil.get(n.id) ?? 0) > 1);
     if (apigw) out.push({ severity: 'warn', title: 'API Gateway throttleó (HTTP 429)', detail: 'El throttling protege al backend, pero también rechaza a usuarios legítimos: el ataque igual causa denegación de servicio.', nodeIds: [apigw.id] });
   }
   if (sc.kind === 'ddos-l34' && tgt) {
-    if (c.l34Mitigated) out.push({ severity: 'ok', title: `${label(tgt.id)} está protegido por Shield Standard`, detail: `AWS absorbe los ataques volumétricos L3/L4 contra ${getService(tgt.data.serviceId).name} sin costo extra. ${c.services.some((n) => n.data.serviceId === 'shield') ? 'Shield Advanced además cubre los costos de escalado y da acceso al equipo de respuesta (SRT).' : 'Shield Advanced agrega protección de costos y el equipo de respuesta de AWS (SRT).'}`, nodeIds: [tgt.id] });
+    if (c.l34Mitigated) out.push({ severity: 'ok', title: `${label(tgt.id)} está protegido por Shield Standard`, detail: `AWS absorbe los ataques volumétricos L3/L4 contra ${getService(tgt.data.serviceId).name} sin costo extra. ${c.services.some((n) => lid(n) === 'shield') ? 'Shield Advanced además cubre los costos de escalado y da acceso al equipo de respuesta (SRT).' : 'Shield Advanced agrega protección de costos y el equipo de respuesta de AWS (SRT).'}`, nodeIds: [tgt.id] });
     else out.push({ severity: 'error', title: `${label(tgt.id)} queda expuesto a ataques volumétricos`, detail: 'Recibe tráfico directo de Internet sin CloudFront, balanceador ni API Gateway delante. Pon un punto de entrada administrado.', nodeIds: [tgt.id] });
   }
 

@@ -1,4 +1,7 @@
-import type { CategoryId, Layer, PropDef, ServiceDef, ZoneKind } from '../types';
+import type { AppNode, Cloud, CategoryId, Layer, PropDef, ServiceDef, ServiceNode, ZoneKind } from '../types';
+import { AWS_TO_AZURE, AZURE_SERVICES, DATA_CLASS, DATA_CLASSES } from './azure';
+
+export { DATA_CLASSES };
 
 export const CATEGORIES: Record<CategoryId, { label: string; color: string }> = {
   generic: { label: 'Actores y externos', color: '#5c677d' },
@@ -85,8 +88,6 @@ export const ZONE_PARENT: Record<ZoneKind, (ZoneKind | null)[]> = {
 };
 
 const OUT_REG = ['outside', 'region'] as const;
-export const DATA_CLASSES = ['Público', 'Interno', 'Confidencial', 'Restringido'] as const;
-const DATA_CLASS: PropDef = { key: 'dataClass', label: 'Clasificación de los datos', type: 'select', default: 'Confidencial', options: [...DATA_CLASSES], help: 'Define el impacto en el modelo de amenazas. Restringido: datos personales, financieros o de salud.' };
 const VPC_APP = ['subnet-private', 'subnet-public'] as const;
 
 const S = (d: Omit<ServiceDef, 'provider'> & { provider?: ServiceDef['provider'] }): ServiceDef => ({
@@ -219,7 +220,114 @@ export const SERVICES: ServiceDef[] = [
   S({ id: 'codepipeline', name: 'AWS CodePipeline', short: 'CP', category: 'devops', role: 'devops', layer: 'aplicacion', zones: [...OUT_REG], description: 'CI/CD: compila, prueba y despliega.' }),
 ];
 
+SERVICES.push(...AZURE_SERVICES);
+
 export const SERVICE_MAP: Record<string, ServiceDef> = Object.fromEntries(SERVICES.map((s) => [s.id, s]));
+
+/* ───────────────────────────── multinube */
+
+/** Id "lógico" (equivalente de AWS) con el que razonan reglas, simulación y amenazas. */
+export function lidOf(serviceId: string): string {
+  return SERVICE_MAP[serviceId]?.equiv ?? serviceId;
+}
+export function lid(n: { data: { serviceId: string } } | undefined | null): string {
+  return n ? lidOf(n.data.serviceId) : '';
+}
+
+/** Servicio equivalente en la nube destino (o null si no hay). */
+export function counterpart(serviceId: string, to: Cloud): string | null {
+  const d = SERVICE_MAP[serviceId];
+  if (!d || d.provider === 'generic') return serviceId;
+  if (d.provider === to) return serviceId;
+  if (to === 'azure') return AWS_TO_AZURE[serviceId] ?? null;
+  return d.equiv ?? null;
+}
+
+/** Resuelve un id de AWS usado por las reglas al servicio de la nube del diagrama. */
+export function forCloud(awsId: string, cloud: Cloud): string {
+  return cloud === 'azure' ? (AWS_TO_AZURE[awsId] ?? awsId) : awsId;
+}
+
+/** Nube principal del diagrama: la mayoría de las piezas, o la del proyecto si empatan. */
+export function primaryCloud(nodes: AppNode[], fallback: Cloud = 'aws'): Cloud {
+  let aws = 0;
+  let az = 0;
+  for (const n of nodes) {
+    if (n.type !== 'service') continue;
+    const p = SERVICE_MAP[(n as ServiceNode).data.serviceId]?.provider;
+    if (p === 'aws') aws++;
+    else if (p === 'azure') az++;
+  }
+  return az > aws ? 'azure' : aws > az ? 'aws' : fallback;
+}
+
+export const CLOUD_LABEL: Record<Cloud, string> = { aws: 'AWS', azure: 'Azure' };
+
+export function zoneLabel(kind: ZoneKind, cloud: Cloud): string {
+  if (cloud === 'azure') {
+    if (kind === 'region') return 'Región Azure';
+    if (kind === 'vpc') return 'VNet';
+  }
+  return ZONES[kind].label;
+}
+
+/**
+ * Adapta los textos de reglas, hallazgos y amenazas (escritos con nombres de AWS)
+ * a la nube del diagrama.
+ */
+const AZURE_TERMS: [RegExp, string][] = [
+  [/AWS Shield Standard|Shield Standard/g, 'la protección DDoS de infraestructura de Azure'],
+  [/AWS Shield Advanced|Shield Advanced/g, 'Azure DDoS Network Protection'],
+  [/Amazon CloudFront|CloudFront/g, 'Front Door'],
+  [/Amazon API Gateway|API Gateway/g, 'API Management'],
+  [/AWS Lambda|Lambda/g, 'Azure Functions'],
+  [/Amazon Cognito|Cognito/g, 'Entra External ID'],
+  [/AWS Secrets Manager|Secrets Manager/g, 'Key Vault'],
+  [/Amazon CloudWatch|CloudWatch/g, 'Azure Monitor'],
+  [/AWS CloudTrail|CloudTrail/g, 'Activity Log'],
+  [/Amazon GuardDuty|GuardDuty/g, 'Defender for Cloud'],
+  [/AWS Certificate Manager|\bACM\b/g, 'Key Vault (certificados)'],
+  [/\bECR\b/g, 'ACR'],
+  [/RDS Proxy/g, 'un pool de conexiones (PgBouncer)'],
+  [/Auto Scaling Group/g, 'Scale Set'],
+  [/Auto Scaling/g, 'autoescalado'],
+  [/Multi[‑-]AZ/g, 'redundancia de zona'],
+  [/VPC Endpoints?/g, 'Private Endpoints'],
+  [/\bVPC\b/g, 'VNet'],
+  [/Route 53/g, 'Azure DNS'],
+  [/\bALB\b/g, 'Application Gateway'],
+  [/Bot Control/g, 'Bot Manager'],
+  [/Core Rule Set/g, 'Default Rule Set'],
+  [/security groups?|Security group/g, 'NSG'],
+  [/\bSCP\b/g, 'Azure Policy'],
+  [/Permission boundary/g, 'Alcance de RBAC'],
+  [/IAM Identity Center/g, 'Entra ID'],
+  [/\bIAM\b/g, 'RBAC'],
+  [/\bKMS\b/g, 'Key Vault'],
+  [/Amazon S3|\bS3\b/g, 'Blob Storage'],
+  [/Amazon DynamoDB|DynamoDB/g, 'Cosmos DB'],
+  [/ElastiCache/g, 'Azure Cache for Redis'],
+  [/Aurora/g, 'PostgreSQL Flexible'],
+  [/\bSQS\b/g, 'Service Bus'],
+  [/\bSNS\b/g, 'Service Bus (tópicos)'],
+  [/EventBridge/g, 'Event Grid'],
+  [/Bedrock/g, 'Azure OpenAI'],
+  [/AWS Backup/g, 'Azure Backup'],
+  [/en el usuario root/g, 'en las cuentas con rol Owner'],
+  [/usuario root/g, 'cuentas con rol Owner'],
+  [/\bbuckets?\b/g, 'contenedor'],
+  [/\bShield\b/g, 'DDoS Protection'],
+  [/Cuenta AWS/g, 'Suscripción de Azure'],
+  [/cuenta AWS/g, 'suscripción de Azure'],
+  [/de AWS\b/g, 'de Azure'],
+  [/\bAWS\b/g, 'Azure'],
+];
+export function cloudText(text: string, cloud: Cloud): string {
+  if (cloud !== 'azure' || !text) return text;
+  let out = text;
+  for (const [re, rep] of AZURE_TERMS) out = out.replace(re, rep);
+  return out;
+}
 
 export function getService(id: string): ServiceDef {
   return SERVICE_MAP[id] ?? SERVICE_MAP.external;

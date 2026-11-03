@@ -5,7 +5,7 @@
  * y cargas web típicas. No reemplazan una prueba de carga real. Cada pieza permite
  * sobrescribir su capacidad desde el inspector (props `sim.capacity` y `sim.instances`).
  */
-import { getService } from '../catalog/catalog';
+import { getService, lidOf } from '../catalog/catalog';
 import type { ServiceNode } from '../types';
 
 export type ScaleMode = 'none' | 'asg' | 'instant' | 'serverless-db';
@@ -54,6 +54,9 @@ const base = (p: Partial<SimProfile> & Pick<SimProfile, 'perInstance' | 'latency
 /** Capacidad aproximada de RDS por clase de instancia (consultas simples/s). */
 function rdsCapacity(cls: string): number {
   const c = cls.toLowerCase();
+  // Azure: GP_Gen5_2 (vCores al final) o GP_Standard_D2s_v3 (vCPU en el tamaño)
+  const vc = c.match(/_gen\d+_(\d+)$/) ?? c.match(/_[de](\d+)[a-z]*_v\d+$/);
+  if (vc) return Number(vc[1]) * 750;
   const size = c.split('.').pop() ?? 'medium';
   const bySize: Record<string, number> = { micro: 300, small: 700, medium: 1500, large: 3000, xlarge: 6000, '2xlarge': 12000, '4xlarge': 24000, '8xlarge': 45000 };
   return bySize[size] ?? 1500;
@@ -61,6 +64,9 @@ function rdsCapacity(cls: string): number {
 
 /** Capacidad aproximada de EC2 por tipo (req/s de una app web típica). */
 function ec2Capacity(type: string): number {
+  // Azure: Standard_D2s_v5 → 2 vCPU ≈ 150 req/s por vCPU
+  const az = type.match(/^standard_[a-z]+(\d+)/i);
+  if (az) return Number(az[1]) * 150;
   const size = type.toLowerCase().split('.').pop() ?? 'medium';
   const bySize: Record<string, number> = { nano: 40, micro: 80, small: 150, medium: 300, large: 500, xlarge: 1000, '2xlarge': 2000, '4xlarge': 4000 };
   return bySize[size] ?? 300;
@@ -72,7 +78,9 @@ export function profileFor(node: ServiceNode): SimProfile {
   const num = (k: string, d: number) => (Number.isFinite(Number(p[k])) && p[k] !== '' && p[k] !== undefined ? Number(p[k]) : d);
   let prof: SimProfile;
 
-  switch (node.data.serviceId) {
+  const az = azureProfile(node, num);
+  if (az) prof = az;
+  else switch (lidOf(node.data.serviceId)) {
     case 'user':
     case 'admin':
       prof = base({ perInstance: INF, latency: 0, basis: 'Origen del tráfico.' });
@@ -286,6 +294,83 @@ export function profileFor(node: ServiceNode): SimProfile {
     prof.basis = `Capacidad definida manualmente: ${capOv} req/s por instancia.`;
   }
   return prof;
+}
+
+/** Perfiles propios de Azure (cuando difieren del equivalente de AWS). */
+function azureProfile(node: ServiceNode, num: (k: string, d: number) => number): SimProfile | null {
+  const p = node.data.props;
+  switch (node.data.serviceId) {
+    case 'az-frontdoor':
+      return base({ perInstance: 250000, latency: 15, basis: 'CDN global de Microsoft; sin límite práctico de req/s para una aplicación típica.' });
+    case 'az-appgw':
+      return base({ perInstance: 50000, latency: 6, basis: 'Application Gateway v2 autoescala por unidades de capacidad; supuesto de ~50.000 req/s.', quota: 'Máximo de instancias de autoescalado configurado' });
+    case 'az-apim': {
+      const tier = String(p.type ?? 'Standard v2');
+      const cap = tier === 'Consumption' ? 2000 : tier === 'Basic v2' ? 1000 : tier === 'Premium v2' ? 5000 : 2500;
+      return base({ perInstance: cap, latency: 12, basis: `API Management ${tier}: ~${cap} req/s por unidad (estimación de Microsoft; varía según las políticas). El exceso responde 429.`, quota: `${tier}: capacidad por unidad` });
+    }
+    case 'az-functions': {
+      const dur = num('sim.durationMs', 120);
+      const conc = num('sim.concurrency', 1600);
+      return base({ perInstance: (conc * 1000) / Math.max(1, dur), latency: dur, scale: 'instant', basis: `Flex Consumption: hasta 100 instancias × 16 requests concurrentes (${conc}) ÷ duración media ${dur} ms.`, quota: '100 instancias por app (máximo por defecto)' });
+    }
+    case 'az-appservice': {
+      const n = Math.max(1, num('instances', 2));
+      const per = { B1: 100, S1: 200, P1v3: 400, P2v3: 800, P3v3: 1600 }[String(p.sku ?? 'P1v3')] ?? 400;
+      return base({ perInstance: per, instances: n, maxInstances: Math.max(n, 10), scale: 'asg', scaleDelay: 240, latency: 45, replaceTime: 120, multiAz: n >= 2, basis: `Plan ${p.sku ?? 'P1v3'}: ~${per} req/s por instancia; el autoescalado reacciona en ~4 min.` });
+    }
+    case 'az-containerapps': {
+      const desired = Math.max(1, num('desired', 2));
+      const cpu = num('cpu', 512);
+      const per = Math.round((cpu / 1024) * 400);
+      return base({ perInstance: per, instances: desired, maxInstances: Math.max(desired * 5, 10), scale: 'asg', scaleDelay: 45, latency: 40, replaceTime: 30, multiAz: desired >= 2, basis: `${cpu / 1024} vCPU por réplica → ~${per} req/s. Escalado HTTP con KEDA en ~45 s.` });
+    }
+    case 'az-cosmos': {
+      const mode = String(p.billing ?? 'Autoscale');
+      const ru = mode === 'Serverless' ? 5000 : mode === 'Provisioned' ? num('ru', 400) : num('ru', 4000);
+      return base({ perInstance: Math.round(ru / 3), latency: 6, basis: `${mode}: ${ru} RU/s ÷ ~3 RU por operación (mezcla de lecturas y escrituras) ≈ ${Math.round(ru / 3)} ops/s. El exceso responde 429.`, quota: `${ru} RU/s` });
+    }
+    case 'az-sql':
+    case 'az-postgres': {
+      const multi = !!p.multiAZ;
+      const cap = rdsCapacity(String(p.instanceClass ?? 'GP_Gen5_2'));
+      const sql = node.data.serviceId === 'az-sql';
+      return base({
+        perInstance: cap,
+        latency: 5,
+        stateful: true,
+        multiAz: multi,
+        failoverTime: multi ? 30 : sql ? 120 : 300,
+        basis: `${p.instanceClass}: ~${cap} consultas/s. ${multi ? 'Redundancia de zona: failover automático en segundos.' : sql ? 'Alta disponibilidad local: se recupera en minutos, pero no sobrevive a la caída de una zona.' : 'Sin HA: se reaprovisiona en ~5 min y no sobrevive a la caída de una zona.'}`,
+      });
+    }
+    case 'az-redis': {
+      const replicas = Math.max(0, num('replicas', 1));
+      const premium = String(p.nodeType ?? '').startsWith('Premium');
+      return base({ perInstance: premium ? 80000 : 40000, instances: 1 + replicas, maxInstances: 1 + replicas, latency: 1, stateful: true, multiAz: replicas >= 1 && premium, failoverTime: replicas >= 1 ? 30 : 300, basis: `${p.nodeType}: ~${premium ? '80.000' : '40.000'} ops/s. ${replicas >= 1 ? 'Réplica con failover en ~30 s' : 'Sin réplica (Basic): sin SLA de disponibilidad'}${premium ? '' : '; la redundancia de zona requiere Premium'}.` });
+    }
+    case 'az-servicebus':
+      return base({ perInstance: 2000, latency: 15, basis: 'Service Bus Standard: ~2.000 mensajes/s (variable, sin capacidad reservada). Premium reserva capacidad por Messaging Unit.', quota: 'Throughput compartido (Standard)' });
+    case 'az-servicebus-topic':
+      return base({ perInstance: 2000, latency: 20, basis: 'Service Bus Standard: ~2.000 mensajes/s.' });
+    case 'az-eventgrid':
+      return base({ perInstance: 5000, latency: 20, basis: 'Tópico personalizado: 5.000 eventos/s de publicación.', quota: '5.000 eventos/s por tópico' });
+    case 'az-eventhubs': {
+      const units = Math.max(1, num('units', 2));
+      const premium = p.mode === 'Premium';
+      return base({ perInstance: premium ? units * 10000 : units * 1000, latency: 15, basis: premium ? `${units} Processing Units ≈ ${units * 10000} eventos/s.` : `${units} Throughput Units × 1.000 eventos/s de ingesta.`, quota: premium ? 'Processing Units' : '1.000 eventos/s por TU' });
+    }
+    case 'az-entra':
+      return base({ perInstance: 200, latency: 90, basis: 'Límites de servicio de Entra para emisión de tokens; supuesto de ~200 req/s. Los picos de login son el cuello de botella típico.', quota: 'Límites de throttling del tenant' });
+    case 'az-keyvault':
+      return base({ perInstance: 400, latency: 15, basis: 'Key Vault: 4.000 transacciones de secretos cada 10 s por vault (~400/s). Cachea los secretos en la aplicación.', quota: '4.000 transacciones / 10 s' });
+    case 'az-openai':
+      return base({ perInstance: 15, latency: 1500, basis: 'Cuota de tokens por minuto (TPM) del deployment; supuesto de ~15 req/s y 1,5 s por respuesta.', quota: 'TPM / RPM del deployment' });
+    case 'az-blob':
+      return base({ perInstance: 20000, latency: 25, basis: 'Cuenta de almacenamiento: ~20.000 req/s (objetivo de escalabilidad estándar).', quota: '20.000 req/s por cuenta' });
+    default:
+      return null;
+  }
 }
 
 export function fmtRps(v: number): string {

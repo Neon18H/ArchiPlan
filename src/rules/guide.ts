@@ -1,4 +1,4 @@
-import { getService } from '../catalog/catalog';
+import { cloudText, getService, lid, primaryCloud, forCloud } from '../catalog/catalog';
 import { byId, isService, isZone, placementOf } from '../lib/graph';
 import type { AppEdge, AppNode, Decision, Issue, ZoneKind } from '../types';
 import type { Threat } from '../threats/model';
@@ -22,9 +22,10 @@ export function buildGuide(nodes: AppNode[], edges: AppEdge[], decisions: Decisi
   const has = (...r: string[]) => r.some((x) => roles.has(x as never));
   const vpcBound = services.filter((n) => getService(n.data.serviceId).vpcBound);
   const vpcOk = vpcBound.length === 0 ? has('compute') : vpcBound.every((n) => placementOf(n, map).startsWith('subnet-')) && nodes.some((n) => isZone(n) && n.data.zoneKind === 'vpc');
-  const connected = services.length > 1 && services.every((n) => edges.some((e) => e.source === n.id || e.target === n.id) || ['cloudtrail', 'guardduty', 'kms', 'acm', 'igw'].includes(n.data.serviceId));
+  const connected = services.length > 1 && services.every((n) => edges.some((e) => e.source === n.id || e.target === n.id) || ['cloudtrail', 'guardduty', 'kms', 'acm', 'igw'].includes(lid(n)));
 
-  return [
+  const cloud = primaryCloud(nodes);
+  const steps: GuideStep[] = [
     { id: 'actors', title: '1. Actores', question: '¿Quién usa el sistema y con qué sistemas externos se integra?', done: has('actor', 'external'), suggest: ['user', 'admin', 'external', 'onprem'], tip: 'Empieza por el contexto (C1): personas y sistemas fuera de tu control.' },
     { id: 'entry', title: '2. Punto de entrada', question: '¿Por dónde entra el tráfico?', done: has('dns', 'cdn', 'api', 'lb'), suggest: ['route53', 'cloudfront', 'apigw', 'alb'], tip: 'DNS → CDN → WAF → balanceador/API es el camino típico de una app web.' },
     { id: 'edge-sec', title: '3. Protección del borde', question: '¿Cómo proteges la entrada (OWASP, DDoS, TLS)?', done: has('waf'), suggest: ['waf', 'acm', 'shield'], tip: 'Asocia el WAF al componente más externo (CloudFront o API Gateway).' },
@@ -39,4 +40,21 @@ export function buildGuide(nodes: AppNode[], edges: AppEdge[], decisions: Decisi
     { id: 'threats', title: '12. Modelo de amenazas', question: '¿Trataste las amenazas críticas y altas (STRIDE)?', done: services.length > 0 && !threats.some((t) => (t.status === 'abierta' || t.status === 'parcial') && (t.risk === 'Crítico' || t.risk === 'Alto')), suggest: [], tip: 'Mitiga, acepta con justificación o marca "no aplica" cada amenaza crítica y alta en la pestaña Amenazas.' },
     { id: 'adr', title: '13. Decisiones (ADR)', question: '¿Documentaste por qué elegiste estas piezas?', done: decisions.length > 0, suggest: [], tip: 'Un ADR por decisión importante: contexto, decisión y consecuencias.' },
   ];
+  if (cloud === 'aws') return steps;
+  // Azure: piezas sugeridas equivalentes y textos adaptados
+  const AZ_TIPS: Record<string, string> = {
+    entry: 'DNS → Front Door (con WAF) → Application Gateway o API Management es el camino típico de una app web.',
+    'edge-sec': 'Asocia el WAF a Front Door (o al Application Gateway si no hay CDN).',
+    compute: 'Functions para cargas por eventos; Container Apps o App Service para servicios siempre activos.',
+    data: 'Azure SQL / PostgreSQL para transacciones; Cosmos DB para acceso por clave a gran escala; Redis para lecturas calientes.',
+    network: 'Pública: solo Application Gateway y NAT. Privada: cómputo. Datos: bases de datos (vía Private Endpoint).',
+    secrets: 'Key Vault con RBAC e identidades administradas: nada de cadenas de conexión en el código.',
+    obs: 'Azure Monitor + Application Insights + alertas, y Activity Log/Defender para auditoría y detección.',
+  };
+  return steps.map((g) => ({
+    ...g,
+    question: cloudText(g.question, cloud),
+    tip: AZ_TIPS[g.id] ?? cloudText(g.tip, cloud),
+    suggest: [...new Set(g.suggest.map((id) => forCloud(id, cloud)).filter((id) => id.startsWith('az-') || ['user', 'admin', 'external', 'onprem'].includes(id)))],
+  }));
 }
