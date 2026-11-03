@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { CATEGORIES, getService, LAYERS, lidOf, PLACEMENT_LABEL, SERVICE_MAP, ZONES } from '../catalog/catalog';
 import { byId, isService, isZone, placementOf } from '../lib/graph';
 import { evaluateConnection } from '../rules/connections';
@@ -726,6 +726,12 @@ function GuidePanel({ guide }: { guide: GuideStep[] }) {
 function DecisionsPanel({ decisions }: { decisions: Decision[] }) {
   const { addDecision, updateDecision, deleteDecision } = useStore.getState();
   const [open, setOpen] = useState<string | null>(decisions[0]?.id ?? null);
+  // Al agregar una decisión (a mano o desde la comparación de variantes) se abre la nueva
+  const prevCount = useRef(decisions.length);
+  useEffect(() => {
+    if (decisions.length > prevCount.current) setOpen(decisions[decisions.length - 1].id);
+    prevCount.current = decisions.length;
+  }, [decisions]);
   return (
     <div className="adrs">
       <p className="muted small">Registra por qué tomaste cada decisión importante. Aparecen en el documento de arquitectura.</p>

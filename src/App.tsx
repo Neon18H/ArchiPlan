@@ -10,6 +10,8 @@ import { Palette } from './components/Palette';
 import { Sidebar } from './components/Sidebar';
 import { SimPanel } from './components/SimPanel';
 import { SecurityModal } from './components/SecurityPanel';
+import { VariantBar } from './components/VariantBar';
+import { CompareModal } from './components/CompareModal';
 import { AiButton, AiPanel, AiWatcher } from './components/AiPanel';
 import { NetLegend, NetModal, netViewData, useNetUi } from './components/NetInspector';
 import { useSim } from './sim/store';
@@ -27,7 +29,7 @@ import { traceOverlay } from './net/trace';
 import { useStore } from './store';
 import type { Layer, Severity } from './types';
 
-type ModalKind = 'templates' | 'wizard' | 'projects' | 'export' | 'net' | 'security' | 'ai' | null;
+type ModalKind = 'templates' | 'wizard' | 'projects' | 'export' | 'net' | 'security' | 'ai' | 'compare' | null;
 
 function Menu({ label, children }: { label: React.ReactNode; children: (close: () => void) => React.ReactNode }) {
   const [open, setOpen] = useState(false);
@@ -362,6 +364,7 @@ export default function App() {
             <div className={`center ${simOpen ? 'with-sim' : ''}`}>
               {view === 'c3' ? <C3Canvas /> : <Canvas />}
               {netViewOn && view === 'c2' && <NetLegend />}
+              {view !== 'c3' && <VariantBar onCompare={() => setModal('compare')} />}
               <AiPanel issues={issues} threats={threatModel.threats} />
               {simOpen && view !== 'c3' && <SimPanel />}
             </div>
@@ -373,6 +376,7 @@ export default function App() {
           {modal === 'export' && <ExportModal onClose={() => setModal(null)} />}
           {modal === 'net' && <NetModal onClose={() => setModal(null)} />}
           <AiWatcher issues={issues} threats={threatModel.threats} />
+          {modal === 'compare' && <CompareModal onClose={() => setModal(null)} />}
           {modal === 'security' && <SecurityModal onClose={() => setModal(null)} threats={threatModel.threats} />}
           <Toasts />
         </div>

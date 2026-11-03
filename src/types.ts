@@ -243,6 +243,9 @@ export interface Project {
   securityGroups?: SecurityGroup[];
   /** Seguridad del proyecto: prácticas y guardrails configurados (ver src/security/settings.ts). */
   security?: Record<string, boolean>;
+  /** Variantes del diseño para comparar (A/B). nodes/edges/securityGroups son los de la variante activa. */
+  variants?: Variant[];
+  activeVariant?: string;
 }
 
 export type Severity = 'error' | 'warn' | 'info';
@@ -255,6 +258,17 @@ export type NetFix =
   | { kind: 'set-target'; lbId: string; targetId: string; target: TargetConfig; label: string }
   | { kind: 'set-edge'; edgeId: string; protocol: string; label: string }
   | { kind: 'service'; fix: Fix; label: string };
+
+/** Una alternativa del diseño (p. ej. «con ECS» vs «con Lambda»). */
+export interface Variant {
+  id: string;
+  name: string;
+  note?: string;
+  nodes: AppNode[];
+  edges: AppEdge[];
+  securityGroups: SecurityGroup[];
+  createdAt: string;
+}
 
 export interface Issue {
   id: string;
