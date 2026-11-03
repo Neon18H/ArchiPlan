@@ -5,7 +5,7 @@ import { convertRegion, convertService, convertZoneLabel } from './lib/cloud';
 import { absolutePosition, ancestors, byId, isService, isZone, nodeSize, placementOf, sortNodes, uid, ZONE_DEPTH } from './lib/graph';
 import { buildFromSpec, NODE_H, NODE_W, type Spec } from './lib/layout';
 import { evaluateConnection } from './rules/connections';
-import type { AppEdge, AppNode, C3Model, Cloud, ConnData, Decision, Fix, Layer, NetConfig, NetFix, Placement, Project, ProjectMeta, PropValue, SecurityGroup, ServiceNode, ThreatState, ZoneKind, ZoneNode } from './types';
+import type { Variant, AppEdge, AppNode, C3Model, Cloud, ConnData, Decision, Fix, Layer, NetConfig, NetFix, Placement, Project, ProjectMeta, PropValue, SecurityGroup, ServiceNode, ThreatState, ZoneKind, ZoneNode } from './types';
 import { effectiveNet, generateSecurityGroups, inVpc, isLb, listenPort, needsSg, peerIs, ruleCovers, semantics, type AccessSource } from './net/model';
 
 
@@ -31,6 +31,9 @@ export interface Toast {
 
 interface State extends Snapshot {
   projectId: string | null;
+  /** Variantes del diseño (vacío = un solo diseño). La activa se edita en nodes/edges/securityGroups. */
+  variants: Variant[];
+  activeVariant: string | null;
   dirty: boolean;
   view: ViewMode;
   /** Pieza abierta en la vista de componentes (C3). */
@@ -86,6 +89,13 @@ interface State extends Snapshot {
   removeRule: (sgId: string, dir: 'inbound' | 'outbound', ruleId: string) => void;
   /** Edita los grupos; si la red estaba automática, primero la vuelve personalizada. */
   setSecurity: (patch: Record<string, boolean>) => void;
+  /** Duplica el diseño actual como una variante nueva y la abre. */
+  createVariant: (name?: string) => void;
+  switchVariant: (id: string) => void;
+  renameVariant: (id: string, name: string, note?: string) => void;
+  deleteVariant: (id: string) => void;
+  /** Variantes con la activa sincronizada con lo que hay en el lienzo. */
+  syncedVariants: () => Variant[];
   editSecurityGroups: (fn: (groups: SecurityGroup[]) => SecurityGroup[], coalesceKey?: string) => void;
 
   loadProject: (p: Project, projectId?: string | null) => void;
@@ -129,7 +139,7 @@ function loadAutosave(): Partial<State> | null {
     if (!raw) return null;
     const p = JSON.parse(raw) as Project & { projectId?: string | null };
     if (p.format !== 'archiplan') return null;
-    return { nodes: sortNodes(p.nodes), edges: p.edges, decisions: p.decisions ?? [], threats: p.threats ?? {}, securityGroups: p.securityGroups ?? [], security: p.security ?? {}, meta: { ...emptyMeta(), ...p.meta }, projectId: p.projectId ?? null };
+    return { nodes: sortNodes(p.nodes), edges: p.edges, decisions: p.decisions ?? [], threats: p.threats ?? {}, securityGroups: p.securityGroups ?? [], security: p.security ?? {}, variants: p.variants ?? [], activeVariant: p.activeVariant ?? null, meta: { ...emptyMeta(), ...p.meta }, projectId: p.projectId ?? null };
   } catch {
     return null;
   }
@@ -245,6 +255,19 @@ function preferredZone(nodes: AppNode[], serviceId: string): string | null {
 
 const init = loadAutosave();
 
+const cleanNodes = (nodes: AppNode[]) =>
+  nodes.map(({ selected: _s, dragging: _d, measured: _m, ...n }) => {
+    void _s;
+    void _d;
+    void _m;
+    return n as AppNode;
+  });
+const cleanEdges = (edges: AppEdge[]) =>
+  edges.map(({ selected: _s, ...e }) => {
+    void _s;
+    return e as AppEdge;
+  });
+
 /** Ejecuta varias acciones como un solo paso de deshacer. */
 function batched(get: () => State, set: (p: Partial<State>) => void, fn: () => void) {
   const { commit } = get();
@@ -281,6 +304,8 @@ export const useStore = create<State>((set, get) => ({
   threats: init?.threats ?? {},
   securityGroups: init?.securityGroups ?? [],
   security: init?.security ?? {},
+  variants: init?.variants ?? [],
+  activeVariant: init?.activeVariant ?? null,
   meta: init?.meta ?? emptyMeta(),
   projectId: init?.projectId ?? null,
   dirty: false,
@@ -732,6 +757,51 @@ export const useStore = create<State>((set, get) => ({
     if (g.inbound.some((r) => ruleCovers(r, port) && JSON.stringify(r.peer) === JSON.stringify(peer))) return;
     get().setSecurityGroups(get().securityGroups.map((x) => (x.id === sgId ? { ...x, inbound: [...x.inbound, { id: uid('r'), protocol: 'tcp', from: port, to: port, peer, description: `Desde ${who}` }] } : x)));
   }),
+  syncedVariants: () => {
+    const { variants, activeVariant, nodes, edges, securityGroups } = get();
+    return variants.map((v) => (v.id === activeVariant ? { ...v, nodes: cleanNodes(nodes), edges: cleanEdges(edges), securityGroups } : v));
+  },
+  createVariant: (name) => {
+    const st = get();
+    let variants = st.syncedVariants();
+    let active = st.activeVariant;
+    if (!variants.length) {
+      const first: Variant = { id: uid('var'), name: 'Variante A', nodes: cleanNodes(st.nodes), edges: cleanEdges(st.edges), securityGroups: st.securityGroups, createdAt: now() };
+      variants = [first];
+      active = first.id;
+    }
+    const cur = variants.find((v) => v.id === active)!;
+    const names = new Set(variants.map((v) => v.name));
+    let i = variants.length;
+    while (names.has(`Variante ${String.fromCharCode(65 + (i % 26))}`) && i < variants.length + 26) i++;
+    const letter = String.fromCharCode(65 + (i % 26));
+    const copy: Variant = { id: uid('var'), name: name ?? `Variante ${letter}`, note: `Copia de ${cur.name}`, nodes: cur.nodes, edges: cur.edges, securityGroups: cur.securityGroups, createdAt: now() };
+    set({ variants: [...variants, copy], activeVariant: copy.id, past: [], future: [], dirty: true, nodes: sortNodes(copy.nodes.map((n) => ({ ...n, selected: false }))), edges: copy.edges, securityGroups: copy.securityGroups });
+    get().toast('ok', `«${copy.name}» creada como copia de «${cur.name}». Cambia lo que quieras y luego compara (⚖).`);
+  },
+  switchVariant: (id) => {
+    const st = get();
+    if (id === st.activeVariant) return;
+    const variants = st.syncedVariants();
+    const v = variants.find((x) => x.id === id);
+    if (!v) return;
+    set({ variants, activeVariant: id, past: [], future: [], nodes: sortNodes(v.nodes.map((n) => ({ ...n, selected: false }))), edges: v.edges, securityGroups: v.securityGroups, view: 'c2', c3Id: null, focusRequest: { ids: [], t: Date.now() } });
+  },
+  renameVariant: (id, name, note) => set({ variants: get().variants.map((v) => (v.id === id ? { ...v, name: name.trim() || v.name, ...(note !== undefined ? { note } : {}) } : v)), dirty: true }),
+  deleteVariant: (id) => {
+    const st = get();
+    let variants = st.syncedVariants().filter((v) => v.id !== id);
+    if (id === st.activeVariant) {
+      const next = variants[0];
+      if (next) set({ nodes: sortNodes(next.nodes), edges: next.edges, securityGroups: next.securityGroups, activeVariant: next.id, past: [], future: [] });
+    }
+    // Con una sola variante se vuelve a un diseño único
+    if (variants.length <= 1) {
+      variants = [];
+      set({ activeVariant: null });
+    }
+    set({ variants, dirty: true });
+  },
   setSecurity: (patch) => {
     get().commit('security');
     set({ security: { ...get().security, ...patch } });
@@ -827,6 +897,8 @@ export const useStore = create<State>((set, get) => ({
       threats: p.threats ?? {},
       securityGroups: p.securityGroups ?? [],
       security: p.security ?? {},
+      variants: p.variants ?? [],
+      activeVariant: p.variants?.length ? p.activeVariant ?? p.variants[0].id : null,
       meta: { ...emptyMeta(), ...p.meta },
       projectId,
       dirty: false,
@@ -855,7 +927,8 @@ export const useStore = create<State>((set, get) => ({
     get().loadProject({ format: 'archiplan', version: 1, meta: emptyMeta(), nodes: [], edges: [], decisions: [], threats: {} }, null);
   },
   toProject: () => {
-    const { nodes, edges, decisions, meta, threats, securityGroups, security } = get();
+    const { nodes, edges, decisions, meta, threats, securityGroups, security, activeVariant } = get();
+    const variants = get().syncedVariants();
     return {
       format: 'archiplan',
       version: 1,
@@ -874,6 +947,7 @@ export const useStore = create<State>((set, get) => ({
       threats,
       ...(securityGroups.length ? { securityGroups } : {}),
       ...(Object.keys(security).length ? { security } : {}),
+      ...(variants.length ? { variants, activeVariant: activeVariant ?? variants[0].id } : {}),
     };
   },
   setProjectId: (id) => set({ projectId: id }),
@@ -985,7 +1059,7 @@ export const useStore = create<State>((set, get) => ({
 // Autoguardado local (por si se cierra el navegador)
 let t: ReturnType<typeof setTimeout> | undefined;
 useStore.subscribe((s, prev) => {
-  if (s.nodes === prev.nodes && s.edges === prev.edges && s.decisions === prev.decisions && s.meta === prev.meta && s.threats === prev.threats && s.securityGroups === prev.securityGroups && s.security === prev.security && s.projectId === prev.projectId) return;
+  if (s.nodes === prev.nodes && s.edges === prev.edges && s.decisions === prev.decisions && s.meta === prev.meta && s.threats === prev.threats && s.securityGroups === prev.securityGroups && s.security === prev.security && s.variants === prev.variants && s.activeVariant === prev.activeVariant && s.projectId === prev.projectId) return;
   clearTimeout(t);
   t = setTimeout(() => {
     try {

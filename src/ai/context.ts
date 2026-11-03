@@ -25,6 +25,8 @@ export interface AiContextInput {
   net: NetAnalysis;
   sim?: SimResult | null;
   trace?: TraceResult | null;
+  /** Variantes A/B del proyecto, si las hay. */
+  variant?: { names: string[]; active: string } | null;
 }
 
 const MAX = 24000;
@@ -39,6 +41,7 @@ export function buildContext(x: AiContextInput): string {
 
   L.push(`# Arquitectura: ${meta.name} (${CLOUD_LABEL[cloud]}, región ${meta.region}, ambiente ${meta.environment})`);
   if (meta.description) L.push(`Objetivo: ${meta.description}`);
+  if (x.variant) L.push(`Variantes A/B del proyecto: ${x.variant.names.map((n) => `«${n}»`).join(', ')}. El diagrama de abajo es «${x.variant.active}»; las demás se comparan con ⚖ Comparar.`);
   if (!services.length) {
     L.push('El diagrama está vacío.');
     return L.join('\n');

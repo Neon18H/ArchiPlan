@@ -107,7 +107,11 @@ function useAiContext(issues: Issue[], threats: Threat[]) {
   const net = useNetAnalysis();
   const sim = useSim((s) => s.result);
   const trace = useSim((s) => s.trace);
-  return () => buildContext({ meta, nodes, edges, securityGroups, security, issues, threats, net, sim, trace });
+  return () => {
+    const { variants, activeVariant } = useStore.getState();
+    const variant = variants.length ? { names: variants.map((v) => v.name), active: variants.find((v) => v.id === activeVariant)?.name ?? '' } : null;
+    return buildContext({ meta, nodes, edges, securityGroups, security, issues, threats, net, sim, trace, variant });
+  };
 }
 
 /** Revisión automática mientras se diseña (siempre montado en App). */

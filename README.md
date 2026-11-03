@@ -36,6 +36,7 @@ Los proyectos se guardan como archivos `*.archi.json` en la carpeta `projects/`.
 | **Multinube** | Catálogos de AWS y Azure con las mismas reglas, simulación y modelo de amenazas. Convierte un diagrama completo de AWS a Azure (o al revés) con un clic. |
 | **Simulación** | Carga, picos, caída de instancias o AZ, falla de dependencias, DDoS L7 y L3/L4, y ataques web contra el WAF (ver abajo). |
 | **Modelo de amenazas (STRIDE)** | Genera las amenazas por pieza, por flujo que cruza un límite de confianza y de la cuenta. Calcula el riesgo, detecta controles en el diagrama y aplica mitigaciones con un clic; se conecta con la simulación (ver abajo). |
+| **Variantes A/B** | Clona el diseño, prueba alternativas y compáralas con las mismas simulaciones: disponibilidad, latencia, costo, amenazas y complejidad, con puntaje y ADR automático (ver abajo). |
 | **Exportar** | PNG, SVG, PDF (A3), documento de arquitectura en HTML (imprimible a PDF) o Markdown, Mermaid, Terraform (AWS y/o Azure) y JSON. |
 
 ## Azure y multinube
@@ -160,6 +161,20 @@ El botón **✦ IA** abre un asistente que lee el diagrama completo cada vez que
 - **Revisar mientras diseño:** al dejar de editar unos segundos, comenta los cambios (opcional, consume tokens).
 - **Privacidad:** la API key se guarda solo en tu equipo, en `~/.archiplan/ai.json`, con permisos 600. Nunca va en los proyectos ni en el repositorio, y las llamadas salen desde el servidor local. Por eso el asistente funciona con `npm run serve` o `npm run dev`.
 
+## Variantes A/B
+
+Para decidir entre dos o más caminos («¿ECS o Lambda?», «¿Aurora o DynamoDB?»), clona el diseño y compáralo con las mismas pruebas.
+
+1. En la barra superior del lienzo pulsa **＋ Variante**. El diseño actual queda como «Variante A» y se abre una copia («Variante B») para editarla. Doble clic o ✎ para renombrar; × para eliminar.
+2. Cambia lo que quieras en cada variante. Cada una guarda sus piezas, conexiones y Security Groups; la seguridad del proyecto, las amenazas aceptadas y los ADR son compartidos.
+3. **⚖ Comparar** corre a cada variante: caída de una instancia, de una AZ y de la dependencia principal, carga y pico, ataques web y DDoS, las 5 peticiones de usuario, STRIDE, el análisis de red, la validación y un costo mensual estimado.
+
+La tabla muestra disponibilidad, latencia p95, éxito en el pico, amenazas abiertas (críticas, altas, medias y bajas), ataques bloqueados, costo mensual y por millón de peticiones (con detalle por pieza), complejidad y qué cambia frente a la recomendada. En cada fila se marca la mejor y la peor.
+
+- **Puntaje:** cada pilar va de 0 a 100 y el total es el promedio ponderado. Las prioridades vienen en perfiles (Equilibrado, Startup, Banca / regulado, Alto tráfico) o se ajustan con los controles. Cambiar las prioridades no vuelve a simular.
+- **Costo:** precios de lista on-demand de us-east-1, con el tráfico promedio que indiques. Azure se estima con su equivalente en AWS. Es una referencia para comparar, no un presupuesto: valídalo con AWS Pricing Calculator.
+- **ADR:** **Generar ADR** crea una decisión «propuesta» solo con la elección y su justificación: las cifras que la respaldan, lo que se acepta a cambio y los pendientes de la variante elegida. Si tienes el asistente IA configurado, **✨ Redactar con IA** lo reescribe con los mismos datos.
+
 ## Modelo de amenazas (STRIDE)
 
 La pestaña **Amenazas** genera un modelo STRIDE a partir del diagrama, y se actualiza cada vez que lo cambias:
@@ -191,6 +206,8 @@ src/net/           Red configurable: modelo (SG, puertos, listeners), alcanzabil
 src/scaling/       Escalado configurable (políticas por tipo de pieza)
 src/security/      Seguridad del proyecto (guardrails y prácticas que cumplen controles)
 src/ai/            Asistente IA: contexto del diagrama y cliente
+src/variants/      Variantes A/B: comparación con las mismas pruebas, puntaje y ADR
+src/cost/          Costo mensual estimado por pieza (precios de lista)
 server/ai.mjs      Proxy local hacia OpenAI, Anthropic, DeepSeek y OpenRouter
 src/components/    Lienzo, paleta, panel lateral, modales
 ```
