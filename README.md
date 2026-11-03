@@ -31,7 +31,7 @@ Los proyectos se guardan como archivos `*.archi.json` en la carpeta `projects/`.
 | **Vistas C4** | C1 Contexto (actores, sistema y externos, calculada automáticamente), C2 Contenedores (la que se edita) y C3 Componentes (doble clic sobre un servicio). Con el filtro por **capas** resaltas borde, aplicación, datos, seguridad, etc. |
 | **Guía paso a paso** | Un checklist de 12 pasos (actores → entrada → borde → identidad → cómputo → datos → red → asíncrono → secretos → observabilidad → conexiones → ADR) que indica la siguiente pieza y la agrega con un clic. |
 | **Asistente** | Te hace unas 13 preguntas y genera la arquitectura inicial junto con sus ADR. |
-| **Plantillas** | Web en 3 capas, API serverless, microservicios en ECS, orientada a eventos, sitio estático y pipeline de datos. |
+| **Plantillas** | Web en 3 capas, defensa en profundidad con firewall de terceros, API serverless, microservicios en ECS, orientada a eventos, sitio estático y pipeline de datos. |
 | **Decisiones (ADR)** | Registro de decisiones con contexto, decisión y consecuencias. |
 | **Multinube** | Catálogos de AWS y Azure con las mismas reglas, simulación y modelo de amenazas. Convierte un diagrama completo de AWS a Azure (o al revés) con un clic. |
 | **Simulación** | Carga, picos, caída de instancias, AZ o región, dependencias caídas o lentas, corrupción de datos, ransomware, Game Day combinado, DDoS L7 y L3/L4, y ataques web contra el WAF (ver abajo). |
