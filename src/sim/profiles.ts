@@ -36,6 +36,8 @@ export interface SimProfile {
   quota?: string;
   /** Recurso fuera de la ruta del request (no recibe carga en la simulación). */
   passive?: boolean;
+  /** Utilización objetivo del autoescalado (0‑1). Por defecto 0,7. */
+  targetUtil?: number;
 }
 
 const INF = Number.POSITIVE_INFINITY;
@@ -131,16 +133,18 @@ export function profileFor(node: ServiceNode): SimProfile {
     case 'ec2': {
       const count = Math.max(1, num('count', 2));
       const asg = !!p.autoscaling;
+      const max = p.maxSize !== undefined ? Math.max(count, num('maxSize', count * 3)) : count * 3;
       prof = base({
         perInstance: ec2Capacity(String(p.instanceType ?? 't3.medium')),
         instances: count,
-        maxInstances: asg ? count * 3 : count,
+        maxInstances: asg ? max : count,
+        targetUtil: num('targetCpu', 70) / 100,
         scale: asg ? 'asg' : 'none',
         scaleDelay: 180,
         latency: 40,
         replaceTime: asg ? 240 : INF,
         multiAz: count >= 2,
-        basis: `${p.instanceType ?? 't3.medium'}: ~${ec2Capacity(String(p.instanceType ?? 't3.medium'))} req/s por instancia.${asg ? ' Auto Scaling: +instancias en ~3 min (detección + arranque).' : ' Sin Auto Scaling.'}`,
+        basis: `${p.instanceType ?? 't3.medium'}: ~${ec2Capacity(String(p.instanceType ?? 't3.medium'))} req/s por instancia.${asg ? ` Auto Scaling ${count}→${max} al ${num('targetCpu', 70)}% de CPU: +instancias en ~3 min (detección + arranque).` : ' Sin Auto Scaling.'}`,
       });
       break;
     }
@@ -151,7 +155,8 @@ export function profileFor(node: ServiceNode): SimProfile {
       prof = base({
         perInstance: Math.round((cpu / 1024) * 400),
         instances: desired,
-        maxInstances: auto ? desired * 4 : desired,
+        maxInstances: auto ? Math.max(desired, num('maxTasks', desired * 4)) : desired,
+        targetUtil: num('targetCpu', 70) / 100,
         scale: auto ? 'asg' : 'none',
         scaleDelay: 90,
         latency: 40,
@@ -323,7 +328,7 @@ function azureProfile(node: ServiceNode, num: (k: string, d: number) => number):
       const desired = Math.max(1, num('desired', 2));
       const cpu = num('cpu', 512);
       const per = Math.round((cpu / 1024) * 400);
-      return base({ perInstance: per, instances: desired, maxInstances: Math.max(desired * 5, 10), scale: 'asg', scaleDelay: 45, latency: 40, replaceTime: 30, multiAz: desired >= 2, basis: `${cpu / 1024} vCPU por réplica → ~${per} req/s. Escalado HTTP con KEDA en ~45 s.` });
+      return base({ perInstance: per, instances: desired, maxInstances: Math.max(desired, num('maxTasks', Math.max(desired * 5, 10))), targetUtil: num('targetCpu', 70) / 100, scale: 'asg', scaleDelay: 45, latency: 40, replaceTime: 30, multiAz: desired >= 2, basis: `${cpu / 1024} vCPU por réplica → ~${per} req/s. Escalado HTTP con KEDA en ~45 s.` });
     }
     case 'az-cosmos': {
       const mode = String(p.billing ?? 'Autoscale');

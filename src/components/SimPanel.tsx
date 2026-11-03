@@ -5,6 +5,7 @@ import { FIELD_LABEL, SCENARIO_MAP, SCENARIOS, type Scenario } from '../sim/scen
 import { useSim } from '../sim/store';
 import { useStore } from '../store';
 import { SimChart } from './SimChart';
+import { ModeSwitch, RequestPanel } from './RequestPanel';
 
 const SEV_LABEL = { error: 'Crítico', warn: 'Aviso', info: 'Nota', ok: 'Bien' } as const;
 
@@ -15,7 +16,7 @@ function fmtTime(t: number) {
 }
 
 export function SimPanel() {
-  const { scenario, result, idx, playing, speed, setKind, patch, setIdx, setPlaying, setSpeed, setOpen } = useSim();
+  const { scenario, result, idx, playing, speed, setKind, patch, setIdx, setPlaying, setSpeed, setOpen, mode } = useSim();
   const nodes = useStore((s) => s.nodes);
   const edges = useStore((s) => s.edges);
   const focus = useStore((s) => s.focus);
@@ -35,6 +36,8 @@ export function SimPanel() {
     }, 1000 / speed);
     return () => clearInterval(id);
   }, [playing, speed, result]);
+
+  if (mode === 'request') return <RequestPanel />;
 
   const candidates = meta.target ? targetCandidates(nodes, scenario.kind) : [];
   const autoTarget = meta.target ? pickDefaultTarget(nodes, edges, scenario.kind) : null;
@@ -87,7 +90,7 @@ export function SimPanel() {
     <section className="simpanel" aria-label="Simulación">
       <div className="sim-config">
         <div className="sim-head">
-          <b>Simulación</b>
+          <ModeSwitch />
           <button className="x" onClick={() => setOpen(false)} aria-label="Cerrar simulación">
             ×
           </button>

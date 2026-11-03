@@ -24,7 +24,7 @@ function anchor(a: ReturnType<typeof center>, b: ReturnType<typeof center>): [nu
 export const FloatingEdge = memo(function FloatingEdge({ id, source, target, data, selected, markerEnd }: EdgeProps<AppEdge>) {
   const s = useInternalNode(source);
   const t = useInternalNode(target);
-  const { edgeIssues, dimmed, sim, stride } = useCanvasCtx();
+  const { edgeIssues, dimmed, sim, stride, trace, netBlocked } = useCanvasCtx();
   const boundary = stride?.boundaries.get(id);
   if (!s || !t) return null;
   const a = center(s);
@@ -33,7 +33,8 @@ export const FloatingEdge = memo(function FloatingEdge({ id, source, target, dat
   const [tx, ty, tp] = anchor(b, a);
   const [path, lx, ly] = getSmoothStepPath({ sourceX: sx, sourceY: sy, sourcePosition: sp, targetX: tx, targetY: ty, targetPosition: tp, borderRadius: 10, offset: 18 });
   const d = (data ?? {}) as ConnData;
-  const issue = sim || stride ? undefined : edgeIssues.get(id);
+  const issue = sim || stride || trace ? undefined : edgeIssues.get(id);
+  const blockedLabel = !sim && !stride && !trace ? netBlocked?.get(id) : undefined;
   const simE = sim ? sim.edges[id] : undefined;
   // Estilos en línea (no solo CSS) para que la exportación a PNG/SVG conserve las líneas.
   const isDim = dimmed.has(source) || dimmed.has(target);
@@ -46,6 +47,16 @@ export const FloatingEdge = memo(function FloatingEdge({ id, source, target, dat
   };
   if (boundary) stroke = { ...stroke, stroke: '#eb6834', strokeWidth: 2.2, strokeDasharray: '7 3 2 3' };
   else if (stride) stroke = { ...stroke, opacity: 0.55 };
+  if (blockedLabel) stroke = { ...stroke, stroke: '#d6336c', strokeWidth: selected ? 2.6 : 2, strokeDasharray: '2 5', strokeLinecap: 'round' };
+  let traceLabel: string | null = null;
+  if (trace) {
+    const st = trace.edges.get(id);
+    const color = st === 'fail' ? '#d6336c' : st === 'blocked' ? '#eb6834' : st === 'warn' ? '#e0a100' : '#2f9e44';
+    stroke = st
+      ? { stroke: color, strokeWidth: 3, strokeDasharray: st === 'fail' ? '3 4' : '8 5', opacity: 1, fill: 'none', animation: st === 'fail' ? undefined : 'edge-flow 0.9s linear infinite' }
+      : { ...stroke, stroke: '#c3c8cf', opacity: 0.35, strokeDasharray: d.async ? '6 4' : undefined };
+    if (st === 'fail') traceLabel = trace.failedEdgeId === id ? '✗ aquí falla' : '✗';
+  }
   let simLabel: string | null = null;
   if (sim) {
     const rps = simE?.rps ?? 0;
@@ -65,10 +76,14 @@ export const FloatingEdge = memo(function FloatingEdge({ id, source, target, dat
   return (
     <>
       <BaseEdge id={id} path={path} markerEnd={markerEnd} className={cls} interactionWidth={18} style={stroke} />
-      {(sim ? simLabel : boundary ?? d.protocol) && (
+      {(sim ? simLabel : traceLabel ?? boundary ?? blockedLabel ?? d.protocol) && (
         <EdgeLabelRenderer>
-          <div className={`edge-label ${cls} ${sim ? 'is-sim' : ''} ${boundary ? 'is-boundary' : ''}`} style={{ transform: `translate(-50%, -50%) translate(${lx}px, ${ly}px)` }} title={boundary ? 'Límite de confianza: el flujo pasa a una zona de mayor confianza' : undefined}>
-            {sim ? simLabel : boundary ? `⛨ ${boundary}` : d.protocol}
+          <div
+            className={`edge-label ${cls} ${sim ? 'is-sim' : ''} ${boundary ? 'is-boundary' : ''} ${blockedLabel ? 'is-blocked' : ''} ${traceLabel ? 'is-trace-fail' : ''} ${trace && !trace.edges.get(id) ? 'is-faded' : ''}`}
+            style={{ transform: `translate(-50%, -50%) translate(${lx}px, ${ly}px)` }}
+            title={boundary ? 'Límite de confianza: el flujo pasa a una zona de mayor confianza' : blockedLabel ? `La configuración de red bloquea esta conexión: ${blockedLabel}. Mira «Problemas» o selecciona la flecha.` : undefined}
+          >
+            {sim ? simLabel : traceLabel ? traceLabel : boundary ? `⛨ ${boundary}` : blockedLabel ? `⛔ ${blockedLabel}` : d.protocol}
           </div>
         </EdgeLabelRenderer>
       )}

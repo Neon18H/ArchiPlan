@@ -119,6 +119,9 @@ export const SERVICES: ServiceDef[] = [
     { key: 'instanceType', label: 'Tipo de instancia', type: 'text', default: 't3.medium' },
     { key: 'count', label: 'Instancias', type: 'number', default: 2, min: 1, max: 100 },
     { key: 'autoscaling', label: 'Auto Scaling Group', type: 'bool', default: true },
+    { key: 'minSize', label: 'ASG · mínimo', type: 'number', default: 2, min: 0, max: 1000, help: 'Instancias mínimas del grupo.' },
+    { key: 'maxSize', label: 'ASG · máximo', type: 'number', default: 6, min: 1, max: 1000, help: 'Tope de instancias al escalar.' },
+    { key: 'targetCpu', label: 'ASG · CPU objetivo (%)', type: 'number', default: 60, min: 10, max: 95, help: 'Target tracking: escala cuando la utilización supera este valor.' },
   ] }),
   S({ id: 'lambda', name: 'AWS Lambda', short: 'λ', category: 'compute', role: 'compute', layer: 'aplicacion', zones: ['outside', 'region', 'subnet-private'], description: 'Funciones serverless por eventos.', inboundProtocol: 'Invoke', props: [
     { key: 'runtime', label: 'Runtime', type: 'select', default: 'nodejs20.x', options: ['nodejs20.x', 'python3.12', 'java21', 'go (provided.al2023)', 'dotnet8'] },
@@ -129,6 +132,8 @@ export const SERVICES: ServiceDef[] = [
     { key: 'cpu', label: 'CPU (unidades)', type: 'number', default: 512 },
     { key: 'memory', label: 'Memoria (MB)', type: 'number', default: 1024 },
     { key: 'desired', label: 'Tareas deseadas', type: 'number', default: 2, min: 1 },
+    { key: 'maxTasks', label: 'Auto Scaling · tareas máximas', type: 'number', default: 8, min: 1 },
+    { key: 'targetCpu', label: 'Auto Scaling · CPU objetivo (%)', type: 'number', default: 60, min: 10, max: 95 },
     { key: 'image', label: 'Imagen', type: 'text', default: 'app:latest' },
   ] }),
   S({ id: 'eks', name: 'Amazon EKS', short: 'EKS', category: 'containers', role: 'compute', layer: 'aplicacion', zones: [...VPC_APP], vpcBound: true, description: 'Kubernetes administrado.', inboundProtocol: 'HTTP', props: [

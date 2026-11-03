@@ -215,8 +215,23 @@ export function targetCandidates(nodes: AppNode[], kind: Scenario['kind']): Serv
 
 /* ───────────────────────────── simulación */
 
-export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario): SimResult {
+export interface SimOptions {
+  /** Flechas que la configuración de red bloquea (id → motivo). Las peticiones por ahí fallan. */
+  blocked?: Map<string, string>;
+}
+
+export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts: SimOptions = {}): SimResult {
   const map = byId(nodes);
+  const blockedPair = new Set<string>();
+  const blockedInto = new Set<string>();
+  for (const [eid] of opts.blocked ?? []) {
+    const e = edges.find((x) => x.id === eid);
+    if (!e) continue;
+    blockedPair.add(`${e.source}>${e.target}`);
+    const src = map.get(e.source);
+    if (isService(src) && ['actor', 'dns', 'external'].includes(getService(lid(src)).role)) blockedInto.add(e.target);
+  }
+  const via = (s: string, t: string, v: number) => (blockedPair.has(`${s}>${t}`) ? 0 : v);
   const services = nodes.filter(isService);
   const svcIds = new Set(services.map((n) => n.id));
   const prof = new Map<string, SimProfile>(services.map((n) => [n.id, profileFor(n)]));
@@ -672,8 +687,9 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario): SimR
       if ((p.scale === 'asg' || p.scale === 'serverless-db') && !s.pending && !isDown(id, t)) {
         const healthy = s.instances - s.lost;
         const u = healthy > 0 ? total / (p.perInstance * healthy) : 0;
-        if (u > 0.7 && s.instances < p.maxInstances) {
-          const want = Math.min(p.maxInstances, Math.max(s.instances + 1, Math.ceil(total / (p.perInstance * 0.6)) + s.lost));
+        const thr = p.targetUtil ?? 0.7;
+        if (u > thr && s.instances < p.maxInstances) {
+          const want = Math.min(p.maxInstances, Math.max(s.instances + 1, Math.ceil(total / (p.perInstance * Math.max(0.2, thr - 0.1))) + s.lost));
           s.pending = { at: t + p.scaleDelay, to: want };
           events.push({ t, label: `${label(id)}: utilización ${Math.round(u * 100)}% → escala a ${want} ${p.scale === 'serverless-db' ? 'ACU (×)' : 'instancias'} (listas en ~${p.scaleDelay} s)`, kind: 'info', nodeId: id });
         } else if (u > 1 && s.instances >= p.maxInstances && !s.pending) {
@@ -705,7 +721,7 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario): SimR
           let la = 0;
           for (const e of routes) {
             const miss = d.role === 'cdn' ? (def(e.t).role === 'storage' ? CDN_MISS_STATIC : CDN_MISS_DYNAMIC) : 1;
-            acc += (1 / routes.length) * ((1 - miss) + miss * (succ.get(e.t) ?? sfEff.get(e.t) ?? 1));
+            acc += (1 / routes.length) * ((1 - miss) + miss * via(id, e.t, succ.get(e.t) ?? sfEff.get(e.t) ?? 1));
             la += (1 / routes.length) * miss * (lat.get(e.t) ?? 0);
           }
           ok = acc;
@@ -719,7 +735,7 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario): SimR
           let w = e.w;
           if (cacheEdge && (tRole === 'datastore' || tRole === 'search')) w *= 1 - hit;
           if (e.kind === 'sync') {
-            ok *= depOk(w, succ.get(e.t) ?? 1);
+            ok *= depOk(w, via(id, e.t, succ.get(e.t) ?? 1));
             l += Math.min(w, 1) * (lat.get(e.t) ?? 0);
           } else if (e.kind === 'async') {
             ok *= depOk(Math.min(w, 1), sfEff.get(e.t) ?? 1);
@@ -742,11 +758,11 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario): SimR
     for (const [src, entries] of sources) {
       const share = legit * srcShare.get(src)!;
       for (const e of entries) {
-        legitOk += (share / entries.length) * (succ.get(e) ?? 0);
+        legitOk += (share / entries.length) * (blockedPair.has(`${src}>${e}`) || blockedInto.has(e) ? 0 : succ.get(e) ?? 0);
         latAcc += (share / entries.length) * (lat.get(e) ?? 0);
         latW += share / entries.length;
       }
-      for (const id of loginEdges.get(src) ?? []) legitOk += share * LOGIN_RATIO * (succ.get(id) ?? 0);
+      for (const id of loginEdges.get(src) ?? []) legitOk += share * LOGIN_RATIO * (blockedPair.has(`${src}>${id}`) ? 0 : succ.get(id) ?? 0);
     }
     const attackSent = (sc.kind === 'ddos-l7' || sc.kind === 'web-attacks') && targetId && inWindow(t) ? (sc.kind === 'ddos-l7' ? sc.attackRps : sc.sqliRps + sc.xssRps + sc.lfiRps + sc.botsRps) : 0;
     const blockedNow = sum(blockedAt);
@@ -802,6 +818,18 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario): SimR
   };
 
   const findings = buildFindings({ sc, summary, frames, peakUtil, prof, map, targetId, waf, shieldAdv, perFlow, l34Mitigated, peakLambdaConc, lambdaToRdsMaxConn, services, outE, edges, warnings });
+  if (opts.blocked?.size) {
+    const list = [...opts.blocked].map(([eid, why]) => {
+      const e = edges.find((x) => x.id === eid);
+      return { e, why };
+    }).filter((x) => x.e);
+    findings.unshift({
+      severity: 'error',
+      title: `${list.length} conexión${list.length > 1 ? 'es' : ''} bloqueada${list.length > 1 ? 's' : ''} por la configuración de red`,
+      detail: list.map(({ e, why }) => `${label(e!.source)} → ${label(e!.target)}: ${why}`).join(' · ') + '. Las peticiones que pasan por ahí fallan en toda la simulación. Usa «Petición de usuario» para ver el detalle.',
+      nodeIds: [...new Set(list.flatMap(({ e }) => [e!.source, e!.target]))],
+    });
+  }
   const cloud = primaryCloud(nodes);
   if (cloud === 'azure') {
     for (const e of events) e.label = cloudText(e.label, cloud);

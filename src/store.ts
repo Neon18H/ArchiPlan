@@ -5,7 +5,9 @@ import { convertRegion, convertService, convertZoneLabel } from './lib/cloud';
 import { absolutePosition, ancestors, byId, isService, isZone, nodeSize, placementOf, sortNodes, uid, ZONE_DEPTH } from './lib/graph';
 import { buildFromSpec, NODE_H, NODE_W, type Spec } from './lib/layout';
 import { evaluateConnection } from './rules/connections';
-import type { AppEdge, AppNode, C3Model, Cloud, ConnData, Decision, Fix, Layer, Placement, Project, ProjectMeta, PropValue, ServiceNode, ThreatState, ZoneKind, ZoneNode } from './types';
+import type { AppEdge, AppNode, C3Model, Cloud, ConnData, Decision, Fix, Layer, NetConfig, NetFix, Placement, Project, ProjectMeta, PropValue, SecurityGroup, ServiceNode, ThreatState, ZoneKind, ZoneNode } from './types';
+import { generateSecurityGroups, isLb, listenPort } from './net/model';
+
 
 export type ViewMode = 'c2' | 'c1' | 'c3';
 
@@ -15,6 +17,8 @@ interface Snapshot {
   decisions: Decision[];
   meta: ProjectMeta;
   threats: Record<string, ThreatState>;
+  /** Security Groups definidos por el arquitecto. Vacío = modo automático (derivados de las flechas). */
+  securityGroups: SecurityGroup[];
 }
 
 export interface Toast {
@@ -63,6 +67,15 @@ interface State extends Snapshot {
   setThreatState: (id: string, patch: Partial<ThreatState>) => void;
   setThreatControl: (id: string, key: string, value: boolean) => void;
 
+  /** Configuración de red de una pieza (puerto, SG, listeners, targets…). */
+  setNet: (id: string, patch: Partial<NetConfig>, coalesceKey?: string) => void;
+  setSecurityGroups: (groups: SecurityGroup[], coalesceKey?: string) => void;
+  /** Pasa a modo manual partiendo de los SG que se derivan del diagrama. */
+  materializeSecurityGroups: () => void;
+  /** Vuelve al modo automático (borra los SG manuales y las asignaciones). */
+  resetSecurityGroups: () => void;
+  applyNetFix: (fix: NetFix) => void;
+
   loadProject: (p: Project, projectId?: string | null) => void;
   loadSpec: (spec: Spec, meta: Partial<ProjectMeta>, decisions?: Omit<Decision, 'id'>[]) => void;
   newEmpty: () => void;
@@ -104,7 +117,7 @@ function loadAutosave(): Partial<State> | null {
     if (!raw) return null;
     const p = JSON.parse(raw) as Project & { projectId?: string | null };
     if (p.format !== 'archiplan') return null;
-    return { nodes: sortNodes(p.nodes), edges: p.edges, decisions: p.decisions ?? [], threats: p.threats ?? {}, meta: { ...emptyMeta(), ...p.meta }, projectId: p.projectId ?? null };
+    return { nodes: sortNodes(p.nodes), edges: p.edges, decisions: p.decisions ?? [], threats: p.threats ?? {}, securityGroups: p.securityGroups ?? [], meta: { ...emptyMeta(), ...p.meta }, projectId: p.projectId ?? null };
   } catch {
     return null;
   }
@@ -219,12 +232,30 @@ function preferredZone(nodes: AppNode[], serviceId: string): string | null {
 }
 
 const init = loadAutosave();
+const snap = (s: Snapshot): Snapshot => ({ nodes: s.nodes, edges: s.edges, decisions: s.decisions, meta: s.meta, threats: s.threats, securityGroups: s.securityGroups });
+
+/** Al cambiar el puerto de una pieza, actualiza las etiquetas de las flechas que lo mencionan. */
+function relabelPort(edges: AppEdge[], nodes: AppNode[], id: string, oldPort: number, newPort: number): AppEdge[] {
+  if (oldPort === newPort) return edges;
+  const map = byId(nodes);
+  return edges.map((e) => {
+    if (e.target !== id) return e;
+    const src = map.get(e.source);
+    // Detrás de un balanceador el puerto lo define el target group, no la etiqueta.
+    if (src && isService(src) && isLb(src) && src.data.net?.targets?.[id]) return e;
+    const d = (e.data ?? {}) as ConnData;
+    const re = new RegExp(`\\b${oldPort}\\b`);
+    if (!d.protocol || !re.test(d.protocol)) return e;
+    return { ...e, data: { ...d, protocol: d.protocol.replace(re, String(newPort)) } };
+  });
+}
 
 export const useStore = create<State>((set, get) => ({
   nodes: init?.nodes ?? [],
   edges: init?.edges ?? [],
   decisions: init?.decisions ?? [],
   threats: init?.threats ?? {},
+  securityGroups: init?.securityGroups ?? [],
   meta: init?.meta ?? emptyMeta(),
   projectId: init?.projectId ?? null,
   dirty: false,
@@ -249,21 +280,20 @@ export const useStore = create<State>((set, get) => ({
       }
       lastKey = coalesceKey ?? '';
       lastT = t;
-      const { nodes, edges, decisions, meta, threats, past } = get();
-      set({ past: [...past.slice(-99), { nodes, edges, decisions, meta, threats }], future: [], dirty: true });
+      set({ past: [...get().past.slice(-99), snap(get())], future: [], dirty: true });
     };
   })(),
   undo: () => {
-    const { past, future, nodes, edges, decisions, meta, threats } = get();
+    const { past, future } = get();
     const prev = past[past.length - 1];
     if (!prev) return;
-    set({ ...prev, past: past.slice(0, -1), future: [{ nodes, edges, decisions, meta, threats }, ...future].slice(0, 100), dirty: true });
+    set({ ...prev, past: past.slice(0, -1), future: [snap(get()), ...future].slice(0, 100), dirty: true });
   },
   redo: () => {
-    const { past, future, nodes, edges, decisions, meta, threats } = get();
+    const { past, future } = get();
     const next = future[0];
     if (!next) return;
-    set({ ...next, future: future.slice(1), past: [...past, { nodes, edges, decisions, meta, threats }], dirty: true });
+    set({ ...next, future: future.slice(1), past: [...past, snap(get())], dirty: true });
   },
 
   onNodesChange: (changes) => {
@@ -530,6 +560,104 @@ export const useStore = create<State>((set, get) => ({
     set({ threats: { ...get().threats, [id]: { ...cur, controls: { ...(cur.controls ?? {}), [key]: value } } } });
   },
 
+  setNet: (id, patch, coalesceKey) => {
+    get().commit(coalesceKey ? `net:${id}:${coalesceKey}` : undefined);
+    const nodes = get().nodes;
+    const n = nodes.find((x) => x.id === id);
+    if (!n || !isService(n)) return;
+    const oldPort = listenPort(n);
+    const net: NetConfig = { ...(n.data.net ?? {}), ...patch };
+    for (const k of Object.keys(net) as (keyof NetConfig)[]) if (net[k] === undefined) delete net[k];
+    const next = nodes.map((x) => (x.id === id ? ({ ...x, data: { ...x.data, net } } as AppNode) : x));
+    const nn = next.find((x) => x.id === id) as ServiceNode;
+    set({ nodes: next, edges: relabelPort(get().edges, next, id, oldPort, listenPort(nn)) });
+  },
+  setSecurityGroups: (groups, coalesceKey) => {
+    get().commit(coalesceKey ? `sg:${coalesceKey}` : undefined);
+    const ids = new Set(groups.map((g) => g.id));
+    // Quitar asignaciones a SG eliminados
+    const nodes = get().nodes.map((n) => {
+      if (!isService(n) || !n.data.net?.sgIds?.some((x) => !ids.has(x))) return n;
+      return { ...n, data: { ...n.data, net: { ...n.data.net, sgIds: n.data.net.sgIds.filter((x) => ids.has(x)) } } } as AppNode;
+    });
+    set({ securityGroups: groups, nodes });
+  },
+  materializeSecurityGroups: () => {
+    const { nodes, edges } = get();
+    const gen = generateSecurityGroups(nodes, edges);
+    get().commit();
+    set({
+      securityGroups: gen.groups,
+      nodes: nodes.map((n) => (isService(n) && gen.assign[n.id] ? ({ ...n, data: { ...n.data, net: { ...(n.data.net ?? {}), sgIds: gen.assign[n.id] } } } as AppNode) : n)),
+    });
+    get().toast('ok', `Modo manual: ${gen.groups.length} grupos creados a partir del diagrama. Ahora los editas tú.`);
+  },
+  resetSecurityGroups: () => {
+    get().commit();
+    set({
+      securityGroups: [],
+      nodes: get().nodes.map((n) => {
+        if (!isService(n) || !n.data.net?.sgIds) return n;
+        const { sgIds: _x, ...rest } = n.data.net;
+        void _x;
+        return { ...n, data: { ...n.data, net: rest } } as AppNode;
+      }),
+    });
+    get().toast('info', 'Modo automático: los grupos se derivan de las flechas del diagrama.');
+  },
+  applyNetFix: (fix) => {
+    switch (fix.kind) {
+      case 'service':
+        get().applyFix(fix.fix);
+        return;
+      case 'set-net':
+        get().setNet(fix.nodeId, fix.patch);
+        break;
+      case 'set-target': {
+        const lb = get().nodes.find((n) => n.id === fix.lbId);
+        if (!lb || !isService(lb)) return;
+        get().setNet(fix.lbId, { targets: { ...(lb.data.net?.targets ?? {}), [fix.targetId]: fix.target } });
+        break;
+      }
+      case 'set-edge':
+        get().updateEdge(fix.edgeId, { protocol: fix.protocol });
+        break;
+      case 'add-rule': {
+        const groups = get().securityGroups.map((g) => (g.id === fix.sgId ? { ...g, [fix.dir]: [...g[fix.dir], { ...fix.rule, id: uid('r') }] } : g));
+        get().setSecurityGroups(groups);
+        break;
+      }
+      case 'create-sg': {
+        const n = get().nodes.find((x) => x.id === fix.nodeId);
+        if (!n || !isService(n)) return;
+        const { nodes, edges } = get();
+        const gen = generateSecurityGroups(nodes, edges);
+        const base = gen.groups.find((g) => g.id === gen.assign[n.id]?.[0]);
+        const id = uid('sg');
+        // Reglas de entrada derivadas de las flechas; los orígenes "sg_x" se mapean a los SG manuales asignados.
+        const mapPeer = (r: SecurityGroup['inbound'][number]) => {
+          if (r.peer.kind !== 'sg') return r;
+          const src = r.peer.sgId.replace(/^sg_/, '');
+          const owner = nodes.find((x) => x.id === src);
+          const real = owner && isService(owner) ? owner.data.net?.sgIds?.[0] : undefined;
+          return real ? { ...r, id: uid('r'), peer: { kind: 'sg' as const, sgId: real } } : null;
+        };
+        const g: SecurityGroup = {
+          id,
+          name: base?.name ?? `sg-${n.data.label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+          description: `Grupo de ${n.data.label}`,
+          inbound: (base?.inbound ?? []).map(mapPeer).filter((r): r is SecurityGroup['inbound'][number] => !!r),
+          outbound: [{ id: uid('r'), protocol: 'all', from: 0, to: 65535, peer: { kind: 'cidr', value: '0.0.0.0/0' } }],
+        };
+        get().setSecurityGroups([...get().securityGroups, g]);
+        const cur = get().nodes.find((x) => x.id === fix.nodeId) as ServiceNode;
+        set({ nodes: get().nodes.map((x) => (x.id === fix.nodeId ? ({ ...x, data: { ...x.data, net: { ...(cur.data.net ?? {}), sgIds: [...(cur.data.net?.sgIds ?? []), id] } } } as AppNode) : x)) });
+        break;
+      }
+    }
+    get().toast('ok', `Aplicado: ${fix.label}`);
+  },
+
   loadProject: (p, projectId = null) => {
     get().commit();
     set({
@@ -537,6 +665,7 @@ export const useStore = create<State>((set, get) => ({
       edges: p.edges.map((e) => ({ ...e, type: 'floating', selected: false })),
       decisions: p.decisions ?? [],
       threats: p.threats ?? {},
+      securityGroups: p.securityGroups ?? [],
       meta: { ...emptyMeta(), ...p.meta },
       projectId,
       dirty: false,
@@ -565,7 +694,7 @@ export const useStore = create<State>((set, get) => ({
     get().loadProject({ format: 'archiplan', version: 1, meta: emptyMeta(), nodes: [], edges: [], decisions: [], threats: {} }, null);
   },
   toProject: () => {
-    const { nodes, edges, decisions, meta, threats } = get();
+    const { nodes, edges, decisions, meta, threats, securityGroups } = get();
     return {
       format: 'archiplan',
       version: 1,
@@ -582,6 +711,7 @@ export const useStore = create<State>((set, get) => ({
       }),
       decisions,
       threats,
+      ...(securityGroups.length ? { securityGroups } : {}),
     };
   },
   setProjectId: (id) => set({ projectId: id }),
@@ -693,7 +823,7 @@ export const useStore = create<State>((set, get) => ({
 // Autoguardado local (por si se cierra el navegador)
 let t: ReturnType<typeof setTimeout> | undefined;
 useStore.subscribe((s, prev) => {
-  if (s.nodes === prev.nodes && s.edges === prev.edges && s.decisions === prev.decisions && s.meta === prev.meta && s.threats === prev.threats && s.projectId === prev.projectId) return;
+  if (s.nodes === prev.nodes && s.edges === prev.edges && s.decisions === prev.decisions && s.meta === prev.meta && s.threats === prev.threats && s.securityGroups === prev.securityGroups && s.projectId === prev.projectId) return;
   clearTimeout(t);
   t = setTimeout(() => {
     try {

@@ -1,13 +1,14 @@
 import { getService } from '../catalog/catalog';
 import { byId, isService, isZone, placementOf } from '../lib/graph';
-import type { AppEdge, AppNode, ConnData, ProjectMeta, ServiceNode } from '../types';
+import type { AppEdge, AppNode, ConnData, ProjectMeta, SecurityGroup, ServiceNode } from '../types';
+import { effectiveNet, listenPort, targetOf } from '../net/model';
 
 /**
  * Esqueleto de Terraform para Azure (provider azurerm ~> 4.0).
  * Igual que el de AWS: red, recursos por pieza, NSG derivados de las flechas,
  * RBAC de mínimo privilegio con identidades administradas y TODOs.
  */
-export function toTerraformAzure(nodes: AppNode[], edges: AppEdge[], meta: ProjectMeta): string {
+export function toTerraformAzure(nodes: AppNode[], edges: AppEdge[], meta: ProjectMeta, securityGroups?: SecurityGroup[]): string {
   const map = byId(nodes);
   const services = nodes.filter(isService).filter((n) => getService(n.data.serviceId).provider === 'azure');
   const zones = nodes.filter(isZone);
@@ -237,27 +238,53 @@ resource "azurerm_private_dns_zone_virtual_network_link" "pg" {
 `);
     }
 
-    // NSG por subnet derivados de las flechas
+    // NSG por subnet: en modo manual, unión de las reglas de los NSG configurados; si no, derivados de las flechas
+    const netCfg = effectiveNet(nodes, edges, securityGroups);
     let prio = 100;
     for (const k of subnetKinds) {
       if (!hasSubnet(k)) continue;
       const rules: string[] = [];
-      const add = (name: string, src: string, port: string) => {
+      const seen = new Set<string>();
+      const add = (name: string, src: string, port: string, protocol = 'Tcp') => {
+        const key = `${src}|${port}|${protocol}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        const multi = src.startsWith('[');
         rules.push(`  security_rule {
-    name                       = ${q(name.slice(0, 80))}
+    name                       = ${q(name.replace(/[^A-Za-z0-9_.-]/g, '-').slice(0, 80))}
     priority                   = ${prio}
     direction                  = "Inbound"
     access                     = "Allow"
-    protocol                   = "Tcp"
+    protocol                   = ${q(protocol)}
     source_port_range          = "*"
     destination_port_range     = ${q(port)}
-    source_address_prefix      = ${src}
+    ${multi ? 'source_address_prefixes    ' : 'source_address_prefix      '}= ${src}
     destination_address_prefix = "*"
   }`);
         prio += 10;
       };
       const inSubnet = services.filter((n) => placement(n) === k);
-      for (const t of inSubnet) {
+      if (netCfg.mode === 'manual') {
+        for (const t of inSubnet) {
+          if (sid(t) === 'az-appgw') add(`${tfName(t)}-gwmanager`, '"GatewayManager"', '65200-65535');
+          for (const g of netCfg.groups.filter((x) => netCfg.sgIdsOf(t).includes(x.id))) {
+            g.inbound.forEach((r, i) => {
+              let src: string;
+              if (r.peer.kind === 'prefix') src = '"AzureFrontDoor.Backend"';
+              else if (r.peer.kind === 'cidr') src = r.peer.value.trim() === '0.0.0.0/0' ? '"Internet"' : q(r.peer.value.trim());
+              else {
+                const sgId = r.peer.sgId;
+                const subs = [...new Set(services.filter((n) => netCfg.sgIdsOf(n).includes(sgId)).map((n) => placement(n)).filter((pl) => pl.startsWith('subnet-')))];
+                if (!subs.length) return;
+                src = subs.length === 1 ? `azurerm_subnet.${short(subs[0])}.address_prefixes[0]` : `[${subs.map((x) => `azurerm_subnet.${short(x)}.address_prefixes[0]`).join(', ')}]`;
+              }
+              const port = r.protocol === 'all' ? '*' : r.from === r.to ? String(r.from) : `${r.from}-${r.to}`;
+              add(`${g.name}-${i + 1}`, src, port, r.protocol === 'all' ? '*' : r.protocol === 'udp' ? 'Udp' : 'Tcp');
+            });
+          }
+        }
+      }
+      for (const t of netCfg.mode === 'manual' ? [] : inSubnet) {
         if (sid(t) === 'az-appgw') {
           const behindAfd = ins(t).some(({ s }) => sid(s) === 'az-frontdoor');
           add(`${tfName(t)}-https`, behindAfd ? '"AzureFrontDoor.Backend"' : '"Internet"', '443');
@@ -269,7 +296,7 @@ resource "azurerm_private_dns_zone_virtual_network_link" "pg" {
           const sp = placement(s);
           if (!sp.startsWith('subnet-')) continue;
           const m = String((e.data as ConnData)?.protocol ?? '').match(/(\d{2,5})/);
-          const port = m ? m[1] : sid(t) === 'az-redis' ? '6380' : sid(t) === 'az-sql' ? '1433' : sid(t) === 'az-postgres' ? '5432' : '443';
+          const port = t.data.net?.port ? String(t.data.net.port) : m ? m[1] : String(listenPort(t));
           add(`${tfName(s)}-to-${tfName(t)}`, `azurerm_subnet.${short(sp)}.address_prefixes[0]`, port);
         }
       }
@@ -652,7 +679,7 @@ resource "azurerm_application_gateway" "${name}" {
   backend_http_settings {
     name                  = "app"
     cookie_based_affinity = "Disabled"
-    port                  = ${paas.length ? 443 : 8080}
+    port                  = ${paas.length ? 443 : backends[0] ? targetOf(n, backends[0]).port : 8080}
     protocol              = ${q(paas.length ? 'Https' : 'Http')}
     request_timeout       = 30${paas.length ? `
     pick_host_name_from_backend_address = true` : ''}
@@ -811,8 +838,8 @@ resource "azurerm_monitor_autoscale_setting" "${name}" {
     name = "default"
     capacity {
       default = ${count}
-      minimum = ${count}
-      maximum = ${count * 3}
+      minimum = ${p.minSize !== undefined ? Math.min(count, Number(p.minSize)) : count}
+      maximum = ${p.maxSize !== undefined ? Math.max(count, Number(p.maxSize)) : count * 3}
     }
     rule {
       metric_trigger {
@@ -823,7 +850,7 @@ resource "azurerm_monitor_autoscale_setting" "${name}" {
         time_window        = "PT5M"
         time_aggregation   = "Average"
         operator           = "GreaterThan"
-        threshold          = 70
+        threshold          = ${Number(p.targetCpu) || 70}
       }
       scale_action {
         direction = "Increase"
@@ -960,7 +987,7 @@ resource "azurerm_container_app" "${name}" {
   }
   ingress {
     external_enabled = ${ins(n).some(({ s }) => ['az-appgw', 'az-frontdoor', 'az-apim'].includes(sid(s)))}
-    target_port      = 8080
+    target_port      = ${listenPort(n)}
     traffic_weight {
       percentage      = 100
       latest_revision = true
