@@ -5,6 +5,11 @@ import { useSim } from '../sim/store';
 import { useStore } from '../store';
 import { Modal } from './Modals';
 import { useNetUi } from './NetInspector';
+import { ReplicationPanel } from './ReplicationPanel';
+import { create } from 'zustand';
+import { replicationLinks, suggestLinks } from '../resilience/replication';
+
+export const useResTab = create<{ tab: 'plan' | 'replication'; setTab: (t: 'plan' | 'replication') => void }>((set) => ({ tab: 'plan', setTab: (tab) => set({ tab }) }));
 
 export function applyResFix(fix: ResFix) {
   const st = useStore.getState();
@@ -58,6 +63,10 @@ export function ResilienceModal({ onClose }: { onClose: () => void }) {
   const setDr = (patch: Partial<typeof dr>) => setMeta({ dr: { ...dr, ...patch } });
   // Primero lo que falla; dentro de eso, la ruta crítica; los servicios globales al final
   const sevOf = (r: (typeof plan.rows)[number]) => Math.max(...[r.instance, r.az, r.region, r.data].map((c) => (!c ? 0 : c.status === 'bad' ? 3 : c.status === 'warn' ? 2 : c.status === 'ok' ? 1 : 0)));
+  const tab = useResTab((s) => s.tab);
+  const setTab = useResTab((s) => s.setTab);
+  const nLinks = replicationLinks(nodes).length;
+  const nSugg = suggestLinks(nodes, edges).length;
   const rows = [...plan.rows].sort((a, b) => Number(['global', 'dns'].includes(a.kind)) - Number(['global', 'dns'].includes(b.kind)) || sevOf(b) - sevOf(a) || Number(b.critical) - Number(a.critical));
 
   const tot = (title: string, t: LevelTotal, kind: ScenarioKind, sub: string) => {
@@ -83,6 +92,19 @@ export function ResilienceModal({ onClose }: { onClose: () => void }) {
   return (
     <Modal title="Resiliencia y recuperación ante desastres" onClose={onClose} wide>
       <div className="res-modal">
+        <div className="tabs res-tabs" role="tablist">
+          <button role="tab" aria-selected={tab === 'plan'} className={tab === 'plan' ? 'on' : ''} onClick={() => setTab('plan')}>
+            Plan de failover
+          </button>
+          <button role="tab" aria-selected={tab === 'replication'} className={tab === 'replication' ? 'on' : ''} onClick={() => setTab('replication')}>
+            Replicación y failover {nLinks ? `(${nLinks})` : ''}
+            {nSugg > 0 && <span className="tb-dot" aria-label="réplicas sin configurar" />}
+          </button>
+        </div>
+        {tab === 'replication' ? (
+          <ReplicationPanel onClose={onClose} />
+        ) : (
+        <>
         <p className="muted small res-intro">
           A qué recurso falla cada pieza, en cuánto tiempo vuelve el servicio (RTO) y cuántos datos se pierden (RPO) ante la caída de una instancia, de una zona, de la región completa, o si los datos se dañan. Cada cifra se puede comprobar con la simulación.
         </p>
@@ -173,6 +195,8 @@ export function ResilienceModal({ onClose }: { onClose: () => void }) {
                       {r.service}
                       {r.critical ? ' · ruta crítica' : ''}
                     </span>
+                    {r.replicaOf && <span className="repl-tag">⟲ réplica de {r.replicaOf}</span>}
+                    {r.replicas && <span className="repl-tag">⟲ réplicas: {r.replicas.join(', ')}</span>}
                   </th>
                   <Cell c={r.instance} />
                   <Cell c={r.az} />
@@ -184,6 +208,8 @@ export function ResilienceModal({ onClose }: { onClose: () => void }) {
           </table>
         </div>
         <p className="muted small">Tiempos típicos documentados por el proveedor; sirven para comparar diseños. Valídalos con un Game Day real (AWS Fault Injection Service / Azure Chaos Studio).</p>
+        </>
+        )}
       </div>
     </Modal>
   );

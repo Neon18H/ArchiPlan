@@ -19,6 +19,7 @@ import { ancestors, byId, isService, placementOf } from '../lib/graph';
 import type { AppEdge, AppNode, Role, ServiceNode } from '../types';
 import { fmtRps, profileFor, type SimProfile } from './profiles';
 import type { Scenario } from './scenarios';
+import { coverage, MODE_MAP, replicationLinks, suggestLinks, type FailureKind, type ReplicaLink } from '../resilience/replication';
 import { criticalPath, DEFAULT_DR, dataRecovery, dnsCutover, fmtDur, holdsData, nodeRes, regionRecovery, type DnsCutover, type DrConfig, type NodeRes } from '../resilience/model';
 
 export const DT = 5;
@@ -59,6 +60,10 @@ export interface NodeFrame {
   backlog?: number;
   blocked?: number;
   absorbed?: number;
+  /** Primaria caída cuyo tráfico atiende una réplica. */
+  failoverTo?: string;
+  /** Réplica promovida que atiende como primaria. */
+  promoted?: boolean;
 }
 
 export interface Frame {
@@ -106,6 +111,10 @@ export interface SimSummary {
   downtimeS?: number;
   /** Segundos sirviendo datos corruptos sin saberlo. */
   corruptS?: number;
+  /** Resultado principal de un ataque (cuentas tomadas, GB exfiltrados, costo…). */
+  impact?: { label: string; value: string; tone: 'good' | 'warn' | 'bad'; detail: string };
+  /** Failovers a réplicas dibujadas en el diagrama. */
+  failovers?: { primaryId: string; replicaId: string; ok: boolean; late?: boolean; at: number; rtoS: number; rpoS: number; why: string }[];
 }
 
 export interface SimResult {
@@ -188,6 +197,14 @@ export function pickDefaultTarget(nodes: AppNode[], edges: AppEdge[], kind: Scen
     }
     return null;
   }
+  if (kind === 'credential-stuffing') {
+    const idp = services.find((n) => role(n) === 'identity');
+    if (idp) return idp.id;
+  }
+  if (kind === 'exfiltration') {
+    const toData = services.find((n) => role(n) === 'compute' && edges.some((e) => e.source === n.id && ['datastore', 'storage'].includes(getService((map.get(e.target) as ServiceNode)?.data.serviceId ?? '').role)));
+    return (toData ?? services.find((n) => role(n) === 'compute'))?.id ?? null;
+  }
   if (kind === 'data-corruption' || kind === 'ransomware') {
     const data = services.filter((n) => holdsData(nodeRes(n, map).kind));
     const crit = criticalPath(nodes, edges);
@@ -222,6 +239,8 @@ export function targetCandidates(nodes: AppNode[], kind: Scenario['kind']): Serv
   const role = (n: ServiceNode) => getService(n.data.serviceId).role;
   if (kind === 'instance-failure') return services.filter((n) => getService(n.data.serviceId).vpcBound && !['lb', 'netgw'].includes(role(n)) || profileFor(n).stateful);
   if (kind === 'node-outage' || kind === 'slow-dependency') return services.filter((n) => !['actor'].includes(role(n)) && !profileFor(n).passive);
+  if (kind === 'exfiltration') return services.filter((n) => role(n) === 'compute');
+  if (kind === 'credential-stuffing') return services.filter((n) => role(n) === 'identity' || (['cdn', 'lb', 'api', 'compute'].includes(role(n)) && lid(n) !== 'lambda'));
   if (kind === 'data-corruption' || kind === 'ransomware') {
     const map = byId(nodes);
     return services.filter((n) => holdsData(nodeRes(n, map).kind) || lid(n) === 'memorydb' || lid(n) === 'elasticache');
@@ -336,6 +355,14 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
       if (indeg.get(e.t)! <= 0 && !seen.has(e.t)) queue.push(e.t);
     }
   }
+  // Réplicas dibujadas: van al final del orden (son destinos, nadie depende de ellas aguas abajo)
+  const links: ReplicaLink[] = replicationLinks(nodes).filter((l) => svcIds.has(l.primaryId) && svcIds.has(l.replicaId));
+  const replicaIds = new Set(links.map((l) => l.replicaId));
+  if (replicaIds.size) {
+    const rest = order.filter((id) => !replicaIds.has(id));
+    order.length = 0;
+    order.push(...rest, ...[...replicaIds]);
+  }
   const pos = new Map(order.map((id, i) => [id, i]));
   const isBack = (e: TEdge) => (pos.get(e.t) ?? 0) <= (pos.get(e.s) ?? 0);
 
@@ -370,7 +397,7 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
   };
 
   // ── 4. Objetivo y eventos del escenario
-  const autoTarget = ['load', 'spike', 'az-failure', 'region-failure', 'gameday'].includes(sc.kind) ? null : pickDefaultTarget(nodes, edges, sc.kind);
+  const autoTarget = ['load', 'spike', 'az-failure', 'region-failure', 'gameday', 'leaked-keys'].includes(sc.kind) ? null : pickDefaultTarget(nodes, edges, sc.kind);
   const targetId = sc.targetId && svcIds.has(sc.targetId) ? sc.targetId : autoTarget;
   const t0 = sc.eventAt;
   const t1 = sc.eventAt + sc.eventDuration;
@@ -381,7 +408,40 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
     events.push({ t: from, label: `${label(id)}: ${why}`, kind: 'bad', nodeId: id });
     if (Number.isFinite(until) && until < sc.duration && back) events.push({ t: until, label: `${label(id)}: ${back}`, kind: 'good', nodeId: id });
   };
-  const loseInstances = (id: string, k: number, t: number, cause: string) => {
+  // Failover hacia réplicas dibujadas en el diagrama
+  const redirect = new Map<string, { to: string; from: number }>();
+  const failovers: NonNullable<SimSummary['failovers']> = [];
+  const failoverFrom = (primaryId: string, failure: FailureKind, at: number, downUntil: number, detectS?: number) => {
+    const ls = links.filter((l) => l.primaryId === primaryId);
+    if (!ls.length || redirect.has(primaryId)) return;
+    const covs = ls.map((l) => ({ l, c: coverage(l, failure, { detectS }) }));
+    const ok = covs.filter((x) => x.c.covers && !isDown(x.l.replicaId, at + x.c.rtoS)).sort((a, b) => a.c.rtoS - b.c.rtoS)[0];
+    if (ok && at + ok.c.rtoS < downUntil) {
+      const from = at + ok.c.rtoS;
+      redirect.set(primaryId, { to: ok.l.replicaId, from });
+      failovers.push({ primaryId, replicaId: ok.l.replicaId, ok: true, at: from, rtoS: ok.c.rtoS, rpoS: ok.c.rpoS, why: ok.c.why });
+      if (from < sc.duration)
+        events.push({
+          t: from,
+          label: `Failover ${ok.l.failover === 'auto' ? 'automático' : 'manual'}: ${label(ok.l.replicaId)} (${MODE_MAP[ok.l.mode].short}) atiende lo que iba a ${label(primaryId)}${ok.c.rpoS > 0 ? ` · se pierden ~${fmtDur(ok.c.rpoS)} de escrituras` : ' · sin pérdida de datos'}`,
+          kind: 'good',
+          nodeId: ok.l.replicaId,
+        });
+      return;
+    }
+    for (const x of covs) {
+      const why = x.c.covers ? (isDown(x.l.replicaId, at + x.c.rtoS) ? 'también quedó fuera de servicio.' : 'la primaria vuelve antes de que termine la promoción.') : x.c.why;
+      failovers.push({ primaryId, replicaId: x.l.replicaId, ok: false, late: x.c.covers, at, rtoS: Infinity, rpoS: Infinity, why });
+      events.push({ t: at, label: `${label(x.l.replicaId)} no sirve como failover de ${label(primaryId)}: ${why}`, kind: x.c.covers ? 'info' : 'bad', nodeId: x.l.replicaId });
+    }
+  };
+  /** Destino real de una llamada (la réplica, si la primaria ya hizo failover). */
+  const route = (id: string, t: number) => {
+    const r = redirect.get(id);
+    return r && t >= r.from ? r.to : id;
+  };
+
+  const loseInstances = (id: string, k: number, t: number, cause: string, failure: FailureKind = 'instance') => {
     const p = prof.get(id)!;
     const s = st.get(id)!;
     const healthyBefore = s.instances - s.lost;
@@ -391,13 +451,15 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
       // Cae el primario (o el nodo): hay corte hasta el failover
       if (Number.isFinite(p.failoverTime)) {
         down(id, t, t + p.failoverTime, `${cause} — failover en curso`, healthyBefore > 1 ? 'failover completo, réplica promovida' : 'servicio restablecido');
+        failoverFrom(id, failure, t, t + p.failoverTime);
         if (healthyBefore > 1) s.lost += Math.min(k, healthyBefore - 1);
         if (getService(lid(map.get(id) as ServiceNode)).role === 'cache' && healthyBefore <= 1) {
           s.coldFrom = t + p.failoverTime;
           s.coldUntil = t + p.failoverTime + 120;
         }
       } else {
-        down(id, t, Infinity, `${cause} — sin réplica ni Multi‑AZ, queda fuera de servicio`);
+        down(id, t, Infinity, `${cause} — sin Multi‑AZ propio, queda fuera de servicio`);
+        failoverFrom(id, failure, t, Infinity);
       }
       return;
     }
@@ -429,7 +491,10 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
       }
     }
   }
-  if (sc.kind === 'node-outage' && targetId) down(targetId, t0, t1, 'deja de responder', 'vuelve a responder');
+  if (sc.kind === 'node-outage' && targetId) {
+    down(targetId, t0, t1, 'deja de responder', 'vuelve a responder');
+    failoverFrom(targetId, 'outage', t0, t1);
+  }
   if (sc.kind === 'node-outage' && !targetId) warnings.push('Elige la pieza que va a fallar.');
 
   // DDoS L3/L4: los puntos de entrada administrados (Shield Standard) lo absorben
@@ -465,7 +530,13 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
         if (wp.botControl) pass *= 0.15;
       }
     }
-    if (shieldAdv && waf && flow === FLOOD && since >= 120) pass *= 0.1;
+    if (shieldAdv && waf && flow === FLOOD && since >= 120 && sc.kind === 'ddos-l7') pass *= 0.1;
+    if (sc.kind === 'credential-stuffing' && flow === FLOOD) {
+      if (waf && wp.atp && since >= 30) pass *= 0.1;
+      if (security.captcha) pass *= 0.05;
+      const tn = map.get(targetId) as ServiceNode | undefined;
+      if (tn && lid(tn) === 'cognito' && tn.data.props.threatProtection && since >= 60) pass *= 0.25;
+    }
     return 1 - pass;
   };
   if (sc.kind === 'ddos-l7' && targetId) {
@@ -478,6 +549,20 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
       if (shieldAdv) events.push({ t: t0 + 120, label: 'Shield Advanced aplica mitigación automática de capa 7', kind: 'good', nodeId: shieldAdv.id });
     }
     if (t1 < sc.duration) events.push({ t: t1, label: 'El ataque termina', kind: 'info' });
+  }
+  if (sc.kind === 'credential-stuffing' && targetId) {
+    events.push({ t: t0, label: `Comienza el relleno de credenciales: ${fmtRps(sc.attackRps)} intentos de login/s desde ${sc.botIps} IPs contra ${label(targetId)}`, kind: 'bad', nodeId: targetId });
+    const perIp = (sc.attackRps * 300) / Math.max(1, sc.botIps);
+    if (waf) events.push({ t: t0 + 30, label: perIp > rateLimit ? `WAF: el rate limit bloquea las IPs (${Math.round(perIp)} intentos/5 min por IP)` : `WAF: cada IP hace ${Math.round(perIp)} intentos/5 min, por debajo del límite (${rateLimit}): el rate limit no lo ve`, kind: perIp > rateLimit ? 'good' : 'bad', nodeId: waf.id });
+    if (waf?.data.props.atp) events.push({ t: t0 + 30, label: 'WAF ATP detecta credenciales filtradas y bloquea el ataque al login', kind: 'good', nodeId: waf.id });
+    if (security.captcha) events.push({ t: t0, label: 'El CAPTCHA del login frena a casi todos los bots', kind: 'good', nodeId: targetId });
+    const tn = map.get(targetId) as ServiceNode;
+    if (lid(tn) === 'cognito' && tn.data.props.threatProtection) events.push({ t: t0 + 60, label: 'Cognito threat protection bloquea los inicios de sesión de riesgo', kind: 'good', nodeId: targetId });
+    if (t1 < sc.duration) events.push({ t: t1, label: 'El ataque termina', kind: 'info' });
+  }
+  if (sc.kind === 'scraping' && targetId) {
+    events.push({ t: t0, label: `Bots con cuentas válidas recorren los identificadores de la API: ${fmtRps(sc.botsRps)} req/s desde ${sc.botIps} IPs`, kind: 'bad', nodeId: targetId });
+    if (t1 < sc.duration) events.push({ t: t1, label: 'El scraping termina', kind: 'info' });
   }
   if (sc.kind === 'web-attacks' && targetId) {
     events.push({ t: t0, label: `Comienzan los ataques web contra ${label(targetId)}`, kind: 'bad', nodeId: targetId });
@@ -492,21 +577,27 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
       const d = getService(n.data.serviceId);
       const p = prof.get(n.id)!;
       if (p.passive || ['lb', 'netgw'].includes(d.role) || lid(n) === 'lambda') continue;
+      // Las réplicas dibujadas viven en otra AZ que la primaria
+      if (replicaIds.has(n.id)) continue;
       const vpc = ancestors(n, map).find((z) => z.data.zoneKind === 'vpc');
       const azs = Number(vpc?.data.props.azs ?? 2);
       if (azs < 2) {
         down(n.id, t, Infinity, 'la VPC solo usa una AZ y esa AZ cayó');
+        failoverFrom(n.id, 'az', t, Infinity);
         continue;
       }
       const s = st.get(n.id)!;
       const N = s.instances - s.lost;
       if (p.stateful) {
-        if (p.multiAz) loseInstances(n.id, Math.max(1, Math.floor(N / 2)), t, 'la AZ del primario cayó');
-        else down(n.id, t, Infinity, 'estaba en una sola AZ (sin Multi‑AZ / réplica)');
+        if (p.multiAz) loseInstances(n.id, Math.max(1, Math.floor(N / 2)), t, 'la AZ del primario cayó', 'az');
+        else {
+          down(n.id, t, Infinity, 'estaba en una sola AZ (sin Multi‑AZ propio)');
+          failoverFrom(n.id, 'az', t, Infinity);
+        }
       } else {
         const r = res.get(n.id)!;
         const lose = r.kind === 'fleet' ? (r.azs <= 1 ? N : Math.ceil(N / r.azs)) : N >= 2 ? Math.floor(N / 2) : 1;
-        loseInstances(n.id, lose, t, r.kind === 'fleet' && r.azs <= 1 ? 'todas sus instancias estaban en la AZ caída' : 'pierde las instancias de la AZ caída');
+        loseInstances(n.id, lose, t, r.kind === 'fleet' && r.azs <= 1 ? 'todas sus instancias estaban en la AZ caída' : 'pierde las instancias de la AZ caída', 'az');
       }
     }
   };
@@ -529,13 +620,19 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
     events.push({ t: t0, label: `Cae la región ${where} completa: cómputo, bases de datos, colas y servicios regionales`, kind: 'bad' });
     let loss = 0;
     let anyData = false;
+    const otherRegion = new Set(links.filter((l) => l.mode === 'cross-region' || l.mode === 'isolated').map((l) => l.replicaId));
+    const regionPrimaries: string[] = [];
     for (const n of services) {
       const r = res.get(n.id)!;
       if (['actor', 'global', 'dns'].includes(r.kind)) continue;
+      if (otherRegion.has(n.id)) continue;
       const rr = regionRecovery(n, r, dr, security);
+      if (links.some((l) => l.primaryId === n.id)) regionPrimaries.push(n.id);
       if (holdsData(r.kind) && crit.has(n.id)) {
         anyData = true;
-        if (!Number.isFinite(rr.rpoS)) regionNoCopy.push(n.id);
+        const cov = links.filter((l) => l.primaryId === n.id).map((l) => coverage(l, 'region')).filter((c) => c.covers).sort((a, b) => a.rpoS - b.rpoS)[0];
+        if (cov) loss = Math.max(loss, cov.rpoS);
+        else if (!Number.isFinite(rr.rpoS)) regionNoCopy.push(n.id);
         else loss = Math.max(loss, rr.rpoS);
       }
       if (dr.strategy === 'active') {
@@ -557,6 +654,7 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
         capMods.set(n.id, (t) => (t < from ? 1 : Math.min(1, rr.capacity0 + ((1 - rr.capacity0) * (t - from)) / Math.max(1, rr.rampS))));
       }
     }
+    for (const id of regionPrimaries) failoverFrom(id, 'region', t0, st.get(id)!.downUntil);
     if (dr.strategy === 'active') regionLoss = (t) => (t >= t0 && t < t0 + dns!.seconds ? 0.5 : 0);
     if (dr.strategy !== 'none' && t0 + dns.seconds < sc.duration)
       events.push({ t: t0 + dns.seconds, label: dns.automatic ? `Route 53: los health checks fallan y el DNS manda el tráfico a ${dr.secondaryRegion}` : `El equipo cambia el DNS a mano hacia ${dr.secondaryRegion}`, kind: dns.automatic ? 'good' : 'info', nodeId: dns.dnsId ?? undefined });
@@ -613,6 +711,13 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
       if (detect > 0 && corruptUntil < sc.duration) events.push({ t: corruptUntil, label: `Alguien nota el problema (${sc.detectMin} min después). Se pone ${label(targetId)} en mantenimiento para restaurar`, kind: 'info', nodeId: targetId });
     }
     const until = corruptUntil + rec.rtoS;
+    // Las réplicas en vivo (y en ransomware, todas las de la misma cuenta) reciben el mismo daño
+    for (const l of links.filter((x) => x.primaryId === targetId)) {
+      const c = coverage(l, sc.kind === 'ransomware' ? 'ransomware' : 'corruption', { detectS: detect });
+      if (!c.covers) quietDown(l.replicaId, sc.kind === 'ransomware' ? t0 : corruptUntil, until);
+    }
+    failoverFrom(targetId, sc.kind === 'ransomware' ? 'ransomware' : 'corruption', t0, Number.isFinite(until) ? until : Infinity, detect);
+    const fo = failovers.find((f) => f.primaryId === targetId && f.ok);
     if (r.kind === 'cache' && rec.rtoS === 0) {
       const s0 = st.get(targetId)!;
       s0.coldFrom = corruptUntil;
@@ -621,9 +726,9 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
     } else {
       quietDown(targetId, corruptUntil, until);
       if (Number.isFinite(until) && until < sc.duration) events.push({ t: until, label: `${label(targetId)}: restaurado y de vuelta en servicio`, kind: 'good', nodeId: targetId });
-      else if (!Number.isFinite(rec.rtoS)) events.push({ t: corruptUntil, label: `${label(targetId)}: no hay copia de la que restaurar`, kind: 'bad', nodeId: targetId });
+      else if (!Number.isFinite(rec.rtoS) && !fo) events.push({ t: corruptUntil, label: `${label(targetId)}: no hay copia de la que restaurar`, kind: 'bad', nodeId: targetId });
     }
-    dataLossS = rec.rpoS;
+    dataLossS = fo ? Math.min(rec.rpoS, fo.rpoS) : rec.rpoS;
   }
 
   const legitAt = (t: number) => {
@@ -650,6 +755,7 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
   const perFlow = FLOWS.map((f) => ({ flow: f, sent: 0, blocked: 0, toApp: 0, toData: 0 }));
   let peakBacklog = 0;
   let lambdaFloodInvocations = 0;
+  let stuffServed = 0;
   let lambdaGbSeconds = 0;
   let peakLambdaConc = 0;
   let lambdaToRdsMaxConn = Infinity;
@@ -720,7 +826,8 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
     const blockedAt = new Float64Array(F);
     if (targetId && inWindow(t)) {
       const o = offered.get(targetId)!;
-      if (sc.kind === 'ddos-l7') o[FLOOD] += sc.attackRps;
+      if (sc.kind === 'ddos-l7' || sc.kind === 'credential-stuffing') o[FLOOD] += sc.attackRps;
+      if (sc.kind === 'scraping') o[5] += sc.botsRps;
       if (sc.kind === 'web-attacks') {
         o[2] += sc.sqliRps;
         o[3] += sc.xssRps;
@@ -812,7 +919,8 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
           if (e.kind === 'cache' && isDown(e.t, t)) w = 0;
           const se = slowEdge.get(e.id);
           if (se) w *= se.mult;
-          const add = offered.get(e.t)!;
+          const tgt = route(e.t, t);
+          const add = offered.get(tgt)!;
           let r = 0;
           let a = 0;
           for (let f = 0; f < F; f++) {
@@ -821,7 +929,15 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
             r += v;
             if (f > 0) a += v;
           }
-          edgesF[e.id] = { rps: r, attack: a };
+          if (tgt === e.t) edgesF[e.id] = { rps: r, attack: a };
+          else {
+            // Failover: la flecha a la primaria queda en 0 y el tráfico va a la réplica
+            edgesF[e.id] = { rps: 0, attack: 0 };
+            const real = tedges.find((x) => x.s === e.s && x.t === tgt);
+            const key = real ? real.id : `fo:${e.s}>${tgt}`;
+            const prev = edgesF[key] ?? { rps: 0, attack: 0 };
+            edgesF[key] = { rps: prev.rps + r, attack: prev.attack + a };
+          }
         }
       }
 
@@ -847,6 +963,7 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
         ...(d.role === 'queue' ? { backlog: sum(s.backlog) } : {}),
         ...(nodeAbsorbed > 0 ? { absorbed: nodeAbsorbed } : {}),
       };
+      if (id === targetId && sc.kind === 'credential-stuffing') stuffServed += out[FLOOD] * DT;
       if (d.role === 'compute') {
         for (let f = 1; f < F; f++) perFlow[f].toApp += o[f] * DT;
         attackTotals.toApp += attack * DT;
@@ -920,12 +1037,13 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
           let w = e.w;
           if (cacheEdge && (tRole === 'datastore' || tRole === 'search')) w *= 1 - hit;
           const se = slowEdge.get(e.id);
+          const tg = route(e.t, t);
           if (e.kind === 'sync' && se) {
-            ok *= depOk(w, se.ok ? via(id, e.t, succ.get(e.t) ?? 1) : 0);
-            l += Math.min(w, 1) * (se.ok ? lat.get(e.t) ?? 0 : se.add);
+            ok *= depOk(w, se.ok ? via(id, e.t, succ.get(tg) ?? 1) : 0);
+            l += Math.min(w, 1) * (se.ok ? lat.get(tg) ?? 0 : se.add);
           } else if (e.kind === 'sync') {
-            ok *= depOk(w, via(id, e.t, succ.get(e.t) ?? 1));
-            l += Math.min(w, 1) * (lat.get(e.t) ?? 0);
+            ok *= depOk(w, tg === e.t ? via(id, e.t, succ.get(e.t) ?? 1) : succ.get(tg) ?? 1);
+            l += Math.min(w, 1) * (lat.get(tg) ?? 0);
           } else if (e.kind === 'async') {
             ok *= depOk(Math.min(w, 1), sfEff.get(e.t) ?? 1);
             l += Math.min(w, 1) * (prof.get(e.t)?.latency ?? 0);
@@ -954,8 +1072,13 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
       for (const id of loginEdges.get(src) ?? []) legitOk += share * LOGIN_RATIO * (blockedPair.has(`${src}>${id}`) ? 0 : succ.get(id) ?? 0);
     }
     legitOk *= 1 - regionLoss(t);
+    for (const [pid, r] of redirect) {
+      if (t < r.from) continue;
+      if (nodesF[pid]) nodesF[pid] = { ...nodesF[pid], failoverTo: label(r.to) };
+      if (nodesF[r.to]) nodesF[r.to] = { ...nodesF[r.to], promoted: true };
+    }
     if (corruptUntil > 0 && targetId && t >= t0 && t < corruptUntil && nodesF[targetId]) nodesF[targetId] = { ...nodesF[targetId], status: 'degraded' };
-    const attackSent = (sc.kind === 'ddos-l7' || sc.kind === 'web-attacks') && targetId && inWindow(t) ? (sc.kind === 'ddos-l7' ? sc.attackRps : sc.sqliRps + sc.xssRps + sc.lfiRps + sc.botsRps) : 0;
+    const attackSent = ['ddos-l7', 'web-attacks', 'credential-stuffing', 'scraping'].includes(sc.kind) && targetId && inWindow(t) ? (sc.kind === 'ddos-l7' || sc.kind === 'credential-stuffing' ? sc.attackRps : sc.kind === 'scraping' ? sc.botsRps : sc.sqliRps + sc.xssRps + sc.lfiRps + sc.botsRps) : 0;
     const blockedNow = sum(blockedAt);
     attackTotals.blocked += blockedNow * DT;
     attackTotals.absorbed += absorbedAttack * DT;
@@ -994,6 +1117,55 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
     if (prof.get(id)!.passive) continue;
     if (!bottleneck || u > bottleneck.peakUtil) bottleneck = { id, label: label(id), peakUtil: u };
   }
+  // ── Impacto de los ataques que no son solo tráfico
+  let impact: SimSummary['impact'];
+  const has = (id: string) => services.some((n) => lid(n) === id);
+  if (sc.kind === 'credential-stuffing' && targetId) {
+    const tn = map.get(targetId) as ServiceNode;
+    const cognito = lid(tn) === 'cognito';
+    const mfa = cognito ? String(tn.data.props.mfa ?? 'OPTIONAL') : 'OFF';
+    const taken = Math.round(stuffServed * 0.005 * (mfa === 'ON' ? 0.02 : mfa === 'OPTIONAL' ? 0.7 : 1) * (cognito && tn.data.props.threatProtection ? 0.3 : 1) * (wp.atp ? 0.3 : 1));
+    impact = { label: 'Cuentas tomadas', value: taken.toLocaleString('es-CO'), tone: taken === 0 ? 'good' : taken < 20 ? 'warn' : 'bad', detail: `${Math.round(stuffServed).toLocaleString('es-CO')} intentos llegaron a validar la contraseña; ~0,5 % de las credenciales filtradas suelen ser reutilizadas. MFA ${mfa}.` };
+  }
+  if (sc.kind === 'scraping') {
+    const leaked = security.objectAuthz ? 0 : Math.round(perFlow[5].toApp);
+    impact = { label: 'Registros expuestos', value: leaked.toLocaleString('es-CO'), tone: leaked === 0 ? 'good' : 'bad', detail: security.objectAuthz ? 'La autorización por objeto devuelve 403 a los identificadores ajenos.' : 'Cada petición que llega a la aplicación devuelve el registro de otro usuario.' };
+  }
+  let exfil: { gb: number; rate: number; detect: number; respond: number; egress: string } | null = null;
+  if (sc.kind === 'exfiltration' && targetId) {
+    const tn = map.get(targetId) as ServiceNode;
+    const place = placementOf(tn, map);
+    const egress = has('networkfirewall') ? 'filtered' : has('natgw') || place === 'subnet-public' || !place.startsWith('subnet-') ? 'open' : 'none';
+    const rate = { open: 144, filtered: 2, none: 0.2 }[egress]!; // GB/h
+    const detect = has('guardduty') ? 1200 : security.dataAuditLogs && security.siem ? 7200 : Infinity;
+    const respond = security.siem ? 600 : 10800;
+    const stop = detect + respond;
+    const full = (sc.dataGb / rate) * 3600;
+    const gb = Math.min(sc.dataGb, (rate * Math.min(stop, sc.duration - t0)) / 3600);
+    exfil = { gb, rate, detect, respond, egress };
+    events.push({ t: t0, label: `${label(targetId)} está comprometido: el atacante vuelca los datos a los que llega y los saca por ${egress === 'open' ? 'Internet (NAT / IP pública)' : egress === 'filtered' ? 'el único hueco que deja el Network Firewall (DNS / dominios permitidos)' : 'túneles DNS (sin salida directa a Internet)'}`, kind: 'bad', nodeId: targetId });
+    if (Number.isFinite(detect) && t0 + detect < sc.duration) events.push({ t: t0 + detect, label: has('guardduty') ? 'GuardDuty genera un hallazgo de exfiltración (tráfico anómalo)' : 'Los logs de acceso a datos disparan una alerta', kind: 'good' });
+    if (Number.isFinite(stop) && t0 + stop < sc.duration) events.push({ t: t0 + stop, label: `El equipo aísla ${label(targetId)} y revoca sus credenciales${security.siem ? '' : ' (nadie vio la alerta hasta horas después)'}`, kind: 'good', nodeId: targetId });
+    if (full < Math.min(stop, sc.duration - t0)) events.push({ t: t0 + full, label: `Ya salió toda la base (${sc.dataGb} GB)`, kind: 'bad' });
+    impact = { label: 'Datos exfiltrados', value: `${gb >= 10 ? Math.round(gb) : gb.toFixed(1)} de ${sc.dataGb} GB`, tone: gb < sc.dataGb * 0.01 ? 'good' : gb < sc.dataGb ? 'warn' : 'bad', detail: `Salida ${egress === 'open' ? 'abierta' : egress === 'filtered' ? 'filtrada' : 'cerrada'} (~${rate} GB/h).` };
+  }
+  let keys: { noKeys: boolean; revoke: number; rate: number; cost: number } | null = null;
+  if (sc.kind === 'leaked-keys') {
+    const noKeys = !!security.rootMfa;
+    const gd = has('guardduty');
+    const revoke = security.secretScan ? 300 : gd ? 900 + (security.siem ? 600 : 10800) : 86400;
+    const rate = security.scp ? 60 : 600; // US$/h en instancias GPU
+    const cost = noKeys ? 0 : (rate * revoke) / 3600;
+    keys = { noKeys, revoke, rate, cost };
+    if (noKeys) events.push({ t: t0, label: 'El equipo entra por SSO con credenciales temporales: no hay access keys de larga duración que filtrar', kind: 'good' });
+    else {
+      events.push({ t: t0, label: 'Unas access keys de un desarrollador quedan en un repositorio público', kind: 'bad' });
+      events.push({ t: t0 + 60, label: `Un bot las encuentra y lanza instancias GPU de minería en varias regiones (~US$${rate}/h)${security.boundary ? '' : ' y lista S3, DynamoDB y los secretos'}`, kind: 'bad' });
+      if (t0 + revoke < sc.duration) events.push({ t: t0 + revoke, label: security.secretScan ? 'El escaneo de secretos las detecta y AWS aplica la política de cuarentena: llaves revocadas' : 'GuardDuty detecta el uso anómalo y el equipo revoca las llaves', kind: 'good' });
+    }
+    impact = { label: 'Costo del ataque', value: `US$${Math.round(cost).toLocaleString('es-CO')}`, tone: cost < 50 ? 'good' : cost < 2000 ? 'warn' : 'bad', detail: noKeys ? 'Sin llaves de larga duración.' : `~US$${rate}/h durante ${fmtDur(revoke)} hasta revocarlas.` };
+  }
+
   const lambdaCost = lambdaFloodInvocations > 0 ? (lambdaFloodInvocations / 1e6) * 0.2 + lambdaGbSeconds * 0.0000166667 : 0;
   const summary: SimSummary = {
     availability: totOff > 0 ? totOk / totOff : 1,
@@ -1004,14 +1176,16 @@ export function simulate(nodes: AppNode[], edges: AppEdge[], sc: Scenario, opts:
     recoverySeconds: recovery,
     bottleneck,
     peakBacklog,
-    ...(sc.kind === 'ddos-l7' || sc.kind === 'web-attacks' ? { attack: { ...attackTotals, perFlow: perFlow.slice(1).filter((f) => f.sent > 0) } } : {}),
+    ...(['ddos-l7', 'web-attacks', 'credential-stuffing', 'scraping'].includes(sc.kind) ? { attack: { ...attackTotals, perFlow: perFlow.slice(1).filter((f) => f.sent > 0) } } : {}),
     ...(lambdaCost > 0 ? { lambdaCostUsd: lambdaCost } : {}),
     ...(dataLossS !== undefined ? { dataLossS } : {}),
     ...(['region-failure', 'data-corruption', 'ransomware', 'gameday', 'slow-dependency'].includes(sc.kind) ? { downtimeS: frames.filter((f) => f.t >= t0 && f.success < 0.99).length * DT } : {}),
     ...(corruptUntil > 0 ? { corruptS: Math.max(0, Math.min(corruptUntil, sc.duration) - t0) } : {}),
+    ...(failovers.length ? { failovers } : {}),
+    ...(impact ? { impact } : {}),
   };
 
-  const findings = buildFindings({ sc, summary, frames, peakUtil, prof, map, targetId, waf, shieldAdv, perFlow, l34Mitigated, peakLambdaConc, lambdaToRdsMaxConn, services, outE, edges, warnings, dr, dns, regionNoCopy, regionSlow, slowTarget, slowStats, slowFrom, slowTo, dataRestore, res, crit });
+  const findings = buildFindings({ sc, summary, frames, peakUtil, prof, map, targetId, waf, shieldAdv, perFlow, l34Mitigated, peakLambdaConc, lambdaToRdsMaxConn, services, outE, edges, warnings, dr, dns, regionNoCopy, regionSlow, slowTarget, slowStats, slowFrom, slowTo, dataRestore, res, crit, suggested: suggestLinks(nodes, edges), security, exfil, keys });
   if (opts.blocked?.size) {
     const list = [...opts.blocked].map(([eid, why]) => {
       const e = edges.find((x) => x.id === eid);
@@ -1109,6 +1283,10 @@ interface FindingCtx {
   dataRestore: { rtoS: number; rpoS: number; text: string } | null;
   res: Map<string, NodeRes>;
   crit: Set<string>;
+  suggested: { primaryId: string; replicaId: string }[];
+  security: Record<string, boolean>;
+  exfil: { gb: number; rate: number; detect: number; respond: number; egress: string } | null;
+  keys: { noKeys: boolean; revoke: number; rate: number; cost: number } | null;
 }
 
 function buildFindings(c: FindingCtx): Finding[] {
@@ -1154,6 +1332,7 @@ function buildFindings(c: FindingCtx): Finding[] {
     const wasDown = frames.some((f) => f.nodes[n.id]?.status === 'down');
     if (!wasDown) continue;
     const endsDown = last.nodes[n.id]?.status === 'down';
+    if (endsDown && s.failovers?.some((f) => f.ok && f.primaryId === n.id)) continue;
     if (endsDown && !['node-outage', 'ddos-l34', 'region-failure', 'data-corruption', 'ransomware'].includes(sc.kind)) out.push({ severity: 'error', title: `${label(n.id)} es un punto único de falla`, detail: 'Cayó y no se recuperó: no tiene réplica, Multi‑AZ ni Auto Scaling que la reemplace.', nodeIds: [n.id] });
   }
 
@@ -1198,6 +1377,16 @@ function buildFindings(c: FindingCtx): Finding[] {
     });
     if (vpcSingle) out.push({ severity: 'error', title: 'La VPC usa una sola zona de disponibilidad', detail: 'Al caer esa AZ cae todo lo que está dentro de la VPC. Configura al menos 2 AZ.', nodeIds: [] });
   }
+
+  // Failover a réplicas dibujadas
+  for (const f of s.failovers ?? []) {
+    if (f.ok)
+      out.push({ severity: 'ok', title: `Failover a ${label(f.replicaId)} en ${fmtDur(f.rtoS)}`, detail: `${f.why} ${f.rpoS > 0 ? `Se pierden ~${fmtDur(f.rpoS)} de escrituras.` : 'Sin pérdida de datos.'} Mira en el lienzo cómo el tráfico de ${label(f.primaryId)} pasa a la réplica.`, nodeIds: [f.replicaId, f.primaryId] });
+    else if (f.late) out.push({ severity: 'warn', title: `${label(f.replicaId)} no llegó a tomar el tráfico`, detail: `${label(f.primaryId)} volvió antes de que terminara la promoción. Con failover automático la réplica entra en segundos.`, nodeIds: [f.replicaId, f.primaryId] });
+    else out.push({ severity: 'error', title: `${label(f.replicaId)} no sirve como failover en este escenario`, detail: `${f.why} Cambia el tipo de réplica en Resiliencia → Replicación y failover (p. ej. «copia aislada en otra cuenta» contra ransomware, «réplica con retraso» contra borrados).`, nodeIds: [f.replicaId, f.primaryId] });
+  }
+  if (c.suggested.length && ['instance-failure', 'az-failure', 'node-outage', 'region-failure', 'data-corruption', 'ransomware'].includes(sc.kind))
+    for (const g of c.suggested) out.push({ severity: 'warn', title: `¿${label(g.replicaId)} es réplica de ${label(g.primaryId)}?`, detail: 'Están conectadas, pero no está configurado qué tipo de réplica es ni cómo hace failover, así que la simulación no la usa. Configúralo en ⛑ Resiliencia → Replicación y failover.', nodeIds: [g.replicaId, g.primaryId] });
 
   // Caída de región
   if (sc.kind === 'region-failure') {
@@ -1257,7 +1446,9 @@ function buildFindings(c: FindingCtx): Finding[] {
       if (rr.azs >= 2 || rr.readReplicas > 0 || rr.crossRegion) out.push({ severity: 'info', title: 'Multi‑AZ y las réplicas no protegen de esto', detail: `${label(id)} tiene redundancia, pero copia el daño al instante. Contra errores humanos y bugs solo sirven los backups, PITR y el versionado.`, nodeIds: [id] });
       if ((s.corruptS ?? 0) > 0) out.push({ severity: 'warn', title: `Durante ${fmtDur(s.corruptS ?? 0)} se sirvieron datos dañados sin saberlo`, detail: 'Hasta que alguien lo notó. Alarmas sobre métricas de negocio (pedidos, pagos, errores 5xx) y validaciones de integridad acortan este tiempo.', nodeIds: [id] });
     }
-    if (!Number.isFinite(r.rtoS)) out.push({ severity: 'error', title: sc.kind === 'ransomware' ? 'Los datos se pierden: no hay copia fuera del alcance del atacante' : `${label(id)}: los datos no se pueden recuperar`, detail: r.text, nodeIds: [id] });
+    const fo = s.failovers?.find((f) => f.ok && f.primaryId === id);
+    if (fo) out.push({ severity: 'ok', title: `El servicio sigue con ${label(fo.replicaId)} mientras se recupera ${label(id)}`, detail: fo.why, nodeIds: [fo.replicaId] });
+    else if (!Number.isFinite(r.rtoS)) out.push({ severity: 'error', title: sc.kind === 'ransomware' ? 'Los datos se pierden: no hay copia fuera del alcance del atacante' : `${label(id)}: los datos no se pueden recuperar`, detail: r.text, nodeIds: [id] });
     else out.push({ severity: r.rtoS <= c.dr.rtoMin * 60 ? 'ok' : 'warn', title: `Restauración en ${fmtDur(r.rtoS)}; se pierden ${fmtDur(r.rpoS)} de datos`, detail: `${r.text}${sc.kind === 'data-corruption' ? ' Lo escrito entre el daño y la restauración hay que reconciliarlo a mano.' : ''}`, nodeIds: [id] });
   }
 
@@ -1276,6 +1467,40 @@ function buildFindings(c: FindingCtx): Finding[] {
     ];
     const worst = ph.reduce((a, b) => (b.v < a.v ? b : a));
     out.push({ severity: worst.v >= 0.99 ? 'ok' : worst.v >= 0.9 ? 'warn' : 'error', title: worst.v >= 0.99 ? 'Pasó el Game Day' : `La fase más dura: ${worst.name} (${(worst.v * 100).toFixed(1)} % mínimo)`, detail: ph.map((x) => `${x.name}: ${(x.v * 100).toFixed(1)} %`).join(' · '), nodeIds: [] });
+  }
+
+  // Ataques nuevos
+  const sec = c.security;
+  const T0 = c.targetId ? (c.map.get(c.targetId) as ServiceNode) : undefined;
+  if (sc.kind === 'credential-stuffing' && T0) {
+    const cognito = lid(T0) === 'cognito';
+    const mfa = cognito ? String(T0.data.props.mfa ?? 'OPTIONAL') : 'OFF';
+    if (s.impact) out.push({ severity: s.impact.tone === 'good' ? 'ok' : s.impact.tone === 'warn' ? 'warn' : 'error', title: `${s.impact.value} cuentas tomadas`, detail: s.impact.detail, nodeIds: [T0.id] });
+    if (mfa !== 'ON') out.push({ severity: 'error', title: cognito ? `MFA ${mfa === 'OFF' ? 'apagado' : 'opcional'} en ${label(T0.id)}` : 'El login no tiene MFA', detail: 'Con MFA obligatorio una contraseña filtrada no basta para entrar. Es el control que más baja la toma de cuentas.', nodeIds: [T0.id] });
+    if (!sec.captcha && !c.waf?.data.props.atp) out.push({ severity: 'warn', title: 'Nada frena a los bots en el login', detail: 'El rate limit por IP no ve un ataque repartido en miles de IPs. Agrega CAPTCHA/challenge en el login o WAF Account Takeover Prevention.', nodeIds: [T0.id] });
+    if (cognito && (c.peakUtil.get(T0.id) ?? 0) > 1) out.push({ severity: 'error', title: `El ataque agota la cuota de ${label(T0.id)}`, detail: 'Cognito tiene una cuota de logins por segundo: los usuarios reales tampoco pueden entrar (denegación de servicio como efecto colateral).', nodeIds: [T0.id] });
+  }
+  if (sc.kind === 'scraping' && s.impact) {
+    out.push({ severity: s.impact.tone === 'good' ? 'ok' : 'error', title: `${s.impact.value} registros de otros usuarios expuestos`, detail: `${s.impact.detail}${sec.objectAuthz ? '' : ' Verifica en cada consulta que el recurso pertenece al usuario (Seguridad del proyecto → Autorización por objeto).'}`, nodeIds: c.targetId ? [c.targetId] : [] });
+    if (!c.waf?.data.props.botControl) out.push({ severity: 'warn', title: 'El scraping se reparte en muchas IPs', detail: 'Bot Control del WAF y límites por usuario (no solo por IP) en API Gateway frenan la enumeración.', nodeIds: c.waf ? [c.waf.id] : [] });
+  }
+  if (sc.kind === 'exfiltration' && c.exfil && s.impact) {
+    const x = c.exfil;
+    out.push({ severity: s.impact.tone === 'good' ? 'ok' : s.impact.tone === 'warn' ? 'warn' : 'error', title: `Salieron ${s.impact.value}`, detail: `${s.impact.detail} ${Number.isFinite(x.detect) ? `Se detectó a los ${fmtDur(x.detect)} y se contuvo ${fmtDur(x.respond)} después.` : 'Nadie lo detectó durante la simulación.'}`, nodeIds: c.targetId ? [c.targetId] : [] });
+    if (x.egress === 'open') out.push({ severity: 'warn', title: 'Salida a Internet sin filtro', detail: 'El NAT Gateway deja salir a cualquier destino. Un Network Firewall con lista de dominios permitidos y VPC Endpoints para los servicios de AWS dejan al atacante sin camino directo.', nodeIds: [] });
+    if (!Number.isFinite(x.detect)) out.push({ severity: 'error', title: 'Sin detección', detail: 'Agrega Amazon GuardDuty al diagrama y envía sus hallazgos al equipo (Seguridad del proyecto → Hallazgos enviados al equipo).', nodeIds: [] });
+    else if (!sec.siem) out.push({ severity: 'warn', title: 'La alerta existe pero nadie la ve a tiempo', detail: 'Envía los hallazgos a un canal de guardia (EventBridge → SNS / SIEM) para contener en minutos y no en horas.', nodeIds: [] });
+  }
+  if (sc.kind === 'leaked-keys' && c.keys && s.impact) {
+    const k = c.keys;
+    if (k.noKeys) out.push({ severity: 'ok', title: 'No hay llaves de larga duración que filtrar', detail: 'El equipo entra por SSO (IAM Identity Center) con credenciales temporales.', nodeIds: [] });
+    else {
+      out.push({ severity: s.impact.tone === 'good' ? 'ok' : s.impact.tone === 'warn' ? 'warn' : 'error', title: `Costo del ataque: ${s.impact.value}`, detail: `${s.impact.detail} Extrapolado a un día sin revocarlas: ~US$${(k.rate * 24).toLocaleString('es-CO')}.`, nodeIds: [] });
+      if (!sec.secretScan) out.push({ severity: 'warn', title: 'Sin escaneo de secretos', detail: 'Pre-commit y escaneo en CI (gitleaks, GitHub secret scanning) atrapan la llave antes de que salga; AWS además pone en cuarentena las llaves que aparecen en GitHub.', nodeIds: [] });
+      if (!sec.scp) out.push({ severity: 'warn', title: 'Sin límites en la organización', detail: 'Una SCP que niegue regiones que no usas y tipos de instancia GPU baja el costo del ataque a una fracción.', nodeIds: [] });
+      if (!sec.boundary) out.push({ severity: 'error', title: 'Las llaves también abren los datos', detail: 'Sin permission boundary, las llaves de un desarrollador suelen poder leer S3, DynamoDB y Secrets Manager. Mira «▶ Simular → Ataque → Llaves filtradas».', nodeIds: [] });
+      if (!sec.rootMfa) out.push({ severity: 'info', title: 'La solución de fondo: no tener access keys', detail: 'Acceso humano por SSO con MFA y credenciales temporales (Seguridad del proyecto).', nodeIds: [] });
+    }
   }
 
   // Seguridad: DDoS

@@ -25,7 +25,8 @@ function anchor(a: ReturnType<typeof center>, b: ReturnType<typeof center>): [nu
 export const FloatingEdge = memo(function FloatingEdge({ id, source, target, data, selected, markerEnd }: EdgeProps<AppEdge>) {
   const s = useInternalNode(source);
   const t = useInternalNode(target);
-  const { edgeIssues, dimmed, sim, stride, trace, netBlocked, netView, attack } = useCanvasCtx();
+  const { edgeIssues, dimmed, sim, stride, trace, netBlocked, netView, attack, replicas } = useCanvasCtx();
+  const replicaLabel = !sim && !trace && !netView && !attack ? replicas?.get(id) : undefined;
   const boundary = stride?.boundaries.get(id);
   if (!s || !t) return null;
   const a = center(s);
@@ -47,6 +48,7 @@ export const FloatingEdge = memo(function FloatingEdge({ id, source, target, dat
     opacity: isDim ? 0.15 : 1,
     fill: 'none',
   };
+  if (replicaLabel) stroke = { ...stroke, stroke: '#0c8599', strokeWidth: 2, strokeDasharray: '2 4', strokeLinecap: 'round' };
   if (boundary) stroke = { ...stroke, stroke: '#eb6834', strokeWidth: 2.2, strokeDasharray: '7 3 2 3' };
   else if (stride) stroke = { ...stroke, opacity: 0.55 };
   if (blockedLabel) stroke = { ...stroke, stroke: '#d6336c', strokeWidth: selected ? 2.6 : 2, strokeDasharray: '2 5', strokeLinecap: 'round' };
@@ -86,6 +88,10 @@ export const FloatingEdge = memo(function FloatingEdge({ id, source, target, dat
       animation: rps > 0 && sim.playing ? `edge-flow ${Math.max(0.35, 1.6 - Math.log10(1 + rps) * 0.3)}s linear infinite` : undefined,
     };
     simLabel = rps > 0 ? `${fmtRps(rps)} req/s${attackShare > 0.05 ? ` · ${Math.round(attackShare * 100)}% ataque` : ''}` : null;
+    if (id.startsWith('fo:')) {
+      stroke = { ...stroke, stroke: '#2f9e44', strokeWidth: Math.max(2.4, Number(stroke.strokeWidth)), strokeDasharray: '7 4' };
+      simLabel = `⟲ failover · ${fmtRps(rps)} req/s`;
+    }
   }
   const cls = `edge ${d.async ? 'is-async' : ''} ${issue ? `has-${issue}` : ''} ${selected ? 'is-selected' : ''} ${dimmed.has(source) || dimmed.has(target) ? 'is-dimmed' : ''}`;
   return (
@@ -116,14 +122,14 @@ export const FloatingEdge = memo(function FloatingEdge({ id, source, target, dat
             </div>
           </EdgeLabelRenderer>
         )
-      ) : (sim ? simLabel : traceLabel ?? boundary ?? blockedLabel ?? d.protocol) && (
+      ) : (sim ? simLabel : traceLabel ?? boundary ?? blockedLabel ?? replicaLabel ?? d.protocol) && (
         <EdgeLabelRenderer>
           <div
-            className={`edge-label ${cls} ${sim ? 'is-sim' : ''} ${boundary ? 'is-boundary' : ''} ${blockedLabel ? 'is-blocked' : ''} ${traceLabel ? 'is-trace-fail' : ''} ${trace && !trace.edges.get(id) ? 'is-faded' : ''}`}
+            className={`edge-label ${cls} ${sim ? 'is-sim' : ''} ${sim && id.startsWith('fo:') ? 'is-failover' : ''} ${replicaLabel && !sim ? 'is-replica' : ''} ${boundary ? 'is-boundary' : ''} ${blockedLabel ? 'is-blocked' : ''} ${traceLabel ? 'is-trace-fail' : ''} ${trace && !trace.edges.get(id) ? 'is-faded' : ''}`}
             style={{ transform: `translate(-50%, -50%) translate(${lx}px, ${ly}px)` }}
             title={boundary ? 'Límite de confianza: el flujo pasa a una zona de mayor confianza' : blockedLabel ? `La configuración de red bloquea esta conexión: ${blockedLabel}. Mira «Problemas» o selecciona la flecha.` : undefined}
           >
-            {sim ? simLabel : traceLabel ? traceLabel : boundary ? `⛨ ${boundary}` : blockedLabel ? `⛔ ${blockedLabel}` : d.protocol}
+            {sim ? simLabel : traceLabel ? traceLabel : boundary ? `⛨ ${boundary}` : blockedLabel ? `⛔ ${blockedLabel}` : replicaLabel ? replicaLabel : d.protocol}
           </div>
         </EdgeLabelRenderer>
       )}

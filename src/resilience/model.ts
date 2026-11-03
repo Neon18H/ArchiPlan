@@ -13,6 +13,7 @@
 import { cloudText, getService, lid, primaryCloud } from '../catalog/catalog';
 import { ancestors, byId, isService } from '../lib/graph';
 import type { AppEdge, AppNode, Cloud, PropValue, ServiceNode } from '../types';
+import { coverage, MODE_MAP, replicationLinks, type FailureKind } from './replication';
 
 /* ───────────────────────── estrategia de DR del proyecto */
 
@@ -456,6 +457,10 @@ export interface PlanRow {
   az: PlanCell;
   region: PlanCell;
   data: PlanCell | null;
+  /** Es réplica de… (nombre). */
+  replicaOf?: string;
+  /** Sus réplicas dibujadas (nombres). */
+  replicas?: string[];
 }
 
 export interface LevelTotal {
@@ -525,6 +530,7 @@ export function buildPlan(nodes: AppNode[], edges: AppEdge[], opts: { dr: DrConf
   const behindLb = (n: ServiceNode) => edges.some((e) => e.target === n.id && isService(map.get(e.source)) && resKind(map.get(e.source) as ServiceNode) === 'lb');
   const rows: PlanRow[] = [];
   const issues: ResiliencePlan['issues'] = [];
+  const links = replicationLinks(nodes);
 
   for (const n of nodes.filter(isService)) {
     const r = nodeRes(n, map, security);
@@ -703,7 +709,7 @@ export function buildPlan(nodes: AppNode[], edges: AppEdge[], opts: { dr: DrConf
     }
     const reg = regionRecovery(n, r, dr, security);
     const dataRec = holdsData(r.kind) || id === 'memorydb' ? dataRecovery(n, r, { ransomware: false, security }) : null;
-    rows.push({
+    const row: PlanRow = {
       nodeId: n.id,
       label: n.data.label,
       service: def.short,
@@ -713,7 +719,25 @@ export function buildPlan(nodes: AppNode[], edges: AppEdge[], opts: { dr: DrConf
       az: { ...az, text: T(az.text) },
       region: { status: reg.status, text: T(reg.text), rtoS: reg.rtoS, rpoS: reg.rpoS, fix: reg.fix },
       data: dataRec ? { status: dataRec.status, text: T(dataRec.text), rtoS: dataRec.rtoS, rpoS: dataRec.rpoS, fix: dataRec.fix } : null,
-    });
+    };
+    // Réplicas dibujadas en el diagrama: si cubren la falla mejor, mandan
+    const mine = links.filter((l) => l.primaryId === n.id);
+    const asReplica = links.find((l) => l.replicaId === n.id);
+    if (asReplica) row.replicaOf = map.get(asReplica.primaryId) ? (map.get(asReplica.primaryId) as ServiceNode).data.label : undefined;
+    if (mine.length) row.replicas = mine.map((l) => (map.get(l.replicaId) as ServiceNode | undefined)?.data.label ?? l.replicaId);
+    const viaReplica = (cell: PlanCell, f: FailureKind): PlanCell => {
+      const best = mine.map((l) => ({ l, c: coverage(l, f) })).filter((x) => x.c.covers).sort((a, b) => a.c.rtoS - b.c.rtoS)[0];
+      if (!best || best.c.rtoS >= cell.rtoS) return cell;
+      const rl = (map.get(best.l.replicaId) as ServiceNode).data.label;
+      return { status: best.c.rpoS > 60 * dr.rpoMin ? 'warn' : 'ok', target: `${rl} (${MODE_MAP[best.l.mode].short})`, text: T(`Failover ${best.l.failover === 'auto' ? 'automático' : 'manual'} a ${rl}: ${best.c.why}`), rtoS: best.c.rtoS, rpoS: best.c.rpoS };
+    };
+    if (mine.length) {
+      row.instance = viaReplica(row.instance, 'instance');
+      row.az = viaReplica(row.az, 'az');
+      row.region = viaReplica(row.region, 'region');
+      if (row.data) row.data = viaReplica(row.data, 'corruption');
+    }
+    rows.push(row);
   }
 
   // Totales: el servicio vuelve cuando vuelve la pieza crítica más lenta
@@ -732,7 +756,10 @@ export function buildPlan(nodes: AppNode[], edges: AppEdge[], opts: { dr: DrConf
   for (const n of nodes.filter(isService)) {
     const r = nodeRes(n, map, security);
     if (!holdsData(r.kind) && lid(n) !== 'memorydb') continue;
-    const d = dataRecovery(n, r, { ransomware: true, security });
+    let d: { rtoS: number; rpoS: number } = dataRecovery(n, r, { ransomware: true, security });
+    const iso = links.filter((l) => l.primaryId === n.id).map((l) => coverage(l, 'ransomware')).filter((c) => c.covers).sort((a, b) => a.rtoS - b.rtoS)[0];
+    if (iso && iso.rtoS < d.rtoS) d = iso;
+    if (links.some((l) => l.replicaId === n.id)) continue;
     if (d.rtoS > totals.ransomware.rtoS) totals.ransomware = { rtoS: d.rtoS, rpoS: Math.max(totals.ransomware.rpoS, d.rpoS), worst: n.data.label };
     else totals.ransomware.rpoS = Math.max(totals.ransomware.rpoS, d.rpoS);
   }

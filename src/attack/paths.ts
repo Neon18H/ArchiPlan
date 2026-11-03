@@ -49,7 +49,35 @@ const T = {
   transferAccount: { id: 'T1537', name: 'Transfer Data to Cloud Account' },
   remoteExploit: { id: 'T1210', name: 'Exploitation of Remote Services' },
   manipulation: { id: 'T1565.001', name: 'Data Manipulation: Stored Data Manipulation' },
+  imds: { id: 'T1552.005', name: 'Unsecured Credentials: Cloud Instance Metadata API' },
+  trusted: { id: 'T1199', name: 'Trusted Relationship' },
+  supplyChain: { id: 'T1195.002', name: 'Supply Chain Compromise: Compromise Software Supply Chain' },
+  implantImage: { id: 'T1525', name: 'Implant Internal Image' },
+  phishing: { id: 'T1566', name: 'Phishing' },
+  exfilWeb: { id: 'T1567', name: 'Exfiltration Over Web Service' },
+  encrypt: { id: 'T1486', name: 'Data Encrypted for Impact' },
+  destroy: { id: 'T1485', name: 'Data Destruction' },
+  disableLogs: { id: 'T1562.008', name: 'Impair Defenses: Disable or Modify Cloud Logs' },
+  hijack: { id: 'T1496', name: 'Resource Hijacking' },
 } satisfies Record<string, Technique>;
+
+export type AttackProfile = 'externo' | 'llaves' | 'proveedor' | 'cicd' | 'admin';
+export const PROFILES: { id: AttackProfile; label: string; help: string }[] = [
+  { id: 'externo', label: 'Atacante en Internet', help: 'Solo tiene lo que expone tu arquitectura: dominios, APIs y logins.' },
+  { id: 'llaves', label: 'Llaves filtradas', help: 'Unas access keys de un desarrollador quedaron en un repositorio o en un portátil robado.' },
+  { id: 'proveedor', label: 'Proveedor comprometido', help: 'Un sistema externo que te llama (webhooks, integraciones) fue tomado por el atacante.' },
+  { id: 'cicd', label: 'Cadena de suministro / CI‑CD', help: 'Una dependencia maliciosa o el pipeline comprometido mete código en tus servicios.' },
+  { id: 'admin', label: 'Administrador con phishing', help: 'Le roban la sesión a alguien con acceso a la consola.' },
+];
+
+export interface AttackImpact {
+  technique: Technique;
+  label: string;
+  ok: boolean;
+  /** Qué lo frena (o qué falta). */
+  control: string;
+  fix?: AttackFix;
+}
 
 export const techUrl = (id: string) => `https://attack.mitre.org/techniques/${id.replace('.', '/')}/`;
 export const mitigationUrl = (id: string) => `https://attack.mitre.org/mitigations/${id}/`;
@@ -79,6 +107,8 @@ export interface AttackStep {
   virtual: boolean;
   tactic: Tactic;
   technique: Technique | null;
+  /** Técnicas previas que se resumen en este salto (p. ej. T1566 + T1078.004). */
+  extra?: Technique[];
   how: string;
   likelihood: number;
   controls: AttackControl[];
@@ -86,6 +116,9 @@ export interface AttackStep {
 
 export interface AttackPath {
   id: string;
+  profile: AttackProfile;
+  /** Qué puede hacer al llegar (exfiltrar, cifrar, borrar el rastro…). */
+  impacts: AttackImpact[];
   targetId: string;
   targetLabel: string;
   /** Valor de lo que se alcanza (1‑5). */
@@ -105,9 +138,10 @@ export interface AttackResult {
   entries: string[];
 }
 
-type Mode = 'exec' | 'user' | 'transit' | 'creds' | 'data' | 'start';
+type Mode = 'exec' | 'user' | 'transit' | 'creds' | 'data' | 'start' | 'role' | 'cloud';
 interface Ctx {
   mode: Mode;
+  profile?: AttackProfile;
   waf: Record<string, PropValue> | null;
 }
 
@@ -205,6 +239,11 @@ export function buildAttackPaths(nodes: AppNode[], edges: AppEdge[], opts: { sec
         if (ROUTERS.includes(tr)) {
           moves.push({ step: step(id, t.id, [e.id], 'Acceso inicial', null, `Las peticiones maliciosas pasan por ${t.data.label} hacia el backend.`, 1, []), ctx: { mode: ctx.mode, waf } });
         } else if (tr === 'compute' && ctx.mode === 'transit') {
+          if (lid(t) === 'ec2')
+            moves.push({
+              step: step(id, t.id, [e.id], 'Acceso a credenciales', T.imds, `Una vulnerabilidad SSRF en ${t.data.label} le hace pedir http://169.254.169.254 y devolver las credenciales temporales de su rol.`, 0.35, [...wafCtrls(waf, 'any'), ctrl('M1042', 'IMDSv2 obligatorio (lo exige el Terraform de ArchiPlan)', t.data.props.imdsv1 !== true, 0.05)]),
+              ctx: { mode: 'role', waf },
+            });
           const cs = [
             ...wafCtrls(waf, 'web'),
             secCtrl('inputValidation', 'M1048', 'Validación de entradas y consultas parametrizadas', 0.3),
@@ -222,9 +261,9 @@ export function buildAttackPaths(nodes: AppNode[], edges: AppEdge[], opts: { sec
       return moves;
     }
 
-    if (r === 'compute' && (ctx.mode === 'exec' || ctx.mode === 'user')) {
+    if (r === 'compute' && (ctx.mode === 'exec' || ctx.mode === 'user' || ctx.mode === 'role')) {
       const asUser = ctx.mode === 'user';
-      for (const e of out.get(id) ?? []) {
+      for (const e of ctx.mode === 'role' ? [] : out.get(id) ?? []) {
         if (!allowed(e)) continue;
         const t = svc(e.target);
         if (!t) continue;
@@ -259,8 +298,9 @@ export function buildAttackPaths(nodes: AppNode[], edges: AppEdge[], opts: { sec
           }
         }
       }
+      if (asUser) return moves;
       // Abuso del rol IAM de la pieza: llega a lo que el rol permite, aunque no haya flecha
-      const linked = new Set((out.get(id) ?? []).map((e) => e.target));
+      const linked = new Set(ctx.mode === 'role' ? [] : (out.get(id) ?? []).map((e) => e.target));
       for (const t of services) {
         if (t.id === id || linked.has(t.id)) continue;
         const tr = role(t);
@@ -278,6 +318,25 @@ export function buildAttackPaths(nodes: AppNode[], edges: AppEdge[], opts: { sec
             ctx: { mode: 'data', waf: null },
           });
         }
+      }
+      return moves;
+    }
+
+    // Con credenciales de la nube (llaves filtradas o sesión de un admin): llega por la API, sin red
+    if (ctx.mode === 'cloud') {
+      const human = ctx.profile === 'admin';
+      const cs = human
+        ? [secCtrl('rootMfa', 'M1032', 'SSO con MFA resistente a phishing', 0.1), secCtrl('boundary', 'M1026', 'Permisos mínimos por rol (permission sets)', 0.5), secCtrl('scp', 'M1054', 'Guardrails de la organización (SCP)', 0.7)]
+        : [secCtrl('rootMfa', 'M1032', 'Acceso humano por SSO, sin access keys de larga duración', 0.05), secCtrl('secretScan', 'M1047', 'Escaneo de secretos en el repositorio', 0.3), secCtrl('boundary', 'M1026', 'Permission boundary / permisos mínimos', 0.3), secCtrl('scp', 'M1054', 'Guardrails de la organización (SCP)', 0.6)];
+      const gd = services.find((x) => lid(x) === 'guardduty');
+      if (gd) cs.push(ctrl('M1047', 'GuardDuty detecta el uso anómalo de credenciales', true, 0.8));
+      for (const t of services) {
+        const tl = lid(t);
+        const tr = role(t);
+        if (tl === 'dynamodb' || tl === 's3' || tr === 'secrets')
+          moves.push({ step: step(id, t.id, [], tr === 'secrets' ? 'Acceso a credenciales' : 'Recolección', tr === 'secrets' ? T.secretsStore : tl === 's3' ? T.cloudStorage : T.repo, `${human ? 'Desde la consola' : 'Con las llaves'} llama directo a la API de ${t.data.label}: no pasa por tu red ni por tu WAF.`, human ? 0.35 : 0.3, cs, true), ctx: { mode: tr === 'secrets' ? 'creds' : 'data', waf: null, profile: ctx.profile } });
+        else if (['rds', 'aurora', 'documentdb', 'neptune', 'redshift'].includes(tl))
+          moves.push({ step: step(id, t.id, [], 'Exfiltración', T.transferAccount, `Crea un snapshot de ${t.data.label} y lo comparte con una cuenta suya.`, human ? 0.3 : 0.25, [...cs, ctrl('M1041', 'Cifrado con llave propia (KMS) en la BD', t.data.props.encrypted !== false, 0.4)], true), ctx: { mode: 'data', waf: null, profile: ctx.profile } });
       }
       return moves;
     }
@@ -349,10 +408,47 @@ export function buildAttackPaths(nodes: AppNode[], edges: AppEdge[], opts: { sec
     }
   }
 
+  for (const st0 of starts) st0.ctx.profile = 'externo';
+
+  /* ── otros perfiles de atacante */
+  const admin = actors.find((n) => lid(n) === 'admin');
+  const anchor = admin ?? attacker;
+  if (anchor) {
+    // Llaves filtradas: no hay salto de red, las llaves ya son la entrada
+    starts.push({ step: { from: anchor.id, to: anchor.id, edgeIds: [], virtual: true, tactic: 'Acceso inicial', technique: T.cloudAccounts, how: tx('Unas access keys de un desarrollador quedan en un repositorio público; un bot las encuentra en minutos.'), likelihood: 1, controls: [] }, ctx: { mode: 'cloud', waf: null, profile: 'llaves' } });
+    // Administrador con phishing
+    starts.push({ step: { from: anchor.id, to: anchor.id, edgeIds: [], virtual: true, tactic: 'Acceso inicial', technique: T.phishing, how: tx(`Un correo de phishing le roba la sesión a ${admin ? admin.data.label : 'un administrador'} y entra a la consola con sus permisos.`), likelihood: 1, controls: [] }, ctx: { mode: 'cloud', waf: null, profile: 'admin' } });
+  }
+  // Proveedor comprometido: sistemas externos que llaman a tu arquitectura
+  for (const ext of services.filter((n) => lid(n) === 'external' || lid(n) === 'onprem')) {
+    for (const e of out.get(ext.id) ?? []) {
+      const t = svc(e.target);
+      if (!t || !allowed(e)) continue;
+      const tr = role(t);
+      const cs = [secCtrl('webhookSig', 'M1032', 'Verificación de firma en webhooks y llamadas de terceros', 0.2), secCtrl('serviceAuth', 'M1030', 'Autenticación entre servicios (mTLS / tokens)', 0.5), secCtrl('inputValidation', 'M1048', 'Validación de entradas', 0.5), secCtrl('antiReplay', 'M1036', 'Protección contra repeticiones', 0.85)];
+      if (tr === 'compute') starts.push({ step: step(ext.id, t.id, [e.id], 'Acceso inicial', T.trusted, `${ext.data.label} fue comprometido: sus llamadas a ${t.data.label} ahora traen cargas maliciosas y ${t.data.label} confía en ellas.`, 0.4, cs), ctx: { mode: 'exec', waf: null, profile: 'proveedor' } });
+      else if (ROUTERS.includes(tr)) starts.push({ step: step(ext.id, t.id, [e.id], 'Acceso inicial', T.trusted, `${ext.data.label} fue comprometido y usa su integración con ${t.data.label} para entrar.`, 0.6, []), ctx: { mode: 'transit', waf: wafOf.get(t.id) ?? null, profile: 'proveedor' } });
+    }
+  }
+  // Cadena de suministro: el pipeline despliega código malicioso en cada servicio
+  const pipe = services.find((n) => role(n) === 'devops') ?? services.find((n) => role(n) === 'registry');
+  const pipeAnchor = pipe ?? anchor;
+  if (pipeAnchor) {
+    for (const c of services.filter((n) => role(n) === 'compute')) {
+      const viaEcr = pipe && lid(pipe) === 'ecr';
+      const edge = edges.find((e) => e.source === pipeAnchor.id && e.target === c.id);
+      starts.push({
+        step: step(pipeAnchor.id, c.id, edge ? [edge.id] : [], 'Acceso inicial', viaEcr ? T.implantImage : T.supplyChain, viaEcr ? `Sube una imagen alterada a ${pipe!.data.label}; ${c.data.label} la ejecuta en el próximo despliegue.` : `Una dependencia comprometida (npm, PyPI, Maven) llega en el próximo despliegue de ${c.data.label}${pipe ? ` por ${pipe.data.label}` : ''}.`, 0.15, [secCtrl('sca', 'M1016', 'Escaneo de dependencias (SCA)', 0.3), secCtrl('sast', 'M1016', 'SAST/DAST en el pipeline', 0.7), secCtrl('secretScan', 'M1047', 'Escaneo de secretos (tokens del pipeline)', 0.85)], !edge),
+        ctx: { mode: 'exec', waf: null, profile: 'cicd' },
+      });
+    }
+  }
+
   /* ── búsqueda de caminos (DFS acotada) */
   const MAX_DEPTH = 7;
   const best = new Map<string, AttackStep[][]>();
-  const keep = (target: string, steps: AttackStep[]) => {
+  const keep = (target: string, steps: AttackStep[], profile: AttackProfile) => {
+    target = `${profile}|${target}`;
     const list = best.get(target) ?? [];
     const lk = steps.reduce((a, s) => a * s.likelihood, 1);
     const sig = steps.map((s) => s.to).join('>');
@@ -369,7 +465,8 @@ export function buildAttackPaths(nodes: AppNode[], edges: AppEdge[], opts: { sec
       if (seen.has(m.step.to)) continue;
       const next = [...path, m.step];
       const t = svc(m.step.to);
-      if (t && isTarget(t) && (m.ctx.mode === 'data' || m.ctx.mode === 'creds')) keep(t.id, next);
+      if (t && isTarget(t) && (m.ctx.mode === 'data' || m.ctx.mode === 'creds')) keep(t.id, next, ctx.profile ?? 'externo');
+      m.ctx.profile = ctx.profile;
       if (m.ctx.mode === 'data') continue;
       seen.add(m.step.to);
       dfs(m.step.to, m.ctx, next, seen);
@@ -378,14 +475,44 @@ export function buildAttackPaths(nodes: AppNode[], edges: AppEdge[], opts: { sec
   };
   for (const s of starts) {
     const t = svc(s.step.to);
-    if (t && isTarget(t) && s.ctx.mode === 'data') keep(t.id, [s.step]);
+    const prof = s.ctx.profile ?? 'externo';
+    if (t && isTarget(t) && s.ctx.mode === 'data') keep(t.id, [s.step], prof);
     if (s.ctx.mode === 'data') continue;
+    // Los perfiles sin salto de red empiezan «en» el ancla y el primer paso real es el siguiente
+    if (s.step.from === s.step.to) {
+      for (const m of movesFrom(s.step.to, s.ctx)) {
+        m.ctx.profile = prof;
+        const first: AttackStep = { ...m.step, how: `${s.step.how} ${m.step.how}`, extra: s.step.technique ? [s.step.technique] : undefined };
+        const tt = svc(m.step.to);
+        if (tt && isTarget(tt) && (m.ctx.mode === 'data' || m.ctx.mode === 'creds')) keep(tt.id, [first], prof);
+        if (m.ctx.mode !== 'data') dfs(m.step.to, m.ctx, [first], new Set([s.step.from, m.step.to]));
+      }
+      continue;
+    }
     dfs(s.step.to, s.ctx, [s.step], new Set([s.step.from, s.step.to]));
   }
 
   /* ── rutas finales */
   const paths: AttackPath[] = [];
-  for (const [target, list] of best) {
+  const hasNat = services.some((n) => lid(n) === 'natgw');
+  const hasNfw = services.some((n) => lid(n) === 'networkfirewall');
+  const hasGd = services.some((n) => lid(n) === 'guardduty');
+  const impactsFor = (t: ServiceNode, profile: AttackProfile): AttackImpact[] => {
+    const out: AttackImpact[] = [];
+    const cloudCreds = profile === 'llaves' || profile === 'admin';
+    out.push({ technique: T.exfilWeb, label: 'Sacar los datos', ok: hasNfw || (!hasNat && !cloudCreds), control: cloudCreds ? 'Las credenciales de la nube no pasan por tu red: solo lo frena la detección (GuardDuty, logs de datos).' : hasNfw ? 'Network Firewall con dominios permitidos limita la salida.' : hasNat ? 'El NAT deja salir a cualquier destino: falta un Network Firewall o un proxy de salida.' : 'Sin salida directa a Internet.' });
+    const tl = lid(t);
+    const versioned = tl === 's3' && t.data.props.versioning !== false;
+    out.push({ technique: tl === 's3' ? T.destroy : T.encrypt, label: 'Cifrar o borrar los datos (ransomware)', ok: !!sec.offsiteBackup, control: sec.offsiteBackup ? 'Hay copias en otra cuenta con vault lock.' : `Sin copias fuera de la cuenta${versioned ? ' (el versionado también se puede borrar)' : ''}.`, fix: sec.offsiteBackup ? undefined : { label: 'Copias en otra cuenta con vault lock', security: 'offsiteBackup' } });
+    if (cloudCreds || profile === 'cicd') {
+      out.push({ technique: T.disableLogs, label: 'Borrar el rastro (apagar CloudTrail)', ok: !!sec.logLock && !!sec.scp, control: sec.logLock && sec.scp ? 'Logs inmutables y una SCP impide apagarlos.' : 'Sin logs inmutables ni SCP que impidan apagarlos.', fix: !sec.logLock ? { label: 'Logs de auditoría inmutables', security: 'logLock' } : !sec.scp ? { label: 'Guardrails de la organización (SCP)', security: 'scp' } : undefined });
+      out.push({ technique: T.hijack, label: 'Minar criptomonedas con tu cuenta', ok: !!sec.scp, control: sec.scp ? 'La SCP niega regiones y tipos de instancia que no usas.' : 'Nada limita qué instancias se pueden lanzar.', fix: sec.scp ? undefined : { label: 'Guardrails de la organización (SCP)', security: 'scp' } });
+    }
+    if (!hasGd) out.push({ technique: T.cloudAccounts, label: 'Pasar desapercibido', ok: false, control: 'No hay GuardDuty en el diagrama: nadie ve el uso anómalo de credenciales ni la exfiltración.' });
+    return out;
+  };
+  for (const [key, list] of best) {
+    const [profile, target] = key.split('|') as [AttackProfile, string];
     const t = svc(target)!;
     const value = valueOf(t);
     list.slice(0, 2).forEach((steps, k) => {
@@ -402,23 +529,29 @@ export function buildAttackPaths(nodes: AppNode[], edges: AppEdge[], opts: { sec
         }
       });
       paths.push({
-        id: `${target}:${k}`,
+        id: `${profile}:${target}:${k}`,
+        profile,
+        impacts: impactsFor(t, profile),
         targetId: target,
         targetLabel: t.data.label,
         value,
         steps,
         likelihood,
         risk,
-        title: `Así llegaría un atacante a «${t.data.label}» en ${steps.length} salto${steps.length > 1 ? 's' : ''}`,
+        title: `${profile === 'externo' ? 'Así llegaría un atacante' : profile === 'llaves' ? 'Con unas llaves filtradas se llega' : profile === 'proveedor' ? 'Desde un proveedor comprometido se llega' : profile === 'cicd' ? 'Desde el pipeline se llega' : 'Con la sesión robada de un admin se llega'} a «${t.data.label}» en ${steps.length} salto${steps.length > 1 ? 's' : ''}`,
         bestCut,
       });
     });
   }
   const rank = { Crítico: 4, Alto: 3, Medio: 2, Bajo: 1 };
   paths.sort((a, b) => rank[b.risk] - rank[a.risk] || b.likelihood * b.value - a.likelihood * a.value || a.steps.length - b.steps.length);
-  const reached = new Set(paths.map((p) => p.targetId));
+  const reached = new Set(paths.filter((p) => p.profile === 'externo').map((p) => p.targetId));
   const safeTargets = services.filter((n) => isTarget(n) && !reached.has(n.id)).map((n) => n.id);
-  return { paths: paths.slice(0, 12), safeTargets, entries: [...entries] };
+  // Las más riesgosas de cada perfil (para que ninguno quede tapado por los demás)
+  const kept: AttackPath[] = [];
+  for (const pr of PROFILES) kept.push(...paths.filter((p) => p.profile === pr.id).slice(0, pr.id === 'externo' ? 10 : 6));
+  kept.sort((a, b) => rank[b.risk] - rank[a.risk] || b.likelihood * b.value - a.likelihood * a.value || a.steps.length - b.steps.length);
+  return { paths: kept, safeTargets, entries: [...entries] };
 }
 
 /** Para el lienzo: qué piezas y flechas recorre la ruta hasta el paso «upto». */

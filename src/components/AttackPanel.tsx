@@ -1,5 +1,5 @@
-import { useEffect } from 'react';
-import { mitigationUrl, TACTIC_ID, techUrl, type AttackControl, type AttackFix } from '../attack/paths';
+import { useEffect, useState } from 'react';
+import { mitigationUrl, PROFILES, TACTIC_ID, techUrl, type AttackControl, type AttackFix, type AttackProfile } from '../attack/paths';
 import { useSim } from '../sim/store';
 import { useStore } from '../store';
 import type { ServiceNode } from '../types';
@@ -20,6 +20,8 @@ export function AttackPanel() {
   const focus = useStore((s) => s.focus);
   const label = (id: string) => (nodes.find((n) => n.id === id) as ServiceNode | undefined)?.data.label ?? (id === 'internet' ? 'Internet' : id);
   const path = attack?.paths[attackSel];
+  const [profile, setProfile] = useState<AttackProfile | 'todos'>('todos');
+  const visible = (attack?.paths ?? []).map((p, i) => ({ p, i })).filter(({ p }) => profile === 'todos' || p.profile === profile);
 
   // Animación salto a salto
   useEffect(() => {
@@ -63,13 +65,35 @@ export function AttackPanel() {
             ))}
           </div>
         )}
+        <div className="atk-profiles" role="radiogroup" aria-label="Perfil del atacante">
+          {[{ id: 'todos', label: 'Todos', help: 'Todas las rutas' }, ...PROFILES].map((pr) => {
+            const n = pr.id === 'todos' ? attack?.paths.length ?? 0 : attack?.paths.filter((p) => p.profile === pr.id).length ?? 0;
+            return (
+              <button
+                key={pr.id}
+                role="radio"
+                aria-checked={profile === pr.id}
+                className={profile === pr.id ? 'on' : ''}
+                title={pr.help}
+                disabled={!n}
+                onClick={() => {
+                  setProfile(pr.id as AttackProfile | 'todos');
+                  const first = attack?.paths.findIndex((p) => pr.id === 'todos' || p.profile === pr.id) ?? -1;
+                  if (first >= 0) selectAttack(first);
+                }}
+              >
+                {pr.label} <em>{n}</em>
+              </button>
+            );
+          })}
+        </div>
         <div className="atk-list" role="listbox" aria-label="Rutas encontradas">
-          {attack?.paths.map((p, i) => (
+          {visible.map(({ p, i }) => (
             <button key={p.id} role="option" aria-selected={i === attackSel} className={`atk-item ${i === attackSel ? 'on' : ''}`} onClick={() => selectAttack(i)}>
               <span className={`atk-risk r-${p.risk}`}>{p.risk}</span>
               <b>{p.targetLabel}</b>
               <span className="muted small">
-                {p.steps.length} saltos · {pct(p.likelihood)} · entra por {label(p.steps[0].to)}
+                {p.steps.length} salto{p.steps.length > 1 ? 's' : ''} · {pct(p.likelihood)} · {p.profile === 'externo' ? `entra por ${label(p.steps[0].to)}` : PROFILES.find((x) => x.id === p.profile)?.label}
               </span>
             </button>
           ))}
@@ -107,6 +131,11 @@ export function AttackPanel() {
                       <span className="atk-tactic" title={`Táctica ${TACTIC_ID[s.tactic]}`}>
                         {s.tactic}
                       </span>
+                      {s.extra?.map((x) => (
+                        <a key={x.id} className="atk-tech" href={techUrl(x.id)} target="_blank" rel="noreferrer" title={x.name}>
+                          {x.id} · {x.name}
+                        </a>
+                      ))}
                       {s.technique ? (
                         <a className="atk-tech" href={techUrl(s.technique.id)} target="_blank" rel="noreferrer" title={s.technique.name}>
                           {s.technique.id} · {s.technique.name}
@@ -152,6 +181,32 @@ export function AttackPanel() {
                 <span>Sin arreglos automáticos</span>
                 <em>Los controles de esta ruta ya están, o dependen del diseño (separar redes, quitar la flecha, cambiar el servicio).</em>
               </div>
+            )}
+            {path.impacts.length > 0 && (
+              <>
+                <div className="atk-ctrls-title">Qué podría hacer al llegar</div>
+                <ul className="atk-ctrls atk-impacts">
+                  {path.impacts.map((im) => (
+                    <li key={im.technique.id + im.label} className={im.ok ? 'ok' : 'missing'}>
+                      <span className="atk-ok">{im.ok ? '✓' : '✗'}</span>
+                      <div>
+                        <span>
+                          {im.label}{' '}
+                          <a href={techUrl(im.technique.id)} target="_blank" rel="noreferrer" className="atk-m">
+                            {im.technique.id}
+                          </a>
+                        </span>
+                        <em>{im.control}</em>
+                        {!im.ok && im.fix && (
+                          <button className="btn small fix" onClick={() => applyAttackFix(im.fix!)}>
+                            ⚡ {im.fix.label}
+                          </button>
+                        )}
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </>
             )}
             <div className="atk-ctrls-title">Mitigaciones de la ruta (MITRE)</div>
             <ul className="atk-ctrls">

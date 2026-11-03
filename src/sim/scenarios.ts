@@ -1,4 +1,4 @@
-export type ScenarioKind = 'load' | 'spike' | 'instance-failure' | 'az-failure' | 'node-outage' | 'region-failure' | 'slow-dependency' | 'data-corruption' | 'ransomware' | 'gameday' | 'ddos-l7' | 'ddos-l34' | 'web-attacks';
+export type ScenarioKind = 'load' | 'spike' | 'instance-failure' | 'az-failure' | 'node-outage' | 'region-failure' | 'slow-dependency' | 'data-corruption' | 'ransomware' | 'gameday' | 'ddos-l7' | 'ddos-l34' | 'web-attacks' | 'credential-stuffing' | 'scraping' | 'exfiltration' | 'leaked-keys';
 
 export interface Scenario {
   kind: ScenarioKind;
@@ -29,6 +29,8 @@ export interface Scenario {
   extraLatency: number;
   /** Corrupción de datos: minutos hasta que alguien lo nota. */
   detectMin: number;
+  /** Exfiltración: volumen de datos al alcance (GB). */
+  dataGb: number;
 }
 
 export type ScenarioGroup = 'carga' | 'fallas' | 'datos' | 'caos' | 'ataques';
@@ -47,7 +49,7 @@ export interface ScenarioMeta {
   short: string;
   description: string;
   fields: (keyof Scenario)[];
-  target?: 'compute-or-data' | 'any' | 'entry' | 'data';
+  target?: 'compute-or-data' | 'any' | 'entry' | 'data' | 'login' | 'compute';
   defaults: Partial<Scenario>;
 }
 
@@ -148,6 +150,45 @@ export const SCENARIOS: ScenarioMeta[] = [
     defaults: { baseRps: 200, peakRps: 1500, extraLatency: 3000, eventAt: 60, eventDuration: 600, duration: 900 },
   },
   {
+    kind: 'credential-stuffing',
+    group: 'ataques',
+    label: 'Relleno de credenciales (toma de cuentas)',
+    short: 'Credenciales',
+    description: 'Una botnet prueba usuario/contraseña filtrados de otros sitios contra el login. Mide cuántas cuentas se toman y si el ataque tumba el login de los usuarios reales. Evalúa WAF (rate limit, Bot Control, ATP), CAPTCHA, MFA y la protección de Cognito.',
+    fields: ['targetId', 'baseRps', 'attackRps', 'botIps', 'eventAt', 'eventDuration', 'duration'],
+    target: 'login',
+    defaults: { baseRps: 300, attackRps: 400, botIps: 5000, eventAt: 60, eventDuration: 600, duration: 900 },
+  },
+  {
+    kind: 'scraping',
+    group: 'ataques',
+    label: 'Scraping y abuso de API (BOLA)',
+    short: 'Scraping',
+    description: 'Bots con una cuenta válida recorren los identificadores de la API (/pedidos/1, /pedidos/2…) para llevarse datos de otros usuarios. Evalúa rate limit, Bot Control y la autorización por objeto.',
+    fields: ['targetId', 'baseRps', 'botsRps', 'botIps', 'eventAt', 'eventDuration', 'duration'],
+    target: 'entry',
+    defaults: { baseRps: 300, botsRps: 300, botIps: 300, eventAt: 60, eventDuration: 600, duration: 900 },
+  },
+  {
+    kind: 'exfiltration',
+    group: 'ataques',
+    label: 'Exfiltración desde una pieza comprometida',
+    short: 'Exfiltración',
+    description: 'Un atacante con código en una pieza de cómputo vuelca la base de datos y la saca por Internet. Mide cuántos GB salen antes de que alguien lo detecte. Evalúa la salida a Internet (NAT, Network Firewall), GuardDuty y la alerta al equipo.',
+    fields: ['targetId', 'baseRps', 'dataGb', 'eventAt', 'duration'],
+    target: 'compute',
+    defaults: { baseRps: 300, dataGb: 50, eventAt: 120, duration: 14400 },
+  },
+  {
+    kind: 'leaked-keys',
+    group: 'ataques',
+    label: 'Llaves de AWS filtradas (criptominería)',
+    short: 'Llaves filtradas',
+    description: 'Unas access keys de un desarrollador terminan en un repositorio público. En minutos un bot las usa para lanzar instancias de minería y leer datos. Mide el costo y el tiempo hasta revocarlas.',
+    fields: ['baseRps', 'eventAt', 'duration'],
+    defaults: { baseRps: 300, eventAt: 120, duration: 14400 },
+  },
+  {
     kind: 'ddos-l7',
     group: 'ataques',
     label: 'DDoS de aplicación (HTTP flood)',
@@ -198,6 +239,7 @@ export const FIELD_LABEL: Record<keyof Scenario, { label: string; unit?: string;
   lfiRps: { label: 'Path traversal / LFI', unit: 'req/s', min: 0, step: 10 },
   botsRps: { label: 'Bots / scrapers', unit: 'req/s', min: 0, step: 50 },
   extraLatency: { label: 'Latencia extra', unit: 'ms', min: 100, max: 120000, step: 500 },
+  dataGb: { label: 'Datos al alcance', unit: 'GB', min: 1, max: 1000000, step: 10 },
   detectMin: { label: 'Se detecta a los', unit: 'min', min: 0, max: 1440, step: 5 },
 };
 
@@ -220,6 +262,7 @@ export function defaultScenario(kind: ScenarioKind = 'spike'): Scenario {
     botsRps: 400,
     extraLatency: 5000,
     detectMin: 10,
+    dataGb: 50,
   };
   return { ...base, ...SCENARIO_MAP[kind].defaults, kind };
 }

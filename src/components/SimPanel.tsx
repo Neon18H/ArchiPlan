@@ -117,7 +117,7 @@ export function SimPanel() {
           <p className="sim-desc">
             Estrategia: <b>{DR_MAP[dr.strategy].label}</b>
             {dr.strategy !== 'none' ? ` hacia ${dr.secondaryRegion}` : ''} ·{' '}
-            <button className="linkish" onClick={openResilience}>
+            <button className="linkish" onClick={() => openResilience()}>
               cambiar
             </button>
           </p>
@@ -184,7 +184,12 @@ export function SimPanel() {
               <span>Latencia p95</span>
               <b>{s.p95Latency >= 1000 ? `${(s.p95Latency / 1000).toFixed(1)} s` : `${Math.round(s.p95Latency)} ms`}</b>
             </div>
-            {s.dataLossS !== undefined ? (
+            {s.impact ? (
+              <div className={`kpi ${s.impact.tone === 'good' ? 'good' : s.impact.tone === 'warn' ? 'warn' : 'bad'}`} title={s.impact.detail}>
+                <span>{s.impact.label}</span>
+                <b className="ellipsis">{s.impact.value}</b>
+              </div>
+            ) : s.dataLossS !== undefined ? (
               <div className={`kpi ${s.dataLossS === null ? '' : !Number.isFinite(s.dataLossS) ? 'bad' : s.dataLossS > dr.rpoMin * 60 ? 'warn' : 'good'}`} title="Escrituras que se pierden (RPO)">
                 <span>Datos perdidos</span>
                 <b>{s.dataLossS === null ? '—' : Number.isFinite(s.dataLossS) ? fmtDur(s.dataLossS) : 'todos'}</b>
